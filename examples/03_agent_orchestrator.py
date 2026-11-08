@@ -5,16 +5,26 @@ Demonstrates an Agent / VLM tool calling pattern over reCamera and rebot-armd at
 """
 
 from __future__ import annotations
+
 import json
-from rebot_companion import ReCameraClient, ArmdClient, Transform
+from collections.abc import Callable
+
+from rebot_companion import ArmdClient, ReCameraClient, Transform
+from rebot_companion.pipeline import DeterministicPickPlacePipeline, PipelineConfig
 
 
 class RobotCompanionAgentTools:
     """Tools exposed to an LLM / VLM Agent (compatible with OpenAI Function Calling & Anthropic Tools)."""
 
-    def __init__(self, camera_url: str = "http://192.168.42.1:8090", arm_url: str = "http://127.0.0.1:8765"):
+    def __init__(
+        self,
+        camera_url: str = "http://192.168.42.1:8090",
+        arm_url: str = "http://127.0.0.1:8765",
+        ik_solver: Callable[[Transform], list[float]] | None = None,
+    ):
         self.camera = ReCameraClient(camera_url)
         self.arm = ArmdClient(arm_url)
+        self.ik_solver = ik_solver  # pose in base frame -> joint targets; motion is skipped without one
         # Default nominal hand-eye calibration (Camera at +0.3m X, -0.4m Y, +0.5m Z)
         self.cam_to_base = Transform.from_translation_euler([0.30, -0.40, 0.50], 180.0, 0.0, 90.0)
 
@@ -23,7 +33,10 @@ class RobotCompanionAgentTools:
         return [
             {
                 "name": "inspect_scene",
-                "description": "Trigger reCamera to detect all visible fiducial markers and return their 3D positions in the robot base frame.",
+                "description": (
+                    "Trigger reCamera to detect all visible fiducial markers and return their 3D positions "
+                    "in the robot base frame."
+                ),
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -37,13 +50,21 @@ class RobotCompanionAgentTools:
                 "parameters": {"type": "object", "properties": {}},
             },
             {
+                "name": "get_arm_state",
+                "description": "Read the robot arm safety state, torque state and joint positions (radians).",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            {
+                "name": "emergency_stop",
+                "description": "Immediately latch the robot arm emergency stop.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            {
                 "name": "plan_and_execute_pick",
                 "description": "Command the robot arm to pick an object with the specified marker ID.",
                 "parameters": {
                     "type": "object",
-                    "properties": {
-                        "marker_id": {"type": "integer", "description": "Target marker ID to grasp"}
-                    },
+                    "properties": {"marker_id": {"type": "integer", "description": "Target marker ID to grasp"}},
                     "required": ["marker_id"],
                 },
             },
@@ -57,22 +78,58 @@ class RobotCompanionAgentTools:
             results = []
             for d in detections:
                 in_base = self.cam_to_base @ d.pose
-                results.append({
-                    "id": d.id,
-                    "position_base_xyz": [round(x, 4) for x in in_base.translation],
-                    "rpy_deg": [round(x, 1) for x in in_base.to_euler_deg()],
-                    "confidence": 1.0 - d.reprojection_error,
-                })
+                results.append(
+                    {
+                        "id": d.id,
+                        "position_base_xyz": [round(x, 4) for x in in_base.translation],
+                        "rpy_deg": [round(x, 1) for x in in_base.to_euler_deg()],
+                        "confidence": 1.0 - d.reprojection_error,
+                    }
+                )
             return json.dumps({"detected_markers": results}, indent=2)
 
         elif name == "take_visual_snapshot":
             img_bytes = self.camera.get_snapshot()
             return f"Captured {len(img_bytes)} bytes of JPEG snapshot for visual analysis."
 
+        elif name == "get_arm_state":
+            obs = self.arm.get_observation()
+            return json.dumps(
+                {
+                    "safety_state": obs.safety_state,
+                    "fault_reason": obs.fault_reason,
+                    "is_torqued": obs.is_torqued,
+                    "joint_positions_rad": [round(q, 4) for q in obs.positions],
+                }
+            )
+
+        elif name == "emergency_stop":
+            # REST e-stop: works without holding the control lease.
+            return json.dumps(self.arm.e_stop())
+
         elif name == "plan_and_execute_pick":
-            m_id = arguments.get("marker_id")
-            # Agent triggers camera -> validates coordinates -> executes
-            return f"Executed pick plan for marker #{m_id} via rebot-armd."
+            m_id = int(arguments["marker_id"])
+            # Same deterministic pipeline as Stage 2: trigger -> transform -> bounds check -> leased motion.
+            pipeline = DeterministicPickPlacePipeline(
+                self.camera,
+                self.arm,
+                self.cam_to_base,
+                PipelineConfig(target_marker_id=m_id),
+                ik_solver=self.ik_solver,
+            )
+            res = pipeline.run_cycle()
+            return json.dumps(
+                {
+                    "success": res.success,
+                    "stage": res.stage,
+                    "error": res.error_message,
+                    "motion_executed": res.success and self.ik_solver is not None,
+                    "target_base_xyz": [round(x, 4) for x in res.target_pose_base.translation]
+                    if res.target_pose_base
+                    else None,
+                    "warnings": res.warnings,
+                }
+            )
 
         return f"Unknown tool: {name}"
 
