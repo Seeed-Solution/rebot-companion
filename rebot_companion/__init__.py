@@ -1,5 +1,6 @@
 """rebot-companion: Robot Arm Vision Companion SDK and Orchestration Framework."""
 
+from . import kinematics
 from .arm_client import (
     ArmCommandRejected,
     ArmConnectionError,
@@ -13,7 +14,7 @@ from .arm_client import (
     ObservationSchema,
     ServoRejected,
 )
-from .calibration import HandEyeCalibration
+from .calibration import CalibrationError, CalibrationResult, CalibrationSample, HandEyeCalibration
 from .camera_client import MarkerDetection, ReCameraClient
 from .pipeline import DeterministicPickPlacePipeline, PipelineConfig, PipelineResult
 from .transforms import Transform
@@ -34,7 +35,11 @@ __all__ = [
     "MotionTimeout",
     "Transform",
     "HandEyeCalibration",
+    "CalibrationSample",
+    "CalibrationResult",
+    "CalibrationError",
     "DeterministicPickPlacePipeline",
     "PipelineConfig",
     "PipelineResult",
+    "kinematics",
 ]

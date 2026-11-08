@@ -1,9 +1,14 @@
 """Rigid body 3D transformation utilities (SE3)."""
 
 from __future__ import annotations
+
 import math
-from typing import List, Tuple, Sequence
+from collections.abc import Sequence
+
 import numpy as np
+
+# Same convention as the reCamera device (aruco-detector rot_to_euler) and the rebot-armd Web cockpit.
+EULER_CONVENTION = "R = Rz(yaw) Ry(pitch) Rx(roll)"
 
 
 class Transform:
@@ -36,11 +41,14 @@ class Transform:
         cy, sy = math.cos(y), math.sin(y)
 
         # R = Rz(yaw) * Ry(pitch) * Rx(roll)
-        R = np.array([
-            [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
-            [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
-            [-sp,     cp * sr,                cp * cr],
-        ], dtype=np.float64)
+        R = np.array(
+            [
+                [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+                [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+                [-sp, cp * sr, cp * cr],
+            ],
+            dtype=np.float64,
+        )
 
         mat = np.eye(4, dtype=np.float64)
         mat[:3, :3] = R
@@ -55,6 +63,19 @@ class Transform:
         mat[:3, 3] = np.asarray(t).reshape(3)
         return cls(mat)
 
+    @classmethod
+    def from_matrix(cls, matrix: Sequence[Sequence[float]] | np.ndarray) -> Transform:
+        """Create from a 4x4 homogeneous matrix; the rotation block is re-orthonormalised (SVD)."""
+        m = np.array(matrix, dtype=np.float64)
+        if m.shape != (4, 4):
+            raise ValueError(f"Transform matrix must be 4x4, got {m.shape}")
+        U, _, Vt = np.linalg.svd(m[:3, :3])
+        R = U @ Vt
+        if np.linalg.det(R) < 0:
+            U[:, 2] *= -1
+            R = U @ Vt
+        return cls.from_rot_trans(R, m[:3, 3])
+
     @property
     def translation(self) -> np.ndarray:
         return self.matrix[:3, 3]
@@ -63,7 +84,7 @@ class Transform:
     def rotation(self) -> np.ndarray:
         return self.matrix[:3, :3]
 
-    def to_euler_deg(self) -> Tuple[float, float, float]:
+    def to_euler_deg(self) -> tuple[float, float, float]:
         """Convert rotation matrix to Euler angles (roll, pitch, yaw) in degrees."""
         R = self.rotation
         r20 = R[2, 0]
