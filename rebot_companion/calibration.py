@@ -54,6 +54,49 @@ ASSUMPTIONS = {
 }
 
 
+@dataclass(frozen=True)
+class HandEyeResult:
+    """A solved hand-eye transform together with the setup it belongs to.
+
+    * ``eye_to_hand``: ``transform`` is ``T_cam_to_base`` (camera fixed in the scene).
+    * ``eye_in_hand``: ``transform`` is ``T_cam_to_gripper`` (camera on the gripper); the camera
+      pose in the base frame depends on the arm pose, ``T_base_gripper(q) @ transform``.
+    """
+
+    setup: str
+    transform: Transform
+
+    def __post_init__(self) -> None:
+        if self.setup not in MODES:
+            raise ValueError(f"setup must be one of {MODES}, got {self.setup!r}")
+
+    @property
+    def needs_joints(self) -> bool:
+        return self.setup == "eye_in_hand"
+
+    def cam_to_base(
+        self,
+        joints: Sequence[float] | None = None,
+        sign: Sequence[float] = kinematics.DEFAULT_SIGN,
+        offset: Sequence[float] = kinematics.DEFAULT_OFFSET,
+    ) -> Transform:
+        """``T_cam_to_base``. For eye_in_hand, ``joints`` are the raw armd positions when the image was taken."""
+        if self.setup == "eye_to_hand":
+            return self.transform
+        if joints is None:
+            raise ValueError("eye_in_hand calibration needs the arm joints at detection time")
+        return gripper_pose(joints, sign, offset) @ self.transform
+
+
+def gripper_pose(
+    joints: Sequence[float],
+    sign: Sequence[float] = kinematics.DEFAULT_SIGN,
+    offset: Sequence[float] = kinematics.DEFAULT_OFFSET,
+) -> Transform:
+    """``T_base_gripper`` from raw armd joint positions. Single FK entry point used for eye_in_hand."""
+    return kinematics.tcp_pose_from_joints(joints, sign, offset)
+
+
 class CalibrationError(ValueError):
     """Raised when samples are insufficient or degenerate for the selected method."""
 
@@ -398,25 +441,51 @@ class HandEyeCalibration:
         return json.loads(Path(filepath).read_text(encoding="utf-8"))
 
     @classmethod
-    def load_from_file(cls, filepath: str | Path) -> Transform:
-        """Load the calibration transform from an SDK file or a rebot-armd Web export.
+    def load_result(cls, filepath: str | Path) -> HandEyeResult:
+        """Load a solved calibration (SDK file or rebot-armd Web export) together with its setup.
 
-        Returns ``T_cam_to_base`` (eye_to_hand) or ``T_cam_to_gripper`` (eye_in_hand), i.e. the
-        transform mapping camera-frame coordinates into the base / gripper frame.
+        Use :meth:`HandEyeResult.cam_to_base` to get ``T_cam_to_base``; for an eye_in_hand file it
+        needs the arm joints at the time the marker was detected.
         """
         data = cls._read(filepath)
+        declared = data.get("setup") or data.get("mode")
+        if declared is not None and declared not in MODES:
+            raise ValueError(f"{filepath}: unknown setup {declared!r}, expected one of {MODES}")
         res = data.get("result")
         if isinstance(res, dict):
-            for key in TRANSFORM_KEYS.values():
-                if res.get(key) is not None:
-                    return Transform.from_matrix(res[key])
+            for setup, key in TRANSFORM_KEYS.items():
+                if res.get(key) is None:
+                    continue
+                if declared is not None and declared != setup:
+                    raise ValueError(f"{filepath}: setup {declared!r} does not match result key {key!r}")
+                return HandEyeResult(setup=setup, transform=Transform.from_matrix(res[key]))
         if isinstance(data.get("transform"), dict):
-            return Transform.from_dict(data["transform"])
+            if declared is None:
+                raise ValueError(
+                    f"{filepath}: legacy file has no 'mode'/'setup'; cannot tell eye_to_hand from eye_in_hand"
+                )
+            return HandEyeResult(setup=declared, transform=Transform.from_dict(data["transform"]))
         if data.get("kind") == "hand_eye_calibration":
             raise ValueError(
                 f"{filepath}: file has no solved result; use HandEyeCalibration.load_samples() and solve()"
             )
         raise ValueError(f"{filepath}: not a hand-eye calibration file")
+
+    @classmethod
+    def load_from_file(cls, filepath: str | Path) -> Transform:
+        """Load ``T_cam_to_base`` from an **eye_to_hand** calibration file.
+
+        An eye_in_hand file stores ``T_cam_to_gripper``, which is not a camera-to-base transform;
+        it raises :class:`ValueError`. Use :meth:`load_result`, which returns the setup with the
+        transform, for code that has to handle both.
+        """
+        result = cls.load_result(filepath)
+        if result.setup != "eye_to_hand":
+            raise ValueError(
+                f"{filepath}: eye_in_hand calibration (T_cam_to_gripper) cannot be used as cam_to_base; "
+                "use HandEyeCalibration.load_result() and HandEyeResult.cam_to_base(joints)"
+            )
+        return result.transform
 
     @classmethod
     def load_samples(

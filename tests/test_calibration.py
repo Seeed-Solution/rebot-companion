@@ -7,7 +7,13 @@ import pytest
 from scipy.spatial.transform import Rotation
 
 from rebot_companion import kinematics as K
-from rebot_companion.calibration import CalibrationError, HandEyeCalibration, solve_point_registration
+from rebot_companion.calibration import (
+    CalibrationError,
+    HandEyeCalibration,
+    HandEyeResult,
+    gripper_pose,
+    solve_point_registration,
+)
 from rebot_companion.transforms import Transform
 
 # Web solveRigid reference (tools/gen_web_fixtures.mjs): inputs and outputs
@@ -257,7 +263,11 @@ def test_axxb_eye_in_hand_noise(tmp_path: Path, capsys):
     calib.save_to_file(f)
     data = json.loads(f.read_text())
     assert "T_cam_to_gripper" in data["result"] and "T_marker_to_base" in data["result"]
-    np.testing.assert_allclose(HandEyeCalibration.load_from_file(f).matrix, X.matrix, atol=1e-12)
+    loaded = HandEyeCalibration.load_result(f)
+    assert loaded.setup == "eye_in_hand"
+    np.testing.assert_allclose(loaded.transform.matrix, X.matrix, atol=1e-12)
+    with pytest.raises(ValueError, match="eye_in_hand"):
+        HandEyeCalibration.load_from_file(f)  # T_cam_to_gripper is never returned as cam_to_base
     again = HandEyeCalibration.load_samples(f, method="axxb")
     np.testing.assert_allclose(again.solve().matrix, X.matrix, atol=1e-9)
 
@@ -334,3 +344,53 @@ def test_axxb_matches_opencv_park():
     )
     np.testing.assert_allclose(X.rotation, R, atol=1e-6)
     np.testing.assert_allclose(X.translation, t.ravel(), atol=1e-6)
+
+
+# ---------------------------------------------------------- setup-aware loading ---
+def test_load_result_eye_to_hand(tmp_path: Path):
+    X = Transform.from_translation_euler([0.3, -0.4, 0.5], 180.0, 0.0, 90.0)
+    f = tmp_path / "e2h.json"
+    f.write_text(
+        json.dumps(
+            {"kind": "hand_eye_calibration", "setup": "eye_to_hand", "result": {"T_cam_to_base": X.matrix.tolist()}}
+        )
+    )
+    r = HandEyeCalibration.load_result(f)
+    assert r.setup == "eye_to_hand" and not r.needs_joints
+    np.testing.assert_allclose(r.cam_to_base().matrix, X.matrix, atol=1e-12)
+    np.testing.assert_allclose(r.cam_to_base([0.3] * 7).matrix, X.matrix, atol=1e-12)  # joints ignored
+    np.testing.assert_allclose(HandEyeCalibration.load_from_file(f).matrix, X.matrix, atol=1e-12)
+
+
+def test_eye_in_hand_cam_to_base_uses_fk_at_detection(tmp_path: Path):
+    X = Transform.from_translation_euler([0.05, 0.0, 0.04], 0.0, -90.0, 180.0)  # T_gripper_cam
+    f = tmp_path / "eih.json"
+    f.write_text(
+        json.dumps(
+            {"kind": "hand_eye_calibration", "setup": "eye_in_hand", "result": {"T_cam_to_gripper": X.matrix.tolist()}}
+        )
+    )
+    r = HandEyeCalibration.load_result(f)
+    assert r.needs_joints
+    with pytest.raises(ValueError, match="joints"):
+        r.cam_to_base()
+    q_a = [0.2, 0.3, -0.4, 0.1, 0.0, 1.5707963, 0.0]
+    q_b = [-0.5, 0.1, 0.2, -0.3, 0.0, 1.5707963, -2.0]
+    for q in (q_a, q_b):
+        expected = K.tcp_pose_from_joints(q) @ X
+        np.testing.assert_allclose(r.cam_to_base(q).matrix, expected.matrix, atol=1e-12)
+        np.testing.assert_allclose(gripper_pose(q).matrix, K.tcp_pose_from_joints(q).matrix, atol=1e-12)
+    assert not np.allclose(r.cam_to_base(q_a).matrix, X.matrix)
+    assert not np.allclose(r.cam_to_base(q_a).matrix, r.cam_to_base(q_b).matrix)
+
+
+def test_load_result_rejects_ambiguous_files(tmp_path: Path):
+    f = tmp_path / "legacy.json"
+    f.write_text(json.dumps({"transform": {"translation": [0.1, 0.2, 0.3], "euler_deg": [0, 0, 0]}}))
+    with pytest.raises(ValueError, match="cannot tell"):
+        HandEyeCalibration.load_result(f)
+    f.write_text(json.dumps({"setup": "eye_to_hand", "result": {"T_cam_to_gripper": np.eye(4).tolist()}}))
+    with pytest.raises(ValueError, match="does not match"):
+        HandEyeCalibration.load_result(f)
+    with pytest.raises(ValueError):
+        HandEyeResult(setup="eye_on_base", transform=Transform())

@@ -14,7 +14,7 @@ from .arm_client import (
     ObservationSchema,
     ServoRejected,
 )
-from .calibration import CalibrationError, CalibrationResult, CalibrationSample, HandEyeCalibration
+from .calibration import CalibrationError, CalibrationResult, CalibrationSample, HandEyeCalibration, HandEyeResult
 from .camera_client import MarkerDetection, ReCameraClient
 from .pipeline import DeterministicPickPlacePipeline, PipelineConfig, PipelineResult
 from .transforms import Transform
@@ -38,6 +38,7 @@ __all__ = [
     "CalibrationSample",
     "CalibrationResult",
     "CalibrationError",
+    "HandEyeResult",
     "DeterministicPickPlacePipeline",
     "PipelineConfig",
     "PipelineResult",
