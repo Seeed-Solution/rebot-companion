@@ -1,8 +1,9 @@
 """reCamera Atomic API Client (HTTP & WebSocket)."""
 
 from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import List, Optional
+
 import httpx
 
 from .transforms import Transform
@@ -11,6 +12,7 @@ from .transforms import Transform
 @dataclass
 class MarkerDetection:
     """Represents a detected fiducial marker with 6-DoF pose."""
+
     id: int
     center: list[float]
     corners: list[list[float]]
@@ -38,16 +40,12 @@ class ReCameraClient:
     def __init__(
         self,
         base_url: str = "http://192.168.42.1:8090",
-        snapshot_url: Optional[str] = None,
+        snapshot_url: str | None = None,
         timeout_sec: float = 5.0,
     ) -> None:
         self.base_url = base_url.rstrip("/")
-        # If snapshot url not specified, infer port 80 /snapshot.jpg
-        if snapshot_url is None:
-            host = self.base_url.split("//")[-1].split(":")[0]
-            self.snapshot_url = f"http://{host}:80/snapshot.jpg"
-        else:
-            self.snapshot_url = snapshot_url.rstrip("/")
+        # No default: a JPEG snapshot endpoint has not been verified on the device firmware.
+        self.snapshot_url = snapshot_url.rstrip("/") if snapshot_url else None
         self.timeout_sec = timeout_sec
 
     def get_inference_state(self) -> dict:
@@ -85,7 +83,16 @@ class ReCameraClient:
             return [MarkerDetection.from_dict(m) for m in markers]
 
     def get_snapshot(self) -> bytes:
-        """Fetch raw JPEG snapshot for VLM / multimodal reasoning."""
+        """Fetch raw JPEG snapshot for VLM / multimodal reasoning.
+
+        Requires ``snapshot_url`` to be passed to the constructor; there is no verified default endpoint.
+        """
+        if not self.snapshot_url:
+            raise RuntimeError(
+                "snapshot_url is not configured: pass ReCameraClient(snapshot_url=...) with an endpoint that "
+                "serves a JPEG (no snapshot endpoint is verified on the reCamera firmware; RTSP "
+                "rtsp://<host>:8554/live0 is available for frame grabs)"
+            )
         with httpx.Client(timeout=self.timeout_sec) as client:
             res = client.get(self.snapshot_url)
             res.raise_for_status()
