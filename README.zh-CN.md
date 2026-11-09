@@ -171,11 +171,12 @@ with arm.session() as s:
 
 ### 正运动学（B601-DM）
 
-`rebot_companion.kinematics` 逐行移植自 rebot-armd Web 驾驶舱的 FK/IK（`src/api/index.html` 中的 `IK.fk` / `IK.solve`，URDF `urdf_b601dm`）。测试用 node 运行 JS 代码得到的数值做对照（`tools/gen_web_fixtures.mjs`）。
+`rebot_companion.kinematics` 包含两套模型，均在 URDF 基座坐标系下（x 向前、y 向左、z 向上，单位米 / 弧度）：
 
-- 使用的关节：J1 偏航，J2/J3/J4 俯仰链；J5 假定为 0；忽略夹爪。基座坐标系：x 向前、y 向左、z 向上，单位米 / 弧度。
-- 电机原始角度到模型角：`model = (motor - offset) / sign`（Web `toModel`，默认 sign `1,1,1,1`、offset `0`；与 Web 的 `?iksign=` / `?ikoff=` 相同；向导参数为 `--iksign` / `--ikoff`）。
-- `tcp_pose(q)` 返回完整 SE(3) TCP 位姿 `R = Rz(q1) Ry(-q2 + q3 + q4)`，x 轴为工具轴。腕部关节为 0 时与 URDF 链数值对比：位置差 < 0.03 mm，旋转差 < 1e-4。
+- 完整 FK：`tcp_pose(q)` / `tcp_pose_from_joints(positions)` / `calibration.gripper_pose(positions)`，按 `reBot-DevArm_gripper.urdf`（rebot-armd `assets/`，副本在 `tests/fixtures/`）的 URDF 链 `base_link` → `joint1`..`joint6` → `end_joint` → `end_link` 计算，返回 TCP 的 SE(3) 位姿（位置 + 旋转），x 轴为工具轴。手眼标定使用这套 FK，采样时 J5、J6 可以取任意值。测试用独立的 URDF 解析结果对照：位置差 < 0.1 mm，旋转差 < 0.01 度。
+- URDF joint5 为腕部横摆（在停放位姿 J1..J5 = 0、J6 = pi/2 时轴竖直；+0.2 rad 使 TCP 沿 -y 移动约 36 mm），joint6 为工具自转（绕工具轴，TCP 位置不变）。Web 驾驶舱界面上这两个关节的标签与此相反。
+- 电机到 URDF 的映射：armd 索引 0..3 → URDF joint1..joint4，`model = (motor - offset) / sign`（Web `toModel` / `CFG.cart.sign` / `CFG.cart.off`，默认 sign `1,1,1,1`、offset `0`；与 Web 的 `?iksign=` / `?ikoff=` 相同；向导参数为 `--iksign` / `--ikoff`）。索引 4 → joint5、索引 5 → joint6，一一对应。索引 6（夹爪）不参与 FK。
+- 平面 FK/IK：`fk(q)` / `solve_ik(target, prev)`，逐行移植自 rebot-armd Web 驾驶舱（`src/api/index.html` 中的 `IK.fk` / `IK.solve`），J1 偏航 + J2/J3/J4 俯仰链，J5 = 0。测试用 node 运行 JS 代码得到的数值做对照（`tools/gen_web_fixtures.mjs`）。J5 = 0 时其 TCP 位置与完整 FK 相差 < 0.2 mm（Web 常量取整、忽略 joint1 的 x 偏移 -0.084 mm）。
 - `solve_ik(target, prev)` 为 Web 中的解析 IK（位置 + 俯仰）。
 
 ### 方法与假设
@@ -187,7 +188,7 @@ with arm.session() as s:
 | `axxb` | eye_in_hand | 相机装在夹爪上，标记固定在场景中 | 完整位姿 | `T_cam_to_gripper` + `T_marker_to_base` |
 
 - `axxb` 为 Park & Martin 方法：对所有样本对，旋转用旋转对数的最小二乘求解，平移用堆叠线性最小二乘求解。测试中其结果与 `cv2.calibrateHandEye(..., CALIB_HAND_EYE_PARK)` 一致。
-- `axxb` 要求相对旋转至少绕两个不平行的轴。对这台机械臂，样本之间要同时改变 J1 偏航和腕部俯仰（各 >= 15 度）。只绕单轴旋转或旋转 < 5 度会抛出 `CalibrationError`。
+- `axxb` 要求相对旋转至少绕两个不平行的轴。对这台机械臂，样本之间要同时改变 J1 偏航和腕部俯仰（各 >= 15 度）；J5 横摆和 J6 自转可提供更多旋转轴。只绕单轴旋转或旋转 < 5 度会抛出 `CalibrationError`。
 - 残差：`point` 输出每个样本的 3D 点误差；`axxb` 输出每个样本在相机坐标系下的标记位置（m）和旋转（度）预测误差。RMSE 和最大误差会打印并写入文件。
 - 设备返回的标记姿态分辨率为 0.01 度（`r_deg`，2 位小数）。`point` 不使用姿态。
 - 精度取决于设备上的相机内参和 `MARKER_SIZE`。先标定内参（见下一节）。

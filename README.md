@@ -168,11 +168,12 @@ with arm.session() as s:
 
 ### Forward kinematics (B601-DM)
 
-`rebot_companion.kinematics` is a line-by-line port of the rebot-armd Web cockpit FK/IK (`src/api/index.html`, `IK.fk` / `IK.solve`, URDF `urdf_b601dm`). Tests compare it against values computed by running the JS code with node (`tools/gen_web_fixtures.mjs`).
+`rebot_companion.kinematics` has two models, both in the URDF base frame (x forward, y left, z up, metres / radians):
 
-- Joints used: J1 yaw, J2/J3/J4 pitch chain; J5 is assumed to be 0; gripper ignored. Base frame: x forward, y left, z up, metres / radians.
-- Raw motor positions map to model angles with `model = (motor - offset) / sign` (Web `toModel`, defaults sign `1,1,1,1`, offset `0`; same as the Web `?iksign=` / `?ikoff=` overrides; the wizard takes `--iksign` / `--ikoff`).
-- `tcp_pose(q)` returns the full SE(3) TCP pose `R = Rz(q1) Ry(-q2 + q3 + q4)`, x axis = tool axis. Checked numerically against the URDF chain with the wrist joints at 0: < 0.03 mm, < 1e-4 rotation.
+- Full FK, `tcp_pose(q)` / `tcp_pose_from_joints(positions)` / `calibration.gripper_pose(positions)`: the URDF chain `base_link` → `joint1`..`joint6` → `end_joint` → `end_link` of `reBot-DevArm_gripper.urdf` (rebot-armd `assets/`, copy in `tests/fixtures/`). Returns the SE(3) TCP pose (position + rotation), x axis = tool axis. Hand-eye calibration uses this FK, so J5 and J6 may take any value in the samples. Tests compare it with an independent URDF parser: < 0.1 mm, < 0.01 deg.
+- URDF joint5 = wrist swing (axis vertical at the park pose J1..J5 = 0, J6 = pi/2; +0.2 rad moves the TCP ~36 mm in -y), joint6 = tool roll (about the tool axis; the TCP position does not change). The Web cockpit UI labels these two the other way round.
+- Motor → URDF mapping: armd index 0..3 → URDF joint1..joint4 with `model = (motor - offset) / sign` (Web `toModel` / `CFG.cart.sign` / `CFG.cart.off`, defaults sign `1,1,1,1`, offset `0`; same as the Web `?iksign=` / `?ikoff=` overrides; the wizard takes `--iksign` / `--ikoff`). Index 4 → joint5 and index 5 → joint6, 1:1. Index 6 (gripper) is not part of the FK.
+- Planar FK/IK, `fk(q)` / `solve_ik(target, prev)`: line-by-line port of the rebot-armd Web cockpit (`src/api/index.html`, `IK.fk` / `IK.solve`), J1 yaw + J2/J3/J4 pitch chain, J5 = 0. Tests compare it against values computed by running the JS code with node (`tools/gen_web_fixtures.mjs`). With J5 = 0 its TCP position matches the full FK to < 0.2 mm (rounded Web constants, joint1 x offset of -0.084 mm ignored).
 - `solve_ik(target, prev)` is the analytic position + pitch IK from the Web.
 
 ### Methods and assumptions
@@ -184,7 +185,7 @@ with arm.session() as s:
 | `axxb` | eye_in_hand | camera on the gripper, marker fixed in the scene | full poses | `T_cam_to_gripper` + `T_marker_to_base` |
 
 - `axxb` = Park & Martin: rotation by least squares on rotation logarithms, translation by stacked linear least squares, over all sample pairs. Its result matches `cv2.calibrateHandEye(..., CALIB_HAND_EYE_PARK)` in the tests.
-- `axxb` needs relative rotations about at least two non-parallel axes. With this arm, change both J1 yaw and wrist pitch (>= 15 deg) between samples. Rotation about one axis only, or < 5 deg, raises `CalibrationError`.
+- `axxb` needs relative rotations about at least two non-parallel axes. With this arm, change both J1 yaw and wrist pitch (>= 15 deg) between samples; J5 swing and J6 roll add further rotation axes. Rotation about one axis only, or < 5 deg, raises `CalibrationError`.
 - Residuals: `point` reports the 3D point error per sample; `axxb` reports per-sample marker position (m) and rotation (deg) prediction errors in the camera frame. RMSE and max error are printed and saved.
 - Marker orientation from the device has 0.01 deg resolution (`r_deg`, 2 decimals). `point` does not use it.
 - Accuracy depends on the camera intrinsics and `MARKER_SIZE` on the device. Calibrate intrinsics first (next section).
