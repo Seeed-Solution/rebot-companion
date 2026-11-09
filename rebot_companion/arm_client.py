@@ -13,6 +13,8 @@ Typical use::
         s.torque(True)
         s.home()
         s.move_to([0.2, 0.1, 0.0, 0.0, 0.0, 0.0], duration=2.0)
+        s.move_pose([0.25, 0.0, 0.25])   # Cartesian action (armd with /api/v1/action/*)
+        s.gripper("close")
         s.unload()                    # park + torque off (if armd supports it)
     arm.e_stop()                      # REST, never needs the lease
 
@@ -28,6 +30,9 @@ Protocol summary (armd ``src/api/ws.rs``):
 * ``servo{sequence_id, positions, generation, epoch_id}`` streams targets; armd
   stops following the stream 200 ms after the last frame.
 * ``estop`` needs no lease and advances the epoch.
+* ``/api/v1/action/{move_to,move_relative,gripper}`` (and jog/home/unload) acks carry
+  ``action_id`` + ``expected_duration_s``; the observation's ``action`` field reports
+  ``running -> done | failed | cancelled`` for the latest action.
 """
 
 from __future__ import annotations
@@ -53,6 +58,7 @@ SERVO_MAX_STEP = 0.35  # rad; armd drops frames jumping further from its command
 SERVO_MIN_RATE_HZ = 10.0  # armd motion_frame_timeout is 200 ms
 GRIPPER_INDEX = 6  # 7-DOF B601-DM: joints 0..5 arm, 6 gripper
 SAFE_EXIT_POLICIES = ("off", "error", "always")
+ACTION_MAX_TIMEOUT_S = 60.0
 
 # --------------------------------------------------------------------------- errors
 
@@ -103,6 +109,17 @@ class ArmFaultError(ArmdError):
 
 class MotionTimeout(ArmdError):
     """Motion did not finish within the timeout. A stop command has been sent."""
+
+
+class ActionFailed(ArmdError):
+    """A high-level action ended ``failed`` or ``cancelled`` (``code`` is armd's ``action.code``)."""
+
+    def __init__(self, code: str, message: str = "", status: ActionStatus | None = None, obs: ArmStatus | None = None):
+        self.code = code
+        self.message = message
+        self.status = status
+        self.obs = obs
+        super().__init__(f"{code}: {message}" if message else code)
 
 
 class ServoJumpError(ArmdError, ValueError):
@@ -160,6 +177,74 @@ def _parse_safety_state(value: Any) -> tuple[str, str | None, Any]:
     return "Unknown", None, value
 
 
+ACTION_TERMINAL_STATES = ("done", "failed", "cancelled")
+
+
+def _opt_float(v: Any) -> float | None:
+    return None if v is None else float(v)
+
+
+@dataclass
+class ActionStatus:
+    """``ArmObservation.action``: the latest high-level action (rebot-armd agent action API).
+
+    ``kind``: move_to | move_relative | gripper | joint_move | home | park.
+    ``state``: running | done | failed | cancelled; ``code`` is set for failed / cancelled.
+    """
+
+    id: int
+    kind: str
+    state: str
+    tag: str | None = None
+    code: str | None = None
+    message: str | None = None
+    progress: float = 0.0
+    started_at: float = 0.0
+    finished_at: float | None = None
+    holding: bool | None = None
+    gripper_gap_rad: float | None = None
+    settled: bool | None = None
+
+    @classmethod
+    def from_dict(cls, d: dict) -> ActionStatus:
+        holding, settled = d.get("holding"), d.get("settled")
+        return cls(
+            id=int(d.get("id", 0)),
+            kind=str(d.get("kind", "")),
+            state=str(d.get("state", "")),
+            tag=d.get("tag"),
+            code=d.get("code"),
+            message=d.get("message"),
+            progress=float(d.get("progress") or 0.0),
+            started_at=float(d.get("started_at") or 0.0),
+            finished_at=_opt_float(d.get("finished_at")),
+            holding=None if holding is None else bool(holding),
+            gripper_gap_rad=_opt_float(d.get("gripper_gap_rad")),
+            settled=None if settled is None else bool(settled),
+        )
+
+    @property
+    def terminal(self) -> bool:
+        return self.state in ACTION_TERMINAL_STATES
+
+    def to_dict(self) -> dict:
+        return dict(self.__dict__)
+
+
+@dataclass
+class ActionResult:
+    """Outcome of :meth:`ArmSession.action`: the terminal action record and the observation that carried it.
+
+    ``action`` is None only for :meth:`ArmSession.home_action` / :meth:`ArmSession.park_action`
+    against an armd that does not report action records.
+    """
+
+    action: ActionStatus | None
+    status: ArmStatus
+    ack: dict
+    duration_s: float
+
+
 @dataclass
 class ArmStatus:
     """One ``ArmObservation`` as emitted by armd (REST ``GET /api/v1/observation`` or WS telemetry)."""
@@ -181,6 +266,8 @@ class ArmStatus:
     feedback_age_ms: list[int | None] = field(default_factory=list)
     disable_pending: bool = False
     feedback_valid: bool = False
+    commanded_positions: list[float] = field(default_factory=list)  # empty on armd without the field
+    action: ActionStatus | None = None
 
     @classmethod
     def from_dict(cls, d: dict) -> ArmStatus:
@@ -204,6 +291,8 @@ class ArmStatus:
             feedback_age_ms=list(d.get("feedback_age_ms") or []),
             disable_pending=bool(d.get("disable_pending", False)),
             feedback_valid=bool(d.get("feedback_valid", False)),
+            commanded_positions=floats("commanded_positions"),
+            action=ActionStatus.from_dict(d["action"]) if isinstance(d.get("action"), dict) else None,
         )
 
     @property
@@ -312,6 +401,19 @@ class ArmdClient:
     def session(self, client_id: str | None = None, **kwargs: Any) -> ArmSession:
         """Create (not yet opened) control session. Use as a context manager."""
         return ArmSession(self, client_id=client_id, **kwargs)
+
+
+def _vec(v: Sequence[float] | None, n: int, name: str) -> list[float]:
+    out = [float(x) for x in (v or [])]
+    if len(out) != n:
+        raise ValueError(f"{name} needs {n} values")
+    return out
+
+
+def _put_speed(body: dict, linear: float | None, angular: float | None) -> None:
+    speed = {k: float(v) for k, v in (("linear", linear), ("angular", angular)) if v is not None}
+    if speed:
+        body["speed"] = speed
 
 
 # --------------------------------------------------------------------------- WS session
@@ -848,6 +950,175 @@ class ArmSession:
         finally:
             self._unload_pending = False
 
+    # ---- high-level actions (armd /api/v1/action/*) --------------------------
+
+    def action(self, path: str, body: dict | None = None, timeout: float | None = None) -> ActionResult:
+        """Send an action command and block until its record in the observation is terminal.
+
+        armd answers with ``command_ack{action_id, expected_duration_s}`` and reports progress in
+        ``observation.action``. Default ``timeout`` is ``2 * expected_duration_s + 5`` capped at
+        60 s; on timeout ``stop`` is sent and :class:`MotionTimeout` raised. A ``failed`` or
+        ``cancelled`` action raises :class:`ActionFailed` with armd's code. Rejections before
+        the action starts (``IK_UNREACHABLE``, ``WORKSPACE_VIOLATION``, ``MOTION_BUSY``, ...)
+        raise :class:`ArmCommandRejected`.
+        """
+        return self._action(path, body, timeout, legacy_wait=None)
+
+    def move_pose(
+        self,
+        position: Sequence[float],
+        rpy: Sequence[float] | None = None,
+        quat: Sequence[float] | None = None,
+        linear_speed: float | None = None,
+        angular_speed: float | None = None,
+        tag: str | None = None,
+        timeout: float | None = None,
+    ) -> ActionResult:
+        """Straight-line Cartesian move of ``end_link`` to ``position`` (m, base frame).
+
+        Orientation: ``rpy`` (rad, URDF fixed-axis ``Rz @ Ry @ Rx``) or ``quat`` ``[w, x, y, z]``;
+        neither keeps the current orientation. armd defaults: 0.05 m/s, 0.5 rad/s.
+        (:meth:`move_to` is the joint-space jog.)
+        """
+        if rpy is not None and quat is not None:
+            raise ValueError("give rpy or quat, not both")
+        body: dict = {"position": _vec(position, 3, "position")}
+        body["orientation"] = (
+            {"rpy": _vec(rpy, 3, "rpy")} if rpy is not None else {"quat": _vec(quat, 4, "quat")} if quat else None
+        )
+        _put_speed(body, linear_speed, angular_speed)
+        if tag is not None:
+            body["tag"] = str(tag)
+        return self._action("/api/v1/action/move_to", body, timeout, legacy_wait=None)
+
+    def move_relative(
+        self,
+        frame: str = "base",
+        d: Sequence[float] = (0.0, 0.0, 0.0),
+        dyaw: float | None = None,
+        dpitch: float | None = None,
+        droll: float | None = None,
+        level: bool | None = None,
+        linear_speed: float | None = None,
+        angular_speed: float | None = None,
+        tag: str | None = None,
+        timeout: float | None = None,
+    ) -> ActionResult:
+        """Relative Cartesian move in ``frame`` (``base`` | ``tool`` | ``camera``); rotations in rad.
+
+        Rotations are centred on the ``end_link`` origin. In the ``camera`` frame translation uses
+        OpenCV axes (x right, y down, z optical); ``dpitch > 0`` looks down, ``dyaw > 0`` looks
+        right, and ``level`` (armd default true) keeps the image level.
+        """
+        if frame not in ("base", "tool", "camera"):
+            raise ValueError("frame must be base, tool or camera")
+        body: dict = {"frame": frame, "d": _vec(d, 3, "d")}
+        for key, val in (("dyaw", dyaw), ("dpitch", dpitch), ("droll", droll)):
+            if val is not None:
+                body[key] = float(val)
+        if level is not None:
+            body["level"] = bool(level)
+        _put_speed(body, linear_speed, angular_speed)
+        if tag is not None:
+            body["tag"] = str(tag)
+        return self._action("/api/v1/action/move_relative", body, timeout, legacy_wait=None)
+
+    def gripper(
+        self,
+        command: str,
+        fraction: float | None = None,
+        grasp: bool | None = None,
+        speed: float | None = None,
+        timeout_s: float | None = None,
+        tag: str | None = None,
+        timeout: float | None = None,
+    ) -> ActionResult:
+        """Gripper action: ``open``, ``close`` (``grasp`` default true) or ``move`` to ``fraction``.
+
+        ``fraction``: 0 closed .. 1 open (``move`` only). ``speed`` rad/s (armd default 1.0, max 2.0);
+        ``timeout_s`` is armd's own grasp timeout (default 6). The result's ``action.holding`` and
+        ``action.gripper_gap_rad`` report the grasp verdict.
+        """
+        if command not in ("open", "close", "move"):
+            raise ValueError("command must be open, close or move")
+        body: dict = {"command": command}
+        if command == "move":
+            if fraction is None or not 0.0 <= float(fraction) <= 1.0:
+                raise ValueError("move needs fraction in [0, 1]")
+            body["fraction"] = float(fraction)
+        if grasp is not None:
+            body["grasp"] = bool(grasp)
+        if speed is not None:
+            body["speed"] = float(speed)
+        if timeout_s is not None:
+            body["timeout_s"] = float(timeout_s)
+        if tag is not None:
+            body["tag"] = str(tag)
+        if timeout is None and timeout_s is not None:
+            timeout = float(timeout_s) + 5.0
+        return self._action("/api/v1/action/gripper", body, timeout, legacy_wait=None)
+
+    def home_action(self, timeout: float | None = None) -> ActionResult:
+        """:meth:`home` as an action (armd reports kind ``home``); falls back to the state-based wait."""
+        return self._action(
+            "/api/v1/motion/home",
+            {},
+            timeout,
+            legacy_wait=lambda frames, t: self._wait_motion(frames, None, t, None),
+        )
+
+    def park_action(self, timeout: float | None = None) -> ActionResult:
+        """:meth:`unload` as an action (kind ``park``): rest pose, then torque off."""
+        self._unload_pending = True
+        try:
+            return self._action(
+                "/api/v1/motion/unload",
+                {},
+                timeout or 30.0,
+                legacy_wait=lambda frames, t: self._wait_unload(frames, t),
+            )
+        finally:
+            self._unload_pending = False
+
+    def _action(self, path: str, body: dict | None, timeout: float | None, legacy_wait: Any) -> ActionResult:
+        t0 = time.monotonic()
+        ack: dict = {}
+
+        def send() -> None:
+            ack.update(self.command(path, body or {}))
+
+        frames_at_ack = self._frames_after(send)
+        action_id = ack.get("action_id")
+        expected = ack.get("expected_duration_s")
+        if timeout is None:
+            timeout = min(2.0 * float(expected) + 5.0, ACTION_MAX_TIMEOUT_S) if expected else ACTION_MAX_TIMEOUT_S
+        if not isinstance(action_id, int):
+            if legacy_wait is None:
+                try:
+                    self.stop()
+                except ArmdError:
+                    pass
+                raise ArmdError(f"armd accepted {path} but returned no action_id (armd too old?); stop sent")
+            obs = legacy_wait(frames_at_ack, timeout)
+            return ActionResult(None, obs, ack, time.monotonic() - t0)
+
+        def finished(o: ArmStatus) -> bool:
+            a = o.action
+            if a is not None and a.id == action_id and a.terminal:
+                if a.state != "done":
+                    raise ActionFailed(a.code or a.state.upper(), a.message or "", a, o)
+                return True
+            if a is not None and a.id > action_id:
+                # The observation carries only the latest record: a newer action replaced this one.
+                raise ActionFailed("SUPERSEDED", f"replaced by {a.kind} action {a.id}", None, o)
+            if o.is_stopped:  # armd reconciles the action in the same tick; this is a fallback
+                code = "ESTOP_ACTIVE" if o.e_stopped else "FAULT"
+                raise ActionFailed(code, o.fault_reason or "", a if a is not None and a.id == action_id else None, o)
+            return False
+
+        obs = self._wait_until(frames_at_ack, finished, timeout, f"action {action_id} to finish", check_stopped=False)
+        return ActionResult(obs.action, obs, ack, time.monotonic() - t0)
+
     def servo(self, positions: Sequence[float]) -> None:
         """Send one streaming servo frame (no reply on success).
 
@@ -963,7 +1234,9 @@ class ArmSession:
 
         return self._wait_until(frames_at_ack, arrived, timeout, "motion to finish")
 
-    def _wait_until(self, frames_at_ack: int, predicate: Any, timeout: float, what: str) -> ArmStatus:
+    def _wait_until(
+        self, frames_at_ack: int, predicate: Any, timeout: float, what: str, check_stopped: bool = True
+    ) -> ArmStatus:
         # Skip frames that may have been computed before the command took effect.
         min_frame = frames_at_ack + 2
         deadline = time.monotonic() + timeout
@@ -975,7 +1248,7 @@ class ArmSession:
                 if self._lease_lost is not None:
                     break
                 if obs is not None and self._frames >= min_frame:
-                    if obs.is_stopped:
+                    if check_stopped and obs.is_stopped:
                         raise ArmFaultError(obs)
                     if predicate(obs):
                         return obs
@@ -995,6 +1268,9 @@ __all__ = [
     "ArmdClient",
     "ArmSession",
     "ArmStatus",
+    "ActionStatus",
+    "ActionResult",
+    "ActionFailed",
     "ObservationSchema",
     "JointLimit",
     "ArmdError",

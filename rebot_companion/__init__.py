@@ -2,6 +2,9 @@
 
 from . import ik, kinematics, snapshot
 from .arm_client import (
+    ActionFailed,
+    ActionResult,
+    ActionStatus,
     ArmCommandRejected,
     ArmConnectionError,
     ArmdClient,
@@ -31,6 +34,9 @@ __all__ = [
     "ArmdClient",
     "ArmSession",
     "ArmStatus",
+    "ActionStatus",
+    "ActionResult",
+    "ActionFailed",
     "ObservationSchema",
     "ArmdError",
     "ArmConnectionError",
