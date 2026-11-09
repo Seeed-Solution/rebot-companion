@@ -1,16 +1,38 @@
 # rebot-companion
 
+<div align="center">
+
+### 🤖 Robot Arm Vision Companion Toolkit & MCP Server for AI Agents
+
+**Control a reBot arm from AI agents over MCP, with reCamera snapshots, detections and hand-eye calibration**
+
+[![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg?style=flat-square&logo=python)](https://www.python.org/)
+[![License](https://img.shields.io/badge/License-MIT-green.svg?style=flat-square)](LICENSE)
+[![MCP Server](https://img.shields.io/badge/MCP-2.x_Stdio-purple.svg?style=flat-square)](https://modelcontextprotocol.io)
+[![CI](https://img.shields.io/github/actions/workflow/status/Seeed-Solution/rebot-companion/ci.yml?branch=master&style=flat-square&label=CI)](https://github.com/Seeed-Solution/rebot-companion/actions)
+[![Target Arm](https://img.shields.io/badge/Robot-reBot_B601--DM-orange.svg?style=flat-square)](https://github.com/Seeed-Solution/rebot-armd)
+[![Vision](https://img.shields.io/badge/Vision-Seeed_reCamera_SG2002-red.svg?style=flat-square)](https://www.seeedstudio.com)
+
 English | [中文](./README.zh-CN.md)
 
-Python SDK and MCP server for a **reBot B601-DM** robot arm driven by
-[rebot-armd](https://github.com/Seeed-Solution/rebot-armd) on a **Seeed reCamera**, plus
-camera snapshots, object detection, ArUco marker poses and hand-eye calibration.
+<!-- TODO: Add demo GIF of AI Agent controlling the arm and camera via MCP here -->
 
-- `rebot_companion` (SDK): rebot-armd client (REST reads, WebSocket control lease, joint and
-  Cartesian actions), reCamera ArUco trigger client, JPEG snapshots from the camera H.264
-  stream, B601-DM kinematics, hand-eye calibration, and a deterministic pick-and-place pipeline.
-- `rebot-mcp`: a stdio [MCP](https://modelcontextprotocol.io) server that exposes the arm,
-  snapshots and detections as tools to an agent.
+</div>
+
+---
+
+Python SDK and stdio [MCP](https://modelcontextprotocol.io) server bridging **Seeed reCamera (SG2002 RISC-V edge vision)** and **[rebot-armd](https://github.com/Seeed-Solution/rebot-armd) (Rust arm daemon)**.
+
+- `rebot_companion` (SDK): rebot-armd client (REST reads, WebSocket control lease, joint and Cartesian actions), reCamera ArUco trigger client, JPEG snapshots from the camera H.264 stream, B601-DM kinematics, hand-eye calibration, and a deterministic pick-and-place pipeline.
+- `rebot-mcp`: a stdio [MCP](https://modelcontextprotocol.io) server that exposes the arm, snapshots and detections as tools to AI agents.
+
+## Key Features
+
+- **Stdio MCP server for AI agents (`rebot-mcp`)**: 14 tools by default (state, snapshots, detection, motion, gripper, stop). Works with MCP clients that support stdio servers; end-to-end tests used the Python `mcp` client against a real arm. Fault clearing and cockpit takeover are off unless enabled at launch (see [MCP server](#mcp-server-agent-control)).
+- **Hand-eye calibration**: eye-to-hand (closed-form Horn point registration) and eye-in-hand (Park & Martin $AX=XB$), cross-checked against OpenCV `CALIB_HAND_EYE_PARK` in the tests. Accuracy is verified on synthetic data only; it has not been measured on a real arm yet.
+- **Two stages**: Stage 1, an agent orchestrates the tools; Stage 2, a deterministic local pick-and-place pipeline that needs no LLM.
+- **Kinematics**: full URDF forward kinematics (within 0.1 mm of an independent URDF parser in the tests) and an analytic planar inverse kinematics solver for the B601-DM.
+- **reCamera integration**: nothing from this package runs on the camera. On-demand detection triggers (6-DoF ArUco marker poses, YOLO 2D boxes) and JPEG snapshots decoded on the host from the camera's H.264 stream.
 
 > This software moves a real arm. Read [Safety](#safety) before running anything that moves.
 
@@ -18,6 +40,7 @@ camera snapshots, object detection, ArUco marker poses and hand-eye calibration.
 
 ## Contents
 
+- [Key Features](#key-features)
 - [Architecture](#architecture)
 - [Requirements](#requirements)
 - [Install](#install)
@@ -31,6 +54,7 @@ camera snapshots, object detection, ArUco marker poses and hand-eye calibration.
 - [Examples](#examples)
 - [Safety](#safety)
 - [Development](#development)
+- [Acknowledgements](#acknowledgements)
 - [License](#license)
 
 ---
@@ -274,7 +298,32 @@ uv run --directory /path/to/rebot-companion --extra agent rebot-mcp \
   [--allow-clear-fault] [--allow-preempt] [--log-level INFO]
 ```
 
-Add it to Claude Code:
+### Agent Integration (MCP Clients)
+
+#### Generic MCP configuration (clients that use `mcpServers`, e.g. Claude Desktop `claude_desktop_config.json`, Cursor, Windsurf)
+
+Add `rebot` to the `mcpServers` object in your agent's MCP configuration:
+
+```json
+{
+  "mcpServers": {
+    "rebot": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory", "/path/to/rebot-companion",
+        "--extra", "agent",
+        "rebot-mcp",
+        "--armd", "http://192.168.42.1:8765"
+      ]
+    }
+  }
+}
+```
+
+The camera stream defaults to `ws://192.168.42.1:8001/`; add `"--camera-ws", "ws://<host>:8001/"` when the reCamera has another address. Clients with a different config format (for example OpenCode) need the same command and arguments in their own format.
+
+#### Claude Code CLI
 
 ```bash
 claude mcp add rebot -- uv run --directory /path/to/rebot-companion --extra agent rebot-mcp \
@@ -562,6 +611,15 @@ node tools/gen_web_fixtures.mjs ../rebot-armd/src/api/index.html   # regenerate 
 The tests use in-process fakes (armd: `tests/fake_armd.py`) and recorded fixtures; they need no
 hardware. CI (`.github/workflows/ci.yml`) runs ruff and pytest with all extras on Python 3.10,
 3.11, 3.12 and 3.13. See [CONTRIBUTING.md](./CONTRIBUTING.md) and [SECURITY.md](./SECURITY.md).
+
+---
+
+## Acknowledgements
+
+- **[Model Context Protocol (MCP)](https://modelcontextprotocol.io)**: Open standard for connecting AI agents to real-world tools;
+- **[rebot-armd](https://github.com/Seeed-Solution/rebot-armd)**: Rust arm daemon with LeRobot Parquet recording;
+- **[Seeed Studio](https://www.seeedstudio.com/)**: reCamera SG2002 smart sensor & reBot B601-DM arm platform;
+- **[OpenCV](https://opencv.org/)**: Camera calibration and computer vision algorithms.
 
 ---
 

@@ -1,16 +1,38 @@
 # rebot-companion
 
+<div align="center">
+
+### 🤖 面向 AI Agent 的机械臂视觉伴侣 SDK 与 MCP 工具服务器
+
+**通过 MCP 让 AI Agent 控制 reBot 机械臂，并使用 reCamera 快照、检测和手眼标定**
+
+[![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg?style=flat-square&logo=python)](https://www.python.org/)
+[![License](https://img.shields.io/badge/License-MIT-green.svg?style=flat-square)](LICENSE)
+[![MCP Server](https://img.shields.io/badge/MCP-2.x_Stdio-purple.svg?style=flat-square)](https://modelcontextprotocol.io)
+[![CI](https://img.shields.io/github/actions/workflow/status/Seeed-Solution/rebot-companion/ci.yml?branch=master&style=flat-square&label=CI)](https://github.com/Seeed-Solution/rebot-companion/actions)
+[![Target Arm](https://img.shields.io/badge/Robot-reBot_B601--DM-orange.svg?style=flat-square)](https://github.com/Seeed-Solution/rebot-armd)
+[![Vision](https://img.shields.io/badge/Vision-Seeed_reCamera_SG2002-red.svg?style=flat-square)](https://www.seeedstudio.com)
+
 [English](./README.md) | 中文
 
-用于 **reBot B601-DM** 机械臂的 Python SDK 和 MCP 服务器。机械臂由运行在 **Seeed reCamera**
-上的 [rebot-armd](https://github.com/Seeed-Solution/rebot-armd) 驱动；本项目同时提供相机快照、
-目标检测、ArUco 标记位姿和手眼标定。
+<!-- TODO: Add demo GIF of AI Agent controlling the arm and camera via MCP here -->
 
-- `rebot_companion`（SDK）：rebot-armd 客户端（REST 读取、WebSocket 控制租约、关节与笛卡尔动作）、
-  reCamera ArUco 触发客户端、从相机 H.264 流截取 JPEG 快照、B601-DM 运动学、手眼标定、
-  确定性抓放流水线。
-- `rebot-mcp`：stdio [MCP](https://modelcontextprotocol.io) 服务器，把机械臂、快照和检测作为工具
-  提供给 agent。
+</div>
+
+---
+
+用于 **reBot B601-DM** 机械臂的 Python SDK 和 stdio [MCP](https://modelcontextprotocol.io) 服务器。机械臂由运行在 **Seeed reCamera** 上的 [rebot-armd](https://github.com/Seeed-Solution/rebot-armd) 驱动；本项目同时提供相机快照、目标检测、ArUco 标记位姿和手眼标定。
+
+- `rebot_companion`（SDK）：rebot-armd 客户端（REST 读取、WebSocket 控制租约、关节与笛卡尔动作）、reCamera ArUco 触发客户端、从相机 H.264 流截取 JPEG 快照、B601-DM 运动学、手眼标定、确定性抓放流水线。
+- `rebot-mcp`：stdio [MCP](https://modelcontextprotocol.io) 服务器，把机械臂、快照和检测作为工具提供给各类 AI Agent。
+
+## 核心特性
+
+- **面向 AI Agent 的 stdio MCP 服务器（`rebot-mcp`）**：默认提供 14 个工具（状态、快照、检测、运动、夹爪、停止）。可用于支持 stdio 服务器的 MCP 客户端；端到端测试使用 Python `mcp` 客户端连接真机。清除故障和从驾驶舱接管默认关闭，需启动时显式开启（见 [MCP 服务器](#mcp-服务器agent-控制)）。
+- **手眼标定**：眼在手外（闭式 Horn 点配准）与眼在手上（Park & Martin $AX=XB$），测试中与 OpenCV `CALIB_HAND_EYE_PARK` 交叉对比。精度仅在合成数据上验证，尚未在真机上实测。
+- **两阶段**：阶段 1 由 Agent 编排工具；阶段 2 为不依赖大模型的本地确定性抓放流水线。
+- **运动学**：完整 URDF 正运动学（测试中与独立 URDF 解析器相差 0.1 mm 以内）及 B601-DM 平面解析逆运动学。
+- **reCamera 接入**：本项目不在相机上运行任何代码。支持按需触发检测（ArUco 标记 6-DoF 位姿、YOLO 2D 框），以及在主机端从相机 H.264 流解码 JPEG 快照。
 
 > 本软件会驱动真实的机械臂。运行任何会动的代码之前，先阅读[安全](#安全)。
 
@@ -18,6 +40,7 @@
 
 ## 目录
 
+- [核心特性](#核心特性)
 - [架构](#架构)
 - [硬件与软件要求](#硬件与软件要求)
 - [安装](#安装)
@@ -31,6 +54,7 @@
 - [示例](#示例)
 - [安全](#安全)
 - [开发](#开发)
+- [致谢](#致谢)
 - [许可证](#许可证)
 
 ---
@@ -261,7 +285,32 @@ uv run --directory /path/to/rebot-companion --extra agent rebot-mcp \
   [--allow-clear-fault] [--allow-preempt] [--log-level INFO]
 ```
 
-添加到 Claude Code：
+### 接入 AI Agent 客户端
+
+#### 通用 MCP 客户端配置（使用 `mcpServers` 字段的客户端，如 Claude Desktop 的 `claude_desktop_config.json`、Cursor、Windsurf）
+
+在 Agent 的 MCP 配置文件中的 `mcpServers` 字段中添加：
+
+```json
+{
+  "mcpServers": {
+    "rebot": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory", "/path/to/rebot-companion",
+        "--extra", "agent",
+        "rebot-mcp",
+        "--armd", "http://192.168.42.1:8765"
+      ]
+    }
+  }
+}
+```
+
+相机流默认 `ws://192.168.42.1:8001/`；reCamera 地址不同时加 `"--camera-ws", "ws://<host>:8001/"`。配置格式不同的客户端（如 OpenCode）按其自身格式填写同样的命令和参数。
+
+#### Claude Code 命令行添加
 
 ```bash
 claude mcp add rebot -- uv run --directory /path/to/rebot-companion --extra agent rebot-mcp \
@@ -516,6 +565,15 @@ node tools/gen_web_fixtures.mjs ../rebot-armd/src/api/index.html   # 重新生�
 测试使用进程内的模拟对象（armd：`tests/fake_armd.py`）和录制的数据，不需要硬件。CI
 （`.github/workflows/ci.yml`）在 Python 3.10、3.11、3.12 和 3.13 上安装全部 extras 运行 ruff 和 pytest。
 另见 [CONTRIBUTING.md](./CONTRIBUTING.md) 和 [SECURITY.md](./SECURITY.md)（英文）。
+
+---
+
+## 致谢
+
+- **[Model Context Protocol (MCP)](https://modelcontextprotocol.io)**：连接 AI Agent 与物理工具的开放协议标准；
+- **[rebot-armd](https://github.com/Seeed-Solution/rebot-armd)**：带 LeRobot Parquet 录制的 Rust 机械臂守护进程；
+- **[Seeed Studio](https://www.seeedstudio.com/)**：reCamera SG2002 边缘视觉传感器与 reBot B601-DM 机械臂平台；
+- **[OpenCV](https://opencv.org/)**：相机标定与计算机视觉算法库。
 
 ---
 
