@@ -5,6 +5,18 @@ lease required for every actuator command, generation + epoch checks,
 strictly increasing request_id / sequence_id, heartbeat-driven lease expiry,
 watchdog Fault(WatchdogTimeout) while torqued without heartbeats, 200 ms servo
 frame timeout, and lease-free e-stop over WS and REST.
+
+Safety rules modelled because the SDK depends on them (armd source in brackets):
+
+* 7-DOF B601-DM layout: home J6 = pi/2, gripper J7 limit -5.75..0.10 [model.rs:215-218];
+  any target of another length is rejected [safety.rs:232].
+* Servo frames jumping > 0.35 rad from the commanded position (gripper exempt) are dropped
+  silently, without a reply [supervisor.rs:1450-1471].
+* torque(False) away from the resting pose is refused (ARM_NOT_AT_RESTING_POSE)
+  [supervisor.rs:462, model.rs RestingPosePolicy::rebot_dm].
+* unload without a resting-pose profile answers UNSUPPORTED [api/ws.rs:68]; releasing the
+  lease or stop cancels a pending unload [supervisor.rs:229 stop_motion].
+* A failed post-unload torque cut leaves the arm Armed and torqued [supervisor.rs:1430].
 """
 
 from __future__ import annotations
@@ -26,12 +38,25 @@ from rebot_companion.arm_client import (
     ArmStatus,
     LeaseError,
     MotionTimeout,
+    SafeExitOutcome,
+    ServoJumpError,
     ServoRejected,
+    UnloadFailed,
 )
 
-DOF = 6
-LIMITS = [(-3.14, 3.14)] * DOF
+DOF = 7
+HOME = [0.0, 0.0, 0.0, 0.0, 0.0, 1.5707963, 0.0]
+LIMITS = [(-3.14, 3.14)] * 6 + [(-5.75, 0.10)]
+REST_TOL = [0.15, 0.08, 0.08, 0.08, 0.08, 0.08]  # RestingPosePolicy::rebot_dm (gripper excluded)
+SERVO_JUMP = 0.35
 TICK = 0.02  # 50 Hz like armd's default control_frequency_hz
+
+
+def q(*first: float) -> list[float]:
+    """HOME with the leading joints replaced, e.g. ``q(0.1)`` nudges only J1."""
+    out = list(HOME)
+    out[: len(first)] = [float(x) for x in first]
+    return out
 
 
 class FakeArmd:
@@ -44,8 +69,11 @@ class FakeArmd:
         self.epoch = 1
         self.is_torqued = False
         self.pending_rearm = False
-        self.positions = [0.0] * DOF
-        self.home = [0.0] * DOF
+        self.positions = list(HOME)
+        self.home = list(HOME)
+        self.resting_pose = True  # False: no resting-pose profile -> unload UNSUPPORTED
+        self.fail_torque_cut = False  # True: post-unload torque cut fails (arm stays Armed, torqued)
+        self.dropped_servo_frames = 0
         self.traj: tuple[list[float], list[float], float, float] | None = None
         self.servo_target: list[float] | None = None
         self.last_motion_frame = time.monotonic()
@@ -83,13 +111,17 @@ class FakeArmd:
     def trigger_fault(self, reason: str) -> None:
         self.state, self.fault = "Fault", reason
         self.epoch += 1
-        self.traj = None
-        self.servo_target = None
+        self.stop_motion()
 
     def tick(self) -> None:
         with self.lock:
             now = time.monotonic()
-            if self.is_torqued and self.state in ("Armed", "Moving") and now - self.last_heartbeat > self.lease_timeout:
+            if (
+                self.is_torqued
+                and self.state in ("Armed", "Moving")
+                and not self.pending_unload
+                and now - self.last_heartbeat > self.lease_timeout
+            ):
                 self.trigger_fault("WatchdogTimeout")
             if self.traj and not self.freeze_motion:
                 start, end, t0, dur = self.traj
@@ -101,8 +133,11 @@ class FakeArmd:
                         self.state = "Armed"
                     if self.pending_unload:
                         self.pending_unload = False
-                        self.is_torqued = False
-                        self.state = "Idle"
+                        if self.fail_torque_cut or self.resting_violation():
+                            self.state = "Armed"  # set_torque(false) failed -> mark_motion_finished
+                        else:
+                            self.is_torqued = False
+                            self.state = "Idle"
             elif self.servo_target is not None:
                 if now - self.last_motion_frame > self.frame_timeout:
                     self.servo_target = None
@@ -114,6 +149,14 @@ class FakeArmd:
             text = json.dumps(self.observation())
         for conn_id in list(self.conns):
             self.send(conn_id, text)
+
+    def resting_violation(self) -> bool:
+        return any(abs(p - h) > t for p, h, t in zip(self.positions, self.home, REST_TOL))
+
+    def stop_motion(self) -> None:
+        self.traj = None
+        self.servo_target = None
+        self.pending_unload = False
 
     def run_ticker(self) -> None:
         while not self._stop.wait(TICK):
@@ -168,8 +211,7 @@ class FakeArmd:
                 self.conns.pop(conn, None)
                 if local_gen and self.lease and self.lease["conn"] == conn and self.lease["generation"] == local_gen:
                     self.lease = None
-                    self.traj = None
-                    self.servo_target = None
+                    self.stop_motion()
 
     def handle(self, conn, msg, kind, local_gen, label, last_seq, last_req):
         if kind in ("estop", "e_stop"):
@@ -206,8 +248,7 @@ class FakeArmd:
             if not (active and lease["conn"] == conn):
                 self.gen_counter += 1
                 self.lease = {"conn": conn, "generation": self.gen_counter, "acquired_at": time.monotonic()}
-                self.traj = None
-                self.servo_target = None
+                self.stop_motion()
             if evicted is not None:
                 self.send(
                     evicted,
@@ -254,8 +295,7 @@ class FakeArmd:
             return {"type": "lease_lost", "generation": local_gen}, local_gen, label, last_seq, last_req
         if kind == "release_lease":
             self.lease = None
-            self.traj = None
-            self.servo_target = None
+            self.stop_motion()
             return {"type": "lease_released", "success": True}, 0, None, last_seq, last_req
         if msg.get("epoch_id") != self.epoch:
             if kind == "command":
@@ -360,7 +400,12 @@ class FakeArmd:
                     last_seq,
                     last_req,
                 )
-            self.servo_target = list(msg["positions"])
+            target = list(msg["positions"])
+            if any(abs(t - p) > SERVO_JUMP for i, (t, p) in enumerate(zip(target, self.positions)) if i != 6):
+                self.dropped_servo_frames += 1  # armd discards the frame without a reply
+                self.servo_target = None
+                return None, local_gen, label, last_seq, last_req
+            self.servo_target = target
             self.last_motion_frame = self.last_heartbeat = time.monotonic()
             self.state = "Moving"
             return None, local_gen, label, last_seq, last_req
@@ -394,6 +439,9 @@ class FakeArmd:
                 return 409, "ESTOP_ACTIVE"
             if self.state == "Fault":
                 return 409, "FAULT_ACTIVE"
+            if not enable and (not self.resting_pose or self.resting_violation()):
+                return 409, "ARM_NOT_AT_RESTING_POSE"
+            self.stop_motion()
             self.is_torqued = enable
             self.state = "Armed" if enable else "Idle"
             self.pending_rearm = False
@@ -416,14 +464,15 @@ class FakeArmd:
                 self.start_traj(self.home, body.get("duration_secs"))
             return err
         if path == "/api/v1/motion/unload":
+            if not self.resting_pose:
+                return 422, "UNSUPPORTED"
             if self.state not in ("Armed", "Moving"):
                 return 412, "NOT_ARMED"
             self.start_traj(self.home, 0.3)
             self.pending_unload = True
             return None
         if path == "/api/v1/motion/stop":
-            self.traj = None
-            self.servo_target = None
+            self.stop_motion()
             if self.state == "Moving":
                 self.state = "Armed"
             return None
@@ -432,8 +481,7 @@ class FakeArmd:
     def do_estop(self) -> None:
         self.state, self.fault = "EStop", None
         self.epoch += 1
-        self.traj = None
-        self.servo_target = None
+        self.stop_motion()
 
     # ---- REST (served through httpx.MockTransport) -------------------------
     def rest(self, request: httpx.Request) -> httpx.Response:
@@ -546,13 +594,13 @@ def test_full_motion_cycle(armd):
         ack = s.torque(True)
         assert ack["is_torqued"] is True
         t0 = time.monotonic()
-        done = s.move_to([0.3, -0.2, 0.1, 0, 0, 0], duration=0.4)
+        done = s.move_to(q(0.3, -0.2, 0.1), duration=0.4)
         assert time.monotonic() - t0 >= 0.35  # blocked until the trajectory finished
         assert done.safety_state == "Armed"
-        assert done.positions == pytest.approx([0.3, -0.2, 0.1, 0, 0, 0], abs=1e-6)
+        assert done.positions == pytest.approx(q(0.3, -0.2, 0.1), abs=1e-6)
         done = s.home(duration=0.2)
-        assert done.positions == pytest.approx([0.0] * DOF, abs=1e-6)
-        s.servo_stream([[0.01 * i, 0, 0, 0, 0, 0] for i in range(1, 11)], rate_hz=50)
+        assert done.positions == pytest.approx(HOME, abs=1e-6)
+        s.servo_stream([q(0.01 * i) for i in range(1, 11)], rate_hz=50)
         time.sleep(0.15)
         assert s.latest_observation().positions[0] == pytest.approx(0.1, abs=0.02)
         done = s.unload()
@@ -577,7 +625,7 @@ def test_heartbeat_keeps_lease_past_timeout(armd):
         obs = s.wait_for_observation()
         assert obs.safety_state == "Armed"
         assert armd.heartbeats >= 5
-        s.move_to([0.1, 0, 0, 0, 0, 0], duration=0.1)
+        s.move_to(q(0.1), duration=0.1)
 
 
 def test_heartbeat_starvation_trips_watchdog_and_rejects_motion(armd):
@@ -587,7 +635,7 @@ def test_heartbeat_starvation_trips_watchdog_and_rejects_motion(armd):
         time.sleep(armd.lease_timeout * 2)
         assert armd.client.get_observation().fault_reason == "WatchdogTimeout"
         with pytest.raises(LeaseError):
-            s.move_to([0.1, 0, 0, 0, 0, 0], duration=0.1)
+            s.move_to(q(0.1), duration=0.1)
     finally:
         s.close()
 
@@ -598,15 +646,15 @@ def test_epoch_change_invalidates_commands_and_clear_fault_recovers(armd):
         res = armd.client.e_stop()  # REST e-stop while another connection holds the lease
         assert res == {"safety_state": "EStop", "epoch_id": 2}
         with pytest.raises(ArmCommandRejected) as exc:
-            s.move_to([0.1, 0, 0, 0, 0, 0], duration=0.1)
+            s.move_to(q(0.1), duration=0.1)
         assert exc.value.code in ("EPOCH_MISMATCH", "ESTOP_ACTIVE")
         ack = s.clear_fault()
         assert ack["epoch_id"] == 3 and ack["safety_state"] == "Idle"
         with pytest.raises(ArmCommandRejected) as exc:  # clear_fault leaves the arm needing re-arm
-            s.move_to([0.1, 0, 0, 0, 0, 0], duration=0.1)
+            s.move_to(q(0.1), duration=0.1)
         assert exc.value.code == "NOT_ARMED"
         s.torque(True)
-        s.move_to([0.1, 0, 0, 0, 0, 0], duration=0.1)
+        s.move_to(q(0.1), duration=0.1)
         assert s.has_lease  # heartbeats followed the epoch change
 
 
@@ -626,7 +674,7 @@ def test_estop_during_motion_raises_fault(armd):
         s.torque(True)
         threading.Timer(0.15, armd.client.e_stop).start()
         with pytest.raises(ArmFaultError) as exc:
-            s.move_to([1.0, 0, 0, 0, 0, 0], duration=1.0)
+            s.move_to(q(1.0), duration=1.0)
         assert exc.value.status.e_stopped
 
 
@@ -635,7 +683,7 @@ def test_motion_timeout_sends_stop(armd):
     with armd.client.session(client_id="to") as s:
         s.torque(True)
         with pytest.raises(MotionTimeout):
-            s.move_to([0.5, 0, 0, 0, 0, 0], duration=0.1, timeout=0.4)
+            s.move_to(q(0.5), duration=0.1, timeout=0.4)
     assert armd.commands[-1] == "/api/v1/motion/stop"
 
 
@@ -648,7 +696,7 @@ def test_preemption_surfaces_lease_lost(armd):
             time.sleep(0.1)
             assert not a.has_lease
             with pytest.raises(LeaseError):
-                a.move_to([0.1, 0, 0, 0, 0, 0], duration=0.1)
+                a.move_to(q(0.1), duration=0.1)
     finally:
         a.close()
 
@@ -657,17 +705,187 @@ def test_soft_limit_and_servo_reject(armd):
     with armd.client.session(client_id="lim") as s:
         s.torque(True)
         with pytest.raises(ArmCommandRejected) as exc:
-            s.move_to([9.0, 0, 0, 0, 0, 0], duration=0.1)
+            s.move_to(q(9.0), duration=0.1)
         assert exc.value.code == "SOFT_LIMIT_EXCEEDED"
-        s.move_to([0.5, 0, 0, 0, 0, 0], duration=0.5, wait=False)
-        s.servo([0.4, 0, 0, 0, 0, 0])  # servo while a trajectory runs -> servo_reject NOT_ARMED
+        s.move_to(q(0.5), duration=0.5, wait=False)
+        s.servo(q(0.2))  # servo while a trajectory runs -> servo_reject NOT_ARMED
         time.sleep(0.1)
         with pytest.raises(ServoRejected) as exc:
-            s.servo([0.4, 0, 0, 0, 0, 0])
+            s.servo(q(0.2))
         assert exc.value.code == "NOT_ARMED"
 
 
 def test_servo_stream_rejects_low_rate(armd):
     with armd.client.session(client_id="rate") as s:
         with pytest.raises(ValueError):
-            s.servo_stream([[0] * DOF], rate_hz=4)
+            s.servo_stream([HOME], rate_hz=9)
+
+
+# ------------------------------------------------------------- armd safety rules ---
+
+
+def test_targets_must_have_seven_joints(armd):
+    with armd.client.session(client_id="len") as s:
+        s.torque(True)
+        with pytest.raises(ArmCommandRejected) as exc:
+            s.move_to([0.0] * 6, duration=0.1)
+        assert exc.value.code == "SAFETY_ERROR"
+
+
+def test_torque_off_refused_away_from_rest(armd):
+    with armd.client.session(client_id="rest", safe_exit="off") as s:
+        s.torque(True)
+        s.move_to(q(0.5), duration=0.2)
+        with pytest.raises(ArmCommandRejected) as exc:
+            s.torque(False)
+        assert exc.value.code == "ARM_NOT_AT_RESTING_POSE"
+        assert s.latest_observation().is_torqued
+        s.unload()
+
+
+def test_servo_jump_raises_instead_of_silent_drop(armd):
+    with armd.client.session(client_id="jump") as s:
+        s.torque(True)
+        with pytest.raises(ServoJumpError, match="joint 1"):
+            s.servo(q(0.5))  # 0.5 rad from the observed position
+        s.servo(q(0.0, 0.0, 0.0, 0.0, 0.0, 1.5707963, -3.0))  # gripper is exempt
+        s.servo_stream([q(0.05 * i) for i in range(1, 5)], rate_hz=50)
+        with pytest.raises(ServoJumpError):
+            s.servo_stream([q(0.2), q(0.6)], rate_hz=50)  # step from the previous frame
+        assert armd.dropped_servo_frames == 0  # nothing reached armd that it would drop
+
+
+def test_fake_armd_drops_large_servo_jump_without_reply(armd):
+    with armd.client.session(client_id="raw") as s:
+        s.torque(True)
+        s._send(
+            {
+                "type": "servo",
+                "client_id": s.client_id,
+                "generation": s.generation,
+                "sequence_id": 1,
+                "epoch_id": s.epoch_id,
+                "positions": q(0.5),
+            }
+        )
+        time.sleep(0.1)
+        assert armd.dropped_servo_frames == 1
+        assert s._servo_error is None  # no servo_reject
+        assert s.latest_observation().positions[0] == pytest.approx(0.0)
+
+
+def test_unload_unsupported_without_resting_pose(armd):
+    armd.resting_pose = False
+    with armd.client.session(client_id="nrp", safe_exit="off") as s:
+        s.torque(True)
+        with pytest.raises(ArmCommandRejected) as exc:
+            s.unload()
+        assert exc.value.code == "UNSUPPORTED"
+
+
+def test_unload_reports_failed_torque_cut_without_waiting_full_timeout(armd):
+    armd.fail_torque_cut = True
+    with armd.client.session(client_id="cut", safe_exit="off") as s:
+        s.torque(True)
+        s.move_to(q(0.2), duration=0.1)
+        t0 = time.monotonic()
+        with pytest.raises(UnloadFailed) as exc:
+            s.unload(timeout=10.0)
+        assert time.monotonic() - t0 < 2.0
+        assert exc.value.status.is_torqued and exc.value.status.safety_state == "Armed"
+
+
+def test_unload_without_wait_is_finished_before_close(armd):
+    with armd.client.session(client_id="nowait", safe_exit="off") as s:
+        s.torque(True)
+        s.move_to(q(0.3), duration=0.1)
+        s.unload(wait=False)
+    # release would have cancelled the unload; close waited for it instead
+    assert armd.state == "Idle" and not armd.is_torqued
+    assert armd.positions == pytest.approx(HOME, abs=1e-6)
+
+
+# ------------------------------------------------------------------- safe exit ---
+
+
+def _assert_parked(armd):
+    time.sleep(armd.lease_timeout * 1.5)  # past the watchdog window: no Fault latched
+    obs = armd.client.get_observation()
+    assert obs.safety_state == "Idle" and not obs.is_torqued
+    assert obs.positions == pytest.approx(HOME, abs=1e-6)
+
+
+def test_safe_exit_unloads_on_exception(armd):
+    with pytest.raises(RuntimeError):
+        with armd.client.session(client_id="err") as s:
+            s.torque(True)
+            s.move_to(q(0.4), duration=0.1)
+            raise RuntimeError("cycle failed")
+    assert s.safe_exit_outcome == SafeExitOutcome("unloaded", "parked at the resting pose, torque off")
+    assert armd.commands[-1] == "/api/v1/motion/unload"
+    assert armd.lease is None
+    _assert_parked(armd)
+
+
+def test_safe_exit_on_keyboard_interrupt(armd):
+    with pytest.raises(KeyboardInterrupt):
+        with armd.client.session(client_id="kbi") as s:
+            s.torque(True)
+            s.move_to(q(0.4), duration=0.5, wait=False)
+            raise KeyboardInterrupt
+    assert s.safe_exit_outcome.action == "unloaded"
+    _assert_parked(armd)
+
+
+def test_safe_exit_clears_fault_then_unloads(armd):
+    with pytest.raises(ArmFaultError):
+        with armd.client.session(client_id="flt") as s:
+            s.torque(True)
+            threading.Timer(0.1, armd.trigger_fault, args=("Other",)).start()
+            s.move_to(q(0.6), duration=1.0)
+    assert s.safe_exit_outcome.action == "unloaded"
+    assert armd.commands[-3:] == ["/api/v1/safety/clear_fault", "/api/v1/torque", "/api/v1/motion/unload"]
+    _assert_parked(armd)
+
+
+def test_safe_exit_unsupported_is_reported_and_never_disables_torque(armd):
+    armd.resting_pose = False
+    with pytest.raises(RuntimeError):
+        with armd.client.session(client_id="uns") as s:
+            s.torque(True)
+            s.move_to(q(0.4), duration=0.1)
+            raise RuntimeError("boom")
+    assert s.safe_exit_outcome.action == "unsupported"
+    assert "resting-pose" in s.safe_exit_outcome.message
+    assert armd.commands.count("/api/v1/torque") == 1  # only the enable
+    assert armd.is_torqued
+
+
+def test_safe_exit_leaves_estop_latched(armd):
+    with pytest.raises(ArmFaultError):
+        with armd.client.session(client_id="es") as s:
+            s.torque(True)
+            threading.Timer(0.1, armd.client.e_stop).start()
+            s.move_to(q(0.6), duration=1.0)
+    assert s.safe_exit_outcome.action == "estop"
+    assert "/api/v1/safety/clear_fault" not in armd.commands
+    assert armd.state == "EStop"
+
+
+def test_safe_exit_policies(armd):
+    with armd.client.session(client_id="off", safe_exit="off") as s:
+        s.torque(True)
+    assert s.safe_exit_outcome is None and armd.is_torqued  # lease released, arm left holding
+    time.sleep(armd.lease_timeout * 1.5)
+    assert armd.client.get_observation().fault_reason == "WatchdogTimeout"
+    with armd.client.session(client_id="always", safe_exit="always") as s:
+        s.clear_fault()
+        s.torque(True)
+        s.move_to(q(0.3), duration=0.1)
+    assert s.safe_exit_outcome.action == "unloaded"
+    _assert_parked(armd)
+    with armd.client.session(client_id="idle", safe_exit="always") as s:
+        pass
+    assert s.safe_exit_outcome.action == "not_needed"
+    with pytest.raises(ValueError):
+        armd.client.session(safe_exit="sometimes")

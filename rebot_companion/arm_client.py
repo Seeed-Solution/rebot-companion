@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import logging
 import os
 import threading
 import time
@@ -45,6 +46,13 @@ from typing import Any
 import httpx
 from websockets.exceptions import ConnectionClosed
 from websockets.sync.client import connect as ws_connect
+
+log = logging.getLogger(__name__)
+
+SERVO_MAX_STEP = 0.35  # rad; armd drops frames jumping further from its commanded position
+SERVO_MIN_RATE_HZ = 10.0  # armd motion_frame_timeout is 200 ms
+GRIPPER_INDEX = 6  # 7-DOF B601-DM: joints 0..5 arm, 6 gripper
+SAFE_EXIT_POLICIES = ("off", "error", "always")
 
 # --------------------------------------------------------------------------- errors
 
@@ -95,6 +103,38 @@ class ArmFaultError(ArmdError):
 
 class MotionTimeout(ArmdError):
     """Motion did not finish within the timeout. A stop command has been sent."""
+
+
+class ServoJumpError(ArmdError, ValueError):
+    """A servo frame steps more than 0.35 rad from the last commanded target; armd would drop it silently."""
+
+
+class UnloadFailed(ArmdError):
+    """armd finished the unload motion but did not cut torque (arm left Armed and torqued)."""
+
+    def __init__(self, status: ArmStatus) -> None:
+        self.status = status
+        super().__init__(
+            "Unload motion finished but armd did not cut torque (arm is Armed and torqued); "
+            "the post-unload torque cut failed or the arm did not settle at the resting pose"
+        )
+
+
+@dataclass
+class SafeExitOutcome:
+    """Result of :meth:`ArmSession.safe_exit`.
+
+    ``action``: ``not_needed`` (torque already off), ``unloaded``, ``unsupported`` (armd has no
+    resting-pose profile; arm left torqued), ``estop`` (E-stop latched; not cleared automatically),
+    ``no_lease`` (lease lost; nothing can be commanded) or ``failed``.
+    """
+
+    action: str
+    message: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.action in ("not_needed", "unloaded")
 
 
 # --------------------------------------------------------------------------- data
@@ -301,6 +341,19 @@ class ArmSession:
     the arm is torqued. Call :meth:`unload` before closing if the arm should end
     parked with torque off; otherwise the next session has to ``clear_fault()``
     and ``torque(True)`` before moving.
+
+    ``safe_exit`` controls what leaving the ``with`` block does while the arm is
+    torqued (see :meth:`safe_exit`):
+
+    * ``"error"`` (default): on an exception (including ``KeyboardInterrupt``)
+      clear a Fault, unload (park at the resting pose, then torque off) with a
+      bounded ``safe_exit_timeout``, then release the lease.
+    * ``"always"``: do the same on a normal exit too.
+    * ``"off"``: only release the lease.
+
+    The outcome is stored in :attr:`safe_exit_outcome`. A latched EStop is never
+    cleared automatically, and torque is never disabled away from the resting
+    pose (armd refuses that).
     """
 
     def __init__(
@@ -311,7 +364,11 @@ class ArmSession:
         heartbeat_interval: float = 0.15,
         command_timeout: float = 4.0,
         connect_timeout: float = 5.0,
+        safe_exit: str = "error",
+        safe_exit_timeout: float = 30.0,
     ) -> None:
+        if safe_exit not in SAFE_EXIT_POLICIES:
+            raise ValueError(f"safe_exit must be one of {SAFE_EXIT_POLICIES}")
         self.client = client
         self.client_id = client_id or f"rebot-companion-{os.getpid()}-{uuid.uuid4().hex[:8]}"
         if not 0 < len(self.client_id) <= 128:
@@ -320,6 +377,9 @@ class ArmSession:
         self.heartbeat_interval = heartbeat_interval
         self.command_timeout = command_timeout
         self.connect_timeout = connect_timeout
+        self.safe_exit_policy = safe_exit
+        self.safe_exit_timeout = safe_exit_timeout
+        self.safe_exit_outcome: SafeExitOutcome | None = None
 
         self._ws = None
         self._send_lock = threading.Lock()
@@ -338,6 +398,8 @@ class ArmSession:
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
         self._schema: ObservationSchema | None = None
+        self._unload_pending = False
+        self._last_servo: tuple[float, list[float]] | None = None  # (monotonic time, positions)
 
     # ---- lifecycle -----------------------------------------------------------
 
@@ -376,10 +438,19 @@ class ArmSession:
         return self
 
     def close(self, release: bool = True) -> None:
-        """Release the lease (armd stops motion) and close the socket."""
+        """Release the lease (armd stops motion) and close the socket.
+
+        Releasing the lease cancels a pending unload in armd, so an unload started
+        with ``unload(wait=False)`` is waited for first (up to ``safe_exit_timeout``).
+        """
         if self._ws is None:
             return
         try:
+            if self._unload_pending and self.has_lease:
+                try:
+                    self._wait_unload(self._frames, self.safe_exit_timeout)
+                except ArmdError as exc:
+                    log.warning("Unload started with wait=False did not finish before close: %s", exc)
             if release and self._generation is not None and self._closed_reason is None:
                 try:
                     self._request(
@@ -411,8 +482,58 @@ class ArmSession:
     def __enter__(self) -> ArmSession:
         return self.open()
 
-    def __exit__(self, *exc: Any) -> None:
-        self.close()
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        try:
+            if self.safe_exit_policy == "always" or (self.safe_exit_policy == "error" and exc_type is not None):
+                self.safe_exit()
+        except BaseException as err:  # never mask the original exception
+            log.warning("safe exit failed: %s", err)
+        finally:
+            self.close()
+
+    def safe_exit(self, timeout: float | None = None) -> SafeExitOutcome:
+        """Bring a torqued arm to rest with torque off before the lease is released.
+
+        Steps: if torque is off, nothing to do. A latched EStop is reported and left
+        alone. A Fault is cleared, the arm is re-armed (torque on, no motion) and
+        :meth:`unload` runs with ``timeout`` (default ``safe_exit_timeout``). If armd
+        has no resting-pose profile (``UNSUPPORTED``) the arm stays torqued and armd
+        latches ``Fault(WatchdogTimeout)`` once the lease is released; this is
+        reported, because torque cannot be disabled away from the resting pose.
+        """
+        outcome = self._safe_exit(self.safe_exit_timeout if timeout is None else timeout)
+        self.safe_exit_outcome = outcome
+        (log.info if outcome.ok else log.warning)("safe exit: %s %s", outcome.action, outcome.message)
+        return outcome
+
+    def _safe_exit(self, timeout: float) -> SafeExitOutcome:
+        if self._ws is None or self._closed_reason:
+            return SafeExitOutcome("failed", self._closed_reason or "session is not open")
+        if not self.has_lease:
+            return SafeExitOutcome("no_lease", "control lease not held; cannot unload")
+        try:
+            obs = self.wait_for_observation(timeout=1.0)
+            if not obs.is_torqued:
+                return SafeExitOutcome("not_needed", f"torque off ({obs.safety_state})")
+            if obs.e_stopped:
+                return SafeExitOutcome("estop", "EStop is latched; not cleared automatically, arm left holding")
+            if obs.faulted:
+                self.clear_fault()
+                obs = self.wait_for_observation(timeout=1.0)
+            if not obs.is_operational:
+                self.torque(True)  # re-arm after clear_fault; plans no motion
+            self.unload(wait=True, timeout=timeout)
+            return SafeExitOutcome("unloaded", "parked at the resting pose, torque off")
+        except ArmCommandRejected as exc:
+            if exc.code == "UNSUPPORTED":
+                return SafeExitOutcome(
+                    "unsupported",
+                    "armd has no resting-pose profile for automatic unload; arm left torqued and armd "
+                    "will latch Fault(WatchdogTimeout) after the lease is released",
+                )
+            return SafeExitOutcome("failed", str(exc))
+        except ArmdError as exc:
+            return SafeExitOutcome("failed", str(exc))
 
     # ---- state ---------------------------------------------------------------
 
@@ -629,11 +750,20 @@ class ArmSession:
     # ---- actuator API --------------------------------------------------------
 
     def torque(self, enable: bool) -> dict:
-        """Enable/disable torque. Disabling while a real arm is raised drops it; prefer :meth:`unload`."""
+        """Enable/disable torque.
+
+        armd refuses ``enable=False`` (``ARM_NOT_AT_RESTING_POSE``) unless the arm is
+        settled at its resting pose, and in EStop/Fault; use :meth:`unload` to park
+        and cut torque in one step.
+        """
         return self.command("/api/v1/torque", {"enable": bool(enable)})
 
     def stop(self) -> dict:
-        """Stop the active trajectory/servo stream (decelerate and hold; torque stays on)."""
+        """Stop the active trajectory/servo stream (decelerate and hold; torque stays on).
+
+        Also cancels a pending unload.
+        """
+        self._unload_pending = False
         return self.command("/api/v1/motion/stop")
 
     def clear_fault(self) -> dict:
@@ -691,25 +821,64 @@ class ArmSession:
         """Normal unload: return to the resting pose, settle, then cut torque (state ends ``Idle``).
 
         armd answers ``UNSUPPORTED`` when the follower lacks a resting-pose
-        profile or the required feedback.
+        profile or the required feedback. Raises :class:`UnloadFailed` as soon as
+        armd reports the motion finished with torque still on (failed torque cut).
+
+        With ``wait=False``, :meth:`close` waits for the unload before releasing
+        the lease, because a lease release cancels a pending unload in armd.
         """
         frames_at_ack = self._frames_after(lambda: self.command("/api/v1/motion/unload"))
+        self._unload_pending = True
         if not wait:
             return None
-        return self._wait_until(
-            frames_at_ack, lambda o: not o.is_torqued and o.safety_state == "Idle", timeout, "unload to finish"
-        )
+        return self._wait_unload(frames_at_ack, timeout)
+
+    def _wait_unload(self, frames_at_ack: int, timeout: float) -> ArmStatus:
+        def done(o: ArmStatus) -> bool:
+            if not o.is_torqued and o.safety_state == "Idle":
+                return True
+            if o.is_torqued and o.safety_state == "Armed":
+                # armd keeps Moving through the unload and settle phase; Armed with torque
+                # on means set_torque(false) failed after the settle (supervisor.rs:1430).
+                raise UnloadFailed(o)
+            return False
+
+        try:
+            return self._wait_until(frames_at_ack, done, timeout, "unload to finish")
+        finally:
+            self._unload_pending = False
 
     def servo(self, positions: Sequence[float]) -> None:
         """Send one streaming servo frame (no reply on success).
 
         armd follows the latest frame with per-joint velocity limits and drops
         the stream 200 ms after the last frame, so send at >= 10 Hz (armd's UI
-        uses 50 Hz). Frames more than 0.35 rad from the commanded position are
-        discarded by armd without a reply (gripper exempt). A ``servo_reject``
-        received since the previous call is raised here as :class:`ServoRejected`.
+        uses 50 Hz). armd discards, without a reply, frames more than 0.35 rad
+        from its commanded position (gripper exempt). This method raises
+        :class:`ServoJumpError` instead of sending such a frame, measured from
+        the previous frame (if sent within 200 ms) or from the observed
+        positions. armd's commanded position trails the stream under velocity
+        limits, so keep steps well below 0.35 rad. A ``servo_reject`` received
+        since the previous call is raised here as :class:`ServoRejected`.
         """
         self._raise_servo_error()
+        target = [float(x) for x in positions]
+        now = time.monotonic()
+        last = self._last_servo
+        if last is not None and now - last[0] <= 0.2:
+            ref = last[1]
+        else:
+            obs = self.latest_observation()
+            ref = obs.positions if obs is not None else None
+        if ref is not None and len(ref) == len(target):
+            for i, (t, r) in enumerate(zip(target, ref)):
+                if i == GRIPPER_INDEX:
+                    continue
+                if abs(t - r) > SERVO_MAX_STEP:
+                    raise ServoJumpError(
+                        f"servo frame joint {i + 1} steps {abs(t - r):.3f} rad (> {SERVO_MAX_STEP} rad) from the "
+                        "last commanded target; armd would drop it without a reply"
+                    )
         generation = self._check_lease()
         self._servo_seq += 1
         self._send(
@@ -719,14 +888,18 @@ class ArmSession:
                 "generation": generation,
                 "sequence_id": self._servo_seq,
                 "epoch_id": self._epoch,
-                "positions": [float(x) for x in positions],
+                "positions": target,
             }
         )
+        self._last_servo = (now, target)
 
     def servo_stream(self, frames: Iterable[Sequence[float]], rate_hz: float = 50.0) -> None:
-        """Stream frames at ``rate_hz`` (must be > 5 Hz to stay inside armd's 200 ms frame timeout)."""
-        if rate_hz <= 5.0:
-            raise ValueError("rate_hz must exceed 5 Hz (armd motion_frame_timeout is 200 ms)")
+        """Stream frames at ``rate_hz`` (>= 10 Hz; armd drops the stream 200 ms after the last frame).
+
+        Each frame is checked like :meth:`servo` (0.35 rad step limit).
+        """
+        if rate_hz < SERVO_MIN_RATE_HZ:
+            raise ValueError(f"rate_hz must be >= {SERVO_MIN_RATE_HZ:g} Hz (armd motion_frame_timeout is 200 ms)")
         period = 1.0 / rate_hz
         next_t = time.monotonic()
         for frame in frames:
@@ -831,4 +1004,7 @@ __all__ = [
     "ServoRejected",
     "ArmFaultError",
     "MotionTimeout",
+    "ServoJumpError",
+    "UnloadFailed",
+    "SafeExitOutcome",
 ]
