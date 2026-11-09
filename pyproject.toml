@@ -16,6 +16,11 @@ dependencies = [
 calib = [
     "opencv-python-headless>=4.8,<5",
 ]
+agent = [
+    "av>=12",
+    "mcp>=2.3,<3",  # 2.x API: mcp.server.mcpserver.MCPServer (FastMCP was renamed)
+    "pillow>=10",
+]
 
 [build-system]
 requires = ["hatchling"]

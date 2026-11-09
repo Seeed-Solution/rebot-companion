@@ -1,6 +1,6 @@
 """rebot-companion: Robot Arm Vision Companion SDK and Orchestration Framework."""
 
-from . import ik, kinematics
+from . import ik, kinematics, snapshot
 from .arm_client import (
     ArmCommandRejected,
     ArmConnectionError,
@@ -55,4 +55,5 @@ __all__ = [
     "IkError",
     "ik",
     "kinematics",
+    "snapshot",
 ]
