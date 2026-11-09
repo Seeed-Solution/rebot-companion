@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 
-from rebot_companion import ArmdClient, ReCameraClient, Transform
+from rebot_companion import ArmdClient, CameraTriggerTimeout, ReCameraClient, Transform
 from rebot_companion.pipeline import DeterministicPickPlacePipeline, PipelineConfig
 
 
@@ -74,7 +74,10 @@ class RobotCompanionAgentTools:
         """Dispatcher for tool calls from the Agent."""
         if name == "inspect_scene":
             wait_ms = arguments.get("wait_ms", 2500)
-            detections = self.camera.trigger(wait_ms=wait_ms)
+            try:
+                detections = self.camera.trigger(wait_ms=wait_ms)
+            except CameraTriggerTimeout as e:
+                return json.dumps({"error": f"camera trigger timed out: {e}"})
             results = []
             for d in detections:
                 in_base = self.cam_to_base @ d.pose

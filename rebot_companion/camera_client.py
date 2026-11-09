@@ -2,11 +2,25 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 import httpx
 
 from .transforms import Transform
+
+log = logging.getLogger(__name__)
+
+
+class CameraTriggerTimeout(Exception):
+    """The trigger produced no result in time (HTTP timeout or ``success: false``).
+
+    Distinct from "no marker": a completed trigger without markers returns an empty list.
+    """
+
+    def __init__(self, message: str, raw: dict | None = None) -> None:
+        super().__init__(message)
+        self.raw = raw or {}
 
 
 @dataclass
@@ -21,8 +35,11 @@ class MarkerDetection:
 
     @classmethod
     def from_dict(cls, d: dict) -> MarkerDetection:
-        p = d.get("pose", {})
-        t = p.get("t", [0.0, 0.0, 0.0])
+        """Parse one marker. Raises ``ValueError`` when the marker has no ``pose`` (no ``t`` vector)."""
+        p = d.get("pose")
+        if not isinstance(p, dict) or p.get("t") is None:
+            raise ValueError(f"marker {d.get('id')} has no pose")
+        t = p["t"]
         r_deg = p.get("r_deg", [0.0, 0.0, 0.0])
         tf = Transform.from_translation_euler(t, r_deg[0], r_deg[1], r_deg[2])
         return cls(
@@ -63,15 +80,22 @@ class ReCameraClient:
             return res.json()
 
     def trigger(self, wait_ms: int = 2500) -> list[MarkerDetection]:
-        """Atomic one-shot trigger: activates detector, grabs one fresh frame, returns to standby."""
-        with httpx.Client(timeout=float(wait_ms) / 1000.0 + 2.0) as client:
-            res = client.post(f"{self.base_url}/api/trigger?wait_ms={wait_ms}")
-            res.raise_for_status()
-            data = res.json()
-            if not data.get("success", False):
-                return []
-            markers = data.get("markers", [])
-            return [MarkerDetection.from_dict(m) for m in markers]
+        """Atomic one-shot trigger: activates detector, grabs one fresh frame, returns to standby.
+
+        Returns the markers that carry a pose (an empty list means the frame had no usable
+        marker). Raises :class:`CameraTriggerTimeout` when no result arrived in time.
+        """
+        try:
+            with httpx.Client(timeout=float(wait_ms) / 1000.0 + 2.0) as client:
+                res = client.post(f"{self.base_url}/api/trigger?wait_ms={wait_ms}")
+                res.raise_for_status()
+                data = res.json()
+        except httpx.TimeoutException as exc:
+            raise CameraTriggerTimeout(f"reCamera trigger timed out: {exc}") from exc
+        if not data.get("success", False):
+            detail = data.get("error") or data.get("message") or "success=false"
+            raise CameraTriggerTimeout(f"reCamera trigger returned no result within {wait_ms} ms ({detail})", data)
+        return _parse_markers(data.get("markers", []))
 
     def get_latest_result(self, after_frame: int = 0, wait_ms: int = 1000) -> list[MarkerDetection]:
         """Long poll the latest detection result."""
@@ -79,8 +103,7 @@ class ReCameraClient:
             res = client.get(f"{self.base_url}/api/results/latest?after={after_frame}&wait_ms={wait_ms}")
             res.raise_for_status()
             data = res.json()
-            markers = data.get("markers", [])
-            return [MarkerDetection.from_dict(m) for m in markers]
+            return _parse_markers(data.get("markers", []))
 
     def get_snapshot(self) -> bytes:
         """Fetch raw JPEG snapshot for VLM / multimodal reasoning.
@@ -97,3 +120,14 @@ class ReCameraClient:
             res = client.get(self.snapshot_url)
             res.raise_for_status()
             return res.content
+
+
+def _parse_markers(markers: list) -> list[MarkerDetection]:
+    """Parse markers, skipping any without a pose (they must not become a target at the camera origin)."""
+    out: list[MarkerDetection] = []
+    for m in markers:
+        try:
+            out.append(MarkerDetection.from_dict(m))
+        except ValueError as exc:
+            log.warning("skipping marker: %s", exc)
+    return out
