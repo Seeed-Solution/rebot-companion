@@ -15,8 +15,10 @@ Lease rules (rebot-armd binds actuator authority to one WebSocket lease):
 * While it holds the lease, heartbeats every 150 ms keep it; the cockpit's non-force retry
   cannot take it. If the cockpit preempts (its confirm button), tools return ``LEASE_LOST``
   and control comes back only through ``take_control``.
-* ``take_control(force=true)`` takes control from the cockpit; call it only after the user
-  explicitly confirms.
+* By default the agent cannot take control from the cockpit or clear faults: ``take_control``
+  only acquires a free lease and ``clear_fault`` is not exposed, so after an E-stop or fault a
+  person clears it in the web cockpit. ``--allow-preempt`` adds ``take_control(force=true)``
+  and ``--allow-clear-fault`` adds the ``clear_fault`` tool.
 
 Built on the mcp 2.x ``MCPServer`` API (the 1.x ``FastMCP`` class was renamed).
 """
@@ -96,12 +98,48 @@ HINTS = {
     "BUSY": "another motion tool call is still running",
 }
 
-INSTRUCTIONS = """Controls a reBot B601-DM arm through rebot-armd, plus the wrist/scene camera.
+INSTRUCTIONS_BASE = """Controls a reBot B601-DM arm through rebot-armd, plus the wrist/scene camera.
 Coordinates: metres in the arm base frame (x forward, y left, z up); poses are of end_link.
-Control lease: the web cockpit and this server share one control lease. If a tool returns
-LEASE_BUSY, ask the user to release control in the cockpit, or call take_control(force=true)
-only after the user explicitly confirms. Never retry force on your own.
 Use snapshot / snapshot_annotated / detect to look before moving. stop and e_stop always work."""
+
+
+def build_instructions(allow_clear_fault: bool, allow_preempt: bool) -> str:
+    lease = (
+        "Control lease: the web cockpit and this server share one control lease. If a tool returns "
+        "LEASE_BUSY, ask the user to release control in the cockpit"
+        + (
+            ", or call take_control(force=true) only after the user explicitly confirms. Never retry force on your own."
+            if allow_preempt
+            else ", then call take_control. This server cannot take control from the cockpit."
+        )
+    )
+    fault = (
+        "After an E-stop or fault, check the scene with the user before clear_fault and enable."
+        if allow_clear_fault
+        else "After an E-stop or fault, stop and ask the user to check the arm and clear the fault in the "
+        "web cockpit; this server cannot clear faults. Then call enable."
+    )
+    return f"{INSTRUCTIONS_BASE}\n{lease}\n{fault}"
+
+
+INSTRUCTIONS = build_instructions(False, False)
+
+HUMAN_CLEAR_HINT = (
+    "ask the user to check the arm and clear the fault in the web cockpit (this server cannot clear faults), "
+    "then call enable"
+)
+HUMAN_RELEASE_HINT = (
+    "the web cockpit or another client holds control; ask the user to release it in the cockpit, then call take_control"
+)
+
+
+def apply_policy(fail: ToolFail, allow_clear_fault: bool, allow_preempt: bool) -> ToolFail:
+    """Rewrite hints that point at tools this server does not expose."""
+    if not allow_clear_fault and fail.code in ("ESTOP_ACTIVE", "FAULT", "FAULT_ACTIVE"):
+        fail.hint = HUMAN_CLEAR_HINT
+    if not allow_preempt and fail.code == "LEASE_BUSY":
+        fail.hint = HUMAN_RELEASE_HINT
+    return fail
 
 
 class ToolFail(Exception):
@@ -453,8 +491,8 @@ class Controller:
 # --------------------------------------------------------------------------- MCP wiring
 
 
-def build_server(ctrl: Controller) -> MCPServer:
-    server = MCPServer("rebot", instructions=INSTRUCTIONS)
+def build_server(ctrl: Controller, allow_clear_fault: bool = False, allow_preempt: bool = False) -> MCPServer:
+    server = MCPServer("rebot", instructions=build_instructions(allow_clear_fault, allow_preempt))
     motion_lock = anyio.Lock()
 
     async def run(fn: Callable[..., Any], *args: Any) -> Any:
@@ -481,6 +519,7 @@ def build_server(ctrl: Controller) -> MCPServer:
                     fail = map_exception(exc)
                     if fail is None:
                         raise
+                    apply_policy(fail, allow_clear_fault, allow_preempt)
                     state = await anyio.to_thread.run_sync(ctrl.safety_state)
                     text = json.dumps(fail.payload(state))
                     return CallToolResult(content=[TextContent(type="text", text=text)], is_error=True)
@@ -583,7 +622,10 @@ def build_server(ctrl: Controller) -> MCPServer:
     async def stop() -> dict:
         return await run(ctrl.stop)
 
-    @tool("Emergency stop. Needs no lease; latches EStop until clear_fault.")
+    @tool(
+        "Emergency stop. Needs no lease; latches EStop until "
+        + ("clear_fault." if allow_clear_fault else "a person clears it in the web cockpit.")
+    )
     async def e_stop() -> dict:
         return await run(ctrl.e_stop)
 
@@ -591,16 +633,26 @@ def build_server(ctrl: Controller) -> MCPServer:
     async def enable() -> dict:
         return await motion(ctrl.enable)
 
-    @tool("Clear EStop / Fault back to Idle; call enable before moving.")
-    async def clear_fault() -> dict:
-        return await motion(ctrl.clear_fault)
+    if allow_clear_fault:
 
-    @tool(
-        "Acquire the control lease. force=true takes control from the web cockpit; only call after "
-        "the user explicitly confirms."
-    )
-    async def take_control(force: bool = False) -> dict:
-        return await run(ctrl.acquire, force)
+        @tool("Clear EStop / Fault back to Idle; call enable before moving.")
+        async def clear_fault() -> dict:
+            return await motion(ctrl.clear_fault)
+
+    if allow_preempt:
+
+        @tool(
+            "Acquire the control lease. force=true takes control from the web cockpit; only call after "
+            "the user explicitly confirms."
+        )
+        async def take_control(force: bool = False) -> dict:
+            return await run(ctrl.acquire, force)
+
+    else:
+
+        @tool("Acquire the control lease when no other client holds it. Cannot take control from the web cockpit.")
+        async def take_control() -> dict:
+            return await run(ctrl.acquire, False)
 
     @tool("Release the control lease (the web cockpit will acquire it automatically).")
     async def release_control() -> dict:
@@ -616,6 +668,16 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--client-id", default="rebot-mcp", help="lease label shown to other clients")
     p.add_argument("--no-auto-lease", action="store_true", help="do not acquire the lease until take_control")
     p.add_argument("--decoder", default="auto", choices=("auto", "pyav", "ffmpeg"))
+    p.add_argument(
+        "--allow-clear-fault",
+        action="store_true",
+        help="expose clear_fault to the agent (default: a person clears faults in the web cockpit)",
+    )
+    p.add_argument(
+        "--allow-preempt",
+        action="store_true",
+        help="let take_control(force=true) take control from the web cockpit (default: not exposed)",
+    )
     p.add_argument("--log-level", default="INFO")
     args = p.parse_args(argv)
     logging.basicConfig(stream=sys.stderr, level=args.log_level.upper(), format="%(asctime)s %(name)s %(message)s")
@@ -628,7 +690,7 @@ def main(argv: list[str] | None = None) -> None:
         auto_lease=not args.no_auto_lease,
     )
     ctrl.start()
-    server = build_server(ctrl)
+    server = build_server(ctrl, allow_clear_fault=args.allow_clear_fault, allow_preempt=args.allow_preempt)
     try:
         server.run("stdio")
     except BaseException as exc:

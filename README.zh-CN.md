@@ -175,7 +175,8 @@ with arm.session() as s:
 ```bash
 uv run --directory /path/to/rebot-companion --extra agent rebot-mcp \
   --armd http://192.168.42.1:8765 --camera-ws ws://192.168.42.1:8001/ \
-  [--client-id rebot-mcp] [--no-auto-lease] [--decoder auto|pyav|ffmpeg]
+  [--client-id rebot-mcp] [--no-auto-lease] [--decoder auto|pyav|ffmpeg] \
+  [--allow-clear-fault] [--allow-preempt]
 
 # Claude Code
 claude mcp add rebot -- uv run --directory /path/to/rebot-companion --extra agent rebot-mcp --armd http://192.168.42.1:8765
@@ -195,8 +196,9 @@ claude mcp add rebot -- uv run --directory /path/to/rebot-companion --extra agen
 | `home` / `park` | — | 动作结果；`park` 结束时为 Idle 且已卸力 |
 | `stop` | — | `{state}`；其他工具运动时也可调用 |
 | `e_stop` | — | `{safety_state, epoch_id}`；不需要租约 |
-| `enable` / `clear_fault` | — | 上力矩 / 清除 EStop 或 Fault |
-| `take_control` | `force`（false） | 获取租约；`force=true` 从 Web 驾驶舱接管控制 |
+| `enable` | — | 上力矩 |
+| `clear_fault` | — | 清除 EStop 或 Fault；仅在 `--allow-clear-fault` 时提供 |
+| `take_control` | `force`（false，仅 `--allow-preempt` 时有） | 获取空闲的租约；加 `--allow-preempt` 后 `force=true` 可从 Web 驾驶舱接管控制 |
 | `release_control` | — | 释放租约（驾驶舱会自动获取） |
 
 租约规则：
@@ -204,7 +206,7 @@ claude mcp add rebot -- uv run --directory /path/to/rebot-companion --extra agen
 - 启动时以非强制方式申请租约。Web 驾驶舱或其他客户端持有租约时，服务继续运行但不持有租约，执行器类工具返回 `LEASE_BUSY`；每次执行器调用会再尝试一次非强制申请。服务不会自行发送 `force=true`。
 - 服务持有租约期间每 150 ms 心跳续约；驾驶舱每 500 ms 的非强制重试不会夺走租约。
 - 驾驶舱通过其确认按钮抢占后，工具返回 `LEASE_LOST`。服务不会自动重新申请，只能通过 `take_control` 取回控制。
-- `take_control(force=true)` 只在用户明确确认接管后调用。处于 armd 抢占冷却期内会返回 `PREEMPT_COOLDOWN` 和 `remaining_ms`。
+- 默认情况下 agent 不能从驾驶舱接管控制，也不能清除故障：`take_control` 没有 `force` 参数，工具列表中没有 `clear_fault`。急停或故障后，错误提示会让 agent 请人在 Web 驾驶舱中清除。`--allow-preempt` 增加 `take_control(force=true)`（只在用户明确确认接管后调用；处于 armd 抢占冷却期内返回 `PREEMPT_COOLDOWN` 和 `remaining_ms`）。`--allow-clear-fault` 增加 `clear_fault` 工具。
 - 调用 `release_control` 后，或使用 `--no-auto-lease` 时，工具返回 `NO_LEASE`，直到调用 `take_control`。
 - 进程退出时会话释放租约；因异常（含 Ctrl-C）退出时 `safe_exit="error"` 先让机械臂回停靠位。进程被强制结束时，armd 看门狗锁存 Fault，机械臂保持当前位置。
 

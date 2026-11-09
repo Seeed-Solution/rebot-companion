@@ -32,7 +32,6 @@ TOOLS = {
     "stop",
     "e_stop",
     "enable",
-    "clear_fault",
     "take_control",
     "release_control",
 }
@@ -109,8 +108,9 @@ async def test_list_tools(make_ctrl):
     assert rel["frame"]["enum"] == ["base", "tool", "camera"] and rel["dx"]["anyOf"][0]["maximum"] == 0.3
     assert rel["dyaw_deg"]["anyOf"][0]["maximum"] == 90.0
     tc = tools["take_control"]
-    assert tc.input_schema["properties"]["force"]["default"] is False
-    assert "only call after the user explicitly confirms" in tc.description
+    assert "force" not in tc.input_schema.get("properties", {})  # no preemption unless --allow-preempt
+    assert "Cannot take control from the web cockpit" in tc.description
+    assert "a person clears it in the web cockpit" in tools["e_stop"].description
     assert tools["gripper"].input_schema["properties"]["command"]["enum"] == ["open", "close", "move"]
 
 
@@ -158,12 +158,32 @@ async def test_lease_busy_never_forces_until_take_control(armd, make_ctrl):
             res = await c.call_tool("move_to", {"x": 0.25, "y": 0.0, "z": 0.25})
             assert res.is_error
             err = body(res)
-            assert err["code"] == "LEASE_BUSY" and "take_control(force=true)" in err["hint"]
+            assert err["code"] == "LEASE_BUSY" and "release it in the cockpit" in err["hint"]
+            assert "force" not in err["hint"]
             assert err["safety_state"] == "Idle"
             assert body(await c.call_tool("get_state", {}))["lease"]["held"] is False
             assert body(await c.call_tool("take_control", {}))["code"] == "LEASE_BUSY"
+            res = await c.call_tool("take_control", {"force": True})  # not part of the default schema
+            assert res.is_error
             assert all(not force for cid, force in armd.acquires if cid == "rebot-mcp")
             assert cockpit.has_lease
+    finally:
+        cockpit.close()
+
+
+@pytest.mark.asyncio
+async def test_allow_preempt_flag_enables_forced_take_control(armd, make_ctrl):
+    cockpit = armd.client.session(client_id="cockpit", safe_exit="off").open()
+    try:
+        async with Client(build_server(make_ctrl(), allow_preempt=True)) as c:
+            tools = {t.name: t for t in (await c.list_tools()).tools}
+            tc = tools["take_control"]
+            assert tc.input_schema["properties"]["force"]["default"] is False
+            assert "only call after the user explicitly confirms" in tc.description
+            err = body(await c.call_tool("move_to", {"x": 0.25, "y": 0.0, "z": 0.25}))
+            assert err["code"] == "LEASE_BUSY" and "take_control(force=true)" in err["hint"]
+            assert body(await c.call_tool("take_control", {}))["code"] == "LEASE_BUSY"
+            assert all(not force for cid, force in armd.acquires if cid == "rebot-mcp")
             res = await c.call_tool("take_control", {"force": True})
             assert body(res)["held"] is True
             assert armd.acquires[-1] == ("rebot-mcp", True)
@@ -195,9 +215,18 @@ async def test_e_stop_without_lease(armd, make_ctrl):
             res = await c.call_tool("e_stop", {})
             assert not res.is_error and body(res)["safety_state"] == "EStop"
             err = body(await c.call_tool("enable", {}))
-            assert err["code"] == "ESTOP_ACTIVE" and "clear_fault" in err["hint"]
+            assert err["code"] == "ESTOP_ACTIVE" and "clear the fault in the web cockpit" in err["hint"]
+            assert "clear_fault" not in {t.name for t in (await c.list_tools()).tools}
     finally:
         cockpit.close()
+
+
+@pytest.mark.asyncio
+async def test_allow_clear_fault_flag_exposes_the_tool(armd, make_ctrl):
+    async with Client(build_server(make_ctrl(), allow_clear_fault=True)) as c:
+        assert "clear_fault" in {t.name for t in (await c.list_tools()).tools}
+        assert not (await c.call_tool("e_stop", {})).is_error
+        assert body(await c.call_tool("clear_fault", {}))["safety_state"] == "Idle"
 
 
 @pytest.mark.asyncio

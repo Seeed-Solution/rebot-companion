@@ -172,7 +172,8 @@ with arm.session() as s:
 ```bash
 uv run --directory /path/to/rebot-companion --extra agent rebot-mcp \
   --armd http://192.168.42.1:8765 --camera-ws ws://192.168.42.1:8001/ \
-  [--client-id rebot-mcp] [--no-auto-lease] [--decoder auto|pyav|ffmpeg]
+  [--client-id rebot-mcp] [--no-auto-lease] [--decoder auto|pyav|ffmpeg] \
+  [--allow-clear-fault] [--allow-preempt]
 
 # Claude Code
 claude mcp add rebot -- uv run --directory /path/to/rebot-companion --extra agent rebot-mcp --armd http://192.168.42.1:8765
@@ -192,8 +193,9 @@ Logs go to stderr; stdout is the MCP channel.
 | `home` / `park` | — | action result; `park` ends Idle with torque off |
 | `stop` | — | `{state}`; runs while another tool is moving |
 | `e_stop` | — | `{safety_state, epoch_id}`; no lease needed |
-| `enable` / `clear_fault` | — | torque on / clear EStop or Fault |
-| `take_control` | `force` (false) | acquire the lease; `force=true` takes control from the web cockpit |
+| `enable` | — | torque on |
+| `clear_fault` | — | clear EStop or Fault; only with `--allow-clear-fault` |
+| `take_control` | `force` (false, only with `--allow-preempt`) | acquire a free lease; with `--allow-preempt`, `force=true` takes control from the web cockpit |
 | `release_control` | — | release the lease (the cockpit acquires it automatically) |
 
 Lease rules:
@@ -201,7 +203,7 @@ Lease rules:
 - At startup the server tries a non-force lease. If the web cockpit or another client holds it, the server keeps running without it and actuator tools return `LEASE_BUSY`; each actuator call retries a non-force acquire. The server never sends `force=true` by itself.
 - While the server holds the lease, its 150 ms heartbeat keeps it; the cockpit's 500 ms non-force retry does not take it over.
 - If the cockpit preempts (its confirm button), tools return `LEASE_LOST`. The server does not re-acquire; control comes back only through `take_control`.
-- `take_control(force=true)` is for use only after the user explicitly confirms the takeover. A takeover inside armd's cooldown returns `PREEMPT_COOLDOWN` with `remaining_ms`.
+- By default the agent cannot take control from the cockpit or clear faults: `take_control` has no `force` parameter and `clear_fault` is not listed. After an E-stop or fault, error hints tell the agent to ask a person to clear it in the web cockpit. `--allow-preempt` adds `take_control(force=true)` (for use only after the user explicitly confirms; inside armd's cooldown it returns `PREEMPT_COOLDOWN` with `remaining_ms`). `--allow-clear-fault` adds the `clear_fault` tool.
 - After `release_control`, or with `--no-auto-lease`, tools return `NO_LEASE` until `take_control`.
 - On exit the session releases the lease; on an exception (including Ctrl-C) `safe_exit="error"` parks the arm first. If the process is killed, armd's watchdog latches a Fault with the arm holding position.
 
