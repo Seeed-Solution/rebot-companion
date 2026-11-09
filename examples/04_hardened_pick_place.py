@@ -39,9 +39,12 @@ def main():
     if calib_path.exists():
         hand_eye = HandEyeCalibration.load_result(calib_path)
         print(f"[*] Loaded {hand_eye.setup} calibration from {calib_path}")
-    else:
-        print("[!] No calibration.json found, using a nominal eye_to_hand baseline transform.")
+    elif args.dry_run:
+        # PLACEHOLDER, not a calibration: base-frame targets are not real. Dry runs only.
+        print(f"[!] {calib_path} not found: dry run with a placeholder transform; target positions are not real.")
         hand_eye = HandEyeResult("eye_to_hand", Transform.from_translation_euler([0.30, -0.40, 0.50], 180.0, 0.0, 90.0))
+    else:
+        parser.error(f"{calib_path} not found: run examples/02_hand_eye_calib.py first, or pass --dry-run")
 
     camera = ReCameraClient(args.camera_url)
     arm = ArmdClient(args.arm_url)
