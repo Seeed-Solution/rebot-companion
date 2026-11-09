@@ -9,7 +9,7 @@
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg?style=flat-square&logo=python)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg?style=flat-square)](LICENSE)
 [![MCP Server](https://img.shields.io/badge/MCP-2.x_Stdio-purple.svg?style=flat-square)](https://modelcontextprotocol.io)
-[![CI](https://img.shields.io/github/actions/workflow/status/Seeed-Solution/rebot-companion/ci.yml?branch=master&style=flat-square&label=CI)](https://github.com/Seeed-Solution/rebot-companion/actions)
+[![CI](https://img.shields.io/github/actions/workflow/status/Seeed-Solution/rebot-companion/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/Seeed-Solution/rebot-companion/actions)
 [![Target Arm](https://img.shields.io/badge/Robot-reBot_B601--DM-orange.svg?style=flat-square)](https://github.com/Seeed-Solution/rebot-armd)
 [![Vision](https://img.shields.io/badge/Vision-Seeed_reCamera_SG2002-red.svg?style=flat-square)](https://www.seeedstudio.com)
 
