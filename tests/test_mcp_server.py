@@ -37,9 +37,15 @@ TOOLS = {
 }
 
 
+TRIGGER_BODIES: list = []
+
+
 def detector_transport() -> httpx.MockTransport:
     def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/api/v1/vision/mode":
+            return httpx.Response(200, json={"api_version": 2, "mode": "off", "per_request_pipelines": True})
         if req.url.path == "/api/v1/detection/trigger":
+            TRIGGER_BODIES.append(json.loads(req.content) if req.content else None)
             return httpx.Response(
                 200,
                 json={
@@ -289,3 +295,15 @@ async def test_detect(make_ctrl):
     assert d["frame_id"] == 5 and d["count"] == 1
     (det,) = d["detections"]
     assert det["label"] == "cup" and det["box_norm"] == [0.4, 0.4, 0.6, 0.6] and det["center_norm"] == [0.5, 0.5]
+    assert TRIGGER_BODIES[-1] == {"pipelines": ["yolo", "aruco"]}  # default: both
+
+
+@pytest.mark.asyncio
+async def test_detect_with_pipelines(make_ctrl):
+    async with Client(build_server(make_ctrl(start=False))) as c:
+        d = body(await c.call_tool("detect", {"pipelines": "aruco"}))
+        assert TRIGGER_BODIES[-1] == {"pipelines": ["aruco"]} and d["frame_id"] == 5
+        body(await c.call_tool("detect", {"pipelines": "yolo"}))
+        assert TRIGGER_BODIES[-1] == {"pipelines": ["yolo"]}
+        res = await c.call_tool("detect", {"pipelines": "video"})
+        assert res.is_error

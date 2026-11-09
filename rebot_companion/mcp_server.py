@@ -472,12 +472,14 @@ class Controller:
         )
         return [Image(data=snap.jpeg, format="jpeg"), json.dumps(meta)]
 
-    def detect(self, wait_ms: int, min_score: float) -> dict:
-        res = self.detector.detect_once(wait_ms=wait_ms)
+    def detect(self, wait_ms: int, min_score: float, pipelines: str | None = None) -> dict:
+        wanted = None if pipelines is None else (["yolo", "aruco"] if pipelines == "both" else [pipelines])
+        res = self.detector.detect_once(wait_ms=wait_ms, pipelines=wanted)
         dets = [d for d in parse_detections(res["raw"]) if d.score >= min_score]
         out = {
             "frame_id": res["frame_id"],
             "ts_ms": res["ts_ms"],
+            "pipelines": res.get("pipelines"),
             "count": len(dets),
             "detections": [
                 {k: v for k, v in d.to_dict().items() if k != "corners_norm" or v is not None} for d in dets
@@ -553,12 +555,18 @@ def build_server(ctrl: Controller, allow_clear_fault: bool = False, allow_preemp
     ) -> list:
         return await run(ctrl.snapshot_annotated, min_score, max_width, quality)
 
-    @tool("Run one detector inference on a fresh frame. Boxes are normalised [x0, y0, x1, y1] in the image (0..1).")
+    @tool(
+        "Run one detector inference on a fresh frame. Boxes are normalised [x0, y0, x1, y1] in the "
+        "image (0..1). pipelines: yolo (objects), aruco (markers) or both (default); honoured by "
+        "rebot-vision >= 1.3, older detectors run their current mode. The result's pipelines lists "
+        "what ran (null when the detector does not report it)."
+    )
     async def detect(
         wait_ms: Annotated[int, Field(ge=0, le=5000)] = 2500,
         min_score: Annotated[float, Field(ge=0, le=1)] = 0.3,
+        pipelines: Literal["yolo", "aruco", "both"] | None = None,
     ) -> dict:
-        return await run(ctrl.detect, wait_ms, min_score)
+        return await run(ctrl.detect, wait_ms, min_score, pipelines)
 
     @tool(
         "Straight-line move of end_link to (x, y, z) m in the base frame. Orientation: roll/pitch/yaw "
