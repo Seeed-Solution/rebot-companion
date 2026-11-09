@@ -103,6 +103,7 @@ class FakeArmd:
         self.action_bodies: list[tuple[str, dict]] = []
         self.ack_extra: dict = {}
         self.cancel_reason = "STOPPED"
+        self.acquires: list[tuple[str, bool]] = []  # (client_id, force) per acquire_lease
         self._stop = threading.Event()
         self._next_conn = 1
 
@@ -367,6 +368,7 @@ class FakeArmd:
             )
         if kind == "acquire_lease":
             client_id = msg.get("client_id") or ""
+            self.acquires.append((client_id, bool(msg.get("force"))))
             seq = msg.get("seq")
             if not client_id or len(client_id) > 128:
                 return (

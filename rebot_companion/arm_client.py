@@ -651,6 +651,16 @@ class ArmSession:
     def has_lease(self) -> bool:
         return self._generation is not None and self._lease_lost is None
 
+    @property
+    def lease_lost(self) -> dict | None:
+        """The ``lease_lost`` message (or reject) that ended the lease, if it was lost."""
+        return self._lease_lost
+
+    @property
+    def closed_reason(self) -> str | None:
+        """Why the WebSocket closed, or None while it is open."""
+        return self._closed_reason
+
     def latest_observation(self) -> ArmStatus | None:
         with self._state:
             return self._obs

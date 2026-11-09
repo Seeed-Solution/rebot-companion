@@ -47,10 +47,12 @@ Given the edge compute constraints (SG2002 single-core 1.0 GHz RISC-V with 256MB
 
 ```text
 rebot-companion/
-├── pyproject.toml              # uv project; extras: [calib] = OpenCV for the intrinsics tool
+├── pyproject.toml              # uv project; extras: [calib] = OpenCV for the intrinsics tool, [agent] = MCP server deps
 ├── rebot_companion/            # SDK
 │   ├── camera_client.py        # reCamera atomic API client (trigger / latest result)
 │   ├── arm_client.py           # rebot-armd client (REST reads + WebSocket lease session)
+│   ├── snapshot.py             # JPEG snapshots from the camera H.264 stream + detection overlay
+│   ├── mcp_server.py           # stdio MCP server (rebot-mcp) for agent control
 │   ├── kinematics.py           # B601-DM forward / inverse kinematics (port of the Web cockpit)
 │   ├── ik.py                   # IK adapter: base-frame pose -> armd 7-joint vector (incl. gripper)
 │   ├── transforms.py           # SE(3) transforms, Euler ZYX convention
@@ -78,7 +80,7 @@ uv sync
 uv run pytest
 ```
 
-Optional OpenCV extra for the intrinsics tool: `uv sync --extra calib` (`uv sync --all-extras` for development).
+Optional OpenCV extra for the intrinsics tool: `uv sync --extra calib`; MCP server extra: `uv sync --extra agent` (`uv sync --all-extras` for development).
 
 ### 2. Check the reCamera atomic API
 ```bash
@@ -149,6 +151,7 @@ rebot-armd accepts actuator commands only on the WebSocket connection that holds
 - `s.unload()` raises `UnloadFailed` as soon as armd reports `Armed` with torque on after the unload motion (failed torque cut). After `s.unload(wait=False)`, closing the session waits for the unload, because a lease release cancels it in armd.
 - Servo: `servo_stream()` needs `rate_hz >= 10` (armd drops the stream 200 ms after the last frame). armd drops frames that jump more than 0.35 rad from its commanded position without a reply (gripper exempt); `servo()` raises `ServoJumpError` for such a step instead of sending it.
 - After a `force=True` preemption, motion is refused with `HANDOVER_SETTLING` for up to 1.5 s.
+- High-level actions (armd with `/api/v1/action/*`): `s.move_pose(xyz, rpy=None | quat=None)` (straight-line Cartesian move of `end_link`; `move_to` stays the joint-space jog), `s.move_relative(frame, d, dyaw=, dpitch=, droll=)`, `s.gripper("open" | "close" | "move", fraction=)`, `s.home_action()`, `s.park_action()`, or `s.action(path, body)`. Each blocks until `observation.action` with the ack's `action_id` is terminal and returns an `ActionResult`; `failed` / `cancelled` raise `ActionFailed(code)`. The default timeout is `2 * expected_duration_s + 5` s, capped at 60 s; on timeout `stop` is sent and `MotionTimeout` raised. `ArmStatus.commanded_positions` and `ArmStatus.action` are empty / None on an armd without these fields.
 
 ```python
 from rebot_companion import ArmdClient
@@ -161,6 +164,52 @@ with arm.session() as s:
     s.move_to(target, duration=2.0)
     s.unload()  # park + torque off before the lease is released
 ```
+
+## 🤖 MCP server (agent control)
+
+`rebot_companion/mcp_server.py` is a stdio MCP server that exposes the arm, camera snapshots and detections as tools. It needs the `agent` extra (`mcp` 2.x, `av`, `pillow`; tested with mcp 2.3.0, av 19.0.2, pillow 13.0.0).
+
+```bash
+uv run --directory /path/to/rebot-companion --extra agent rebot-mcp \
+  --armd http://192.168.42.1:8765 --camera-ws ws://192.168.42.1:8001/ \
+  [--client-id rebot-mcp] [--no-auto-lease] [--decoder auto|pyav|ffmpeg]
+
+# Claude Code
+claude mcp add rebot -- uv run --directory /path/to/rebot-companion --extra agent rebot-mcp --armd http://192.168.42.1:8765
+```
+
+Logs go to stderr; stdout is the MCP channel.
+
+| Tool | Input | Result |
+|---|---|---|
+| `get_state` | — | safety state, fault, torque, lease, joints (positions / commanded / velocities / torques / temperatures), `tcp` (host FK: `xyz_m`, `rpy_deg`, `quat` [w,x,y,z]), gripper, latest `action`, `epoch_id`. No lease needed |
+| `snapshot` | `max_width` (800), `quality` (80) | JPEG image + JSON `{width, height, device_ts_ms, age_ms}` |
+| `snapshot_annotated` | `min_score` (0.3), `max_width`, `quality` | JPEG with the latest detector boxes + JSON `{detections, det_frame_id, det_age_vs_frame_ms, note?}` |
+| `detect` | `wait_ms` (2500, 0..5000), `min_score` (0.3) | `{frame_id, ts_ms, count, detections[{label, score, box_norm, center_norm, track_id}]}`; `POST /api/v1/detection/trigger`, on 404 enable → `latest` → disable (disables only if it enabled inference) |
+| `move_to` | `x, y, z` (m), `roll_deg/pitch_deg/yaw_deg` or `quat`, `speed_mps` (≤ 0.15), `timeout_s` | `{action_id, state, settled, tcp_after, duration_s}`; straight line of `end_link`, orientation omitted = keep |
+| `move_relative` | `frame` (`base`/`tool`/`camera`), `dx/dy/dz` (≤ 0.30 m), `dyaw_deg/dpitch_deg/droll_deg` (≤ 90), `level`, `speed_mps` | same as `move_to` |
+| `gripper` | `command` (`open`/`close`/`move`), `fraction` (0 closed .. 1 open), `grasp` | `{holding, gap_rad, torque_nm, fraction, state}` |
+| `home` / `park` | — | action result; `park` ends Idle with torque off |
+| `stop` | — | `{state}`; runs while another tool is moving |
+| `e_stop` | — | `{safety_state, epoch_id}`; no lease needed |
+| `enable` / `clear_fault` | — | torque on / clear EStop or Fault |
+| `take_control` | `force` (false) | acquire the lease; `force=true` takes control from the web cockpit |
+| `release_control` | — | release the lease (the cockpit acquires it automatically) |
+
+Lease rules:
+
+- At startup the server tries a non-force lease. If the web cockpit or another client holds it, the server keeps running without it and actuator tools return `LEASE_BUSY`; each actuator call retries a non-force acquire. The server never sends `force=true` by itself.
+- While the server holds the lease, its 150 ms heartbeat keeps it; the cockpit's 500 ms non-force retry does not take it over.
+- If the cockpit preempts (its confirm button), tools return `LEASE_LOST`. The server does not re-acquire; control comes back only through `take_control`.
+- `take_control(force=true)` is for use only after the user explicitly confirms the takeover. A takeover inside armd's cooldown returns `PREEMPT_COOLDOWN` with `remaining_ms`.
+- After `release_control`, or with `--no-auto-lease`, tools return `NO_LEASE` until `take_control`.
+- On exit the session releases the lease; on an exception (including Ctrl-C) `safe_exit="error"` parks the arm first. If the process is killed, armd's watchdog latches a Fault with the arm holding position.
+
+Errors come back as `isError` results whose text is JSON `{code, message, hint, safety_state}`; codes include `LEASE_BUSY`, `LEASE_LOST`, `NO_LEASE`, `ESTOP_ACTIVE`, `FAULT_ACTIVE`, `NOT_ARMED`, `WORKSPACE_VIOLATION`, `IK_UNREACHABLE`, `IK_BRANCH_FLIP`, `MOTION_BUSY`, `MOTION_TIMEOUT` (stop was sent), `TRACKING_STALL`, `STOPPED`, `SUPERSEDED`, `BUSY` (a second motion tool call while one runs), `CAMERA_UNAVAILABLE`, `SNAPSHOT_TIMEOUT`, `DETECTOR_UNAVAILABLE`, `UNSUPPORTED`. If the MCP client cancels a motion call, the server sends `stop`.
+
+The move, gripper and action-status tools need an armd with the action API (`/api/v1/action/*`, `action` in the observation). `home` / `park` also work with an older armd.
+
+Snapshots wait for the next IDR frame on the camera stream (default timeout 6 s), decoded with PyAV or, without it, the `ffmpeg` binary (`rebot_companion.snapshot`). Box positions are normalised to the image; they are only correct when the detector input has the same aspect ratio as the stream (not verified on the device).
 
 ---
 

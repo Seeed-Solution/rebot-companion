@@ -12,6 +12,9 @@ dependencies = [
     "scipy>=1.10.0",
 ]
 
+[project.scripts]
+rebot-mcp = "rebot_companion.mcp_server:main"
+
 [project.optional-dependencies]
 calib = [
     "opencv-python-headless>=4.8,<5",

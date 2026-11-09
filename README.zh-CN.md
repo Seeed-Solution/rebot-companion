@@ -49,11 +49,13 @@
 
 ```text
 rebot-companion/
-├── pyproject.toml              # 基于 uv 的 Python 项目；可选 extra [calib] = 内参工具用的 OpenCV
+├── pyproject.toml              # 基于 uv 的 Python 项目；可选 extra [calib] = 内参工具用的 OpenCV，[agent] = MCP 服务依赖
 ├── rebot_companion/            # 核心 SDK
 │   ├── __init__.py
 │   ├── camera_client.py        # reCamera 原子能力客户端 (trigger / latest result)
 │   ├── arm_client.py           # rebot-armd 客户端 (REST 读状态 + WebSocket 租约会话)
+│   ├── snapshot.py             # 从相机 H.264 流截取 JPEG + 检测框叠加
+│   ├── mcp_server.py           # stdio MCP 服务 (rebot-mcp)，供 agent 控制
 │   ├── kinematics.py           # B601-DM 正/逆运动学 (移植自 Web 驾驶舱)
 │   ├── ik.py                   # IK 适配器：基座系位姿 -> armd 7 关节向量（含夹爪）
 │   ├── transforms.py           # 空间 SE(3) 刚体变换，欧拉角 ZYX 约定
@@ -81,7 +83,7 @@ uv sync
 uv run pytest
 ```
 
-内参工具需要可选的 OpenCV extra：`uv sync --extra calib`（开发时用 `uv sync --all-extras`）。
+内参工具需要可选的 OpenCV extra：`uv sync --extra calib`；MCP 服务需要 `uv sync --extra agent`（开发时用 `uv sync --all-extras`）。
 
 ### 2. 验证 reCamera 原子接口
 ```bash
@@ -152,6 +154,7 @@ rebot-armd 只接受持有控制租约（lease）的 WebSocket 连接发来的�
 - unload 运动结束后 armd 报告 `Armed` 且仍上力矩（卸力失败）时，`s.unload()` 立即抛 `UnloadFailed`。`s.unload(wait=False)` 之后关闭会话会先等待 unload 完成，因为释放租约会在 armd 中取消 unload。
 - 伺服：`servo_stream()` 要求 `rate_hz >= 10`（armd 在最后一帧 200 ms 后停止跟随）。相对其指令位置跳变超过 0.35 rad 的帧会被 armd 静默丢弃（夹爪除外）；`servo()` 遇到这样的步长抛 `ServoJumpError`，不发送。
 - 被 `force=True` 抢占后，最长 1.5 s 内运动命令会被 `HANDOVER_SETTLING` 拒绝。
+- 高层动作（armd 需支持 `/api/v1/action/*`）：`s.move_pose(xyz, rpy=None | quat=None)`（`end_link` 笛卡尔直线运动；`move_to` 仍是关节空间 jog）、`s.move_relative(frame, d, dyaw=, dpitch=, droll=)`、`s.gripper("open" | "close" | "move", fraction=)`、`s.home_action()`、`s.park_action()`，或 `s.action(path, body)`。均阻塞到 `observation.action` 中与 ack 的 `action_id` 对应的记录结束，返回 `ActionResult`；`failed` / `cancelled` 抛 `ActionFailed(code)`。默认超时为 `2 * expected_duration_s + 5` s，上限 60 s；超时会发送 `stop` 并抛 `MotionTimeout`。armd 不提供这些字段时，`ArmStatus.commanded_positions` 为空、`ArmStatus.action` 为 None。
 
 ```python
 from rebot_companion import ArmdClient
@@ -164,6 +167,52 @@ with arm.session() as s:
     s.move_to(target, duration=2.0)
     s.unload()  # 释放租约前回停靠位并卸力
 ```
+
+## 🤖 MCP 服务（agent 控制）
+
+`rebot_companion/mcp_server.py` 是 stdio MCP 服务，把机械臂、相机截图和检测结果作为工具提供给 agent。需要 `agent` extra（`mcp` 2.x、`av`、`pillow`；测试版本 mcp 2.3.0、av 19.0.2、pillow 13.0.0）。
+
+```bash
+uv run --directory /path/to/rebot-companion --extra agent rebot-mcp \
+  --armd http://192.168.42.1:8765 --camera-ws ws://192.168.42.1:8001/ \
+  [--client-id rebot-mcp] [--no-auto-lease] [--decoder auto|pyav|ffmpeg]
+
+# Claude Code
+claude mcp add rebot -- uv run --directory /path/to/rebot-companion --extra agent rebot-mcp --armd http://192.168.42.1:8765
+```
+
+日志输出到 stderr；stdout 是 MCP 通道。
+
+| 工具 | 输入 | 返回 |
+|---|---|---|
+| `get_state` | — | 安全状态、故障、力矩、租约、关节（positions / commanded / velocities / torques / temperatures）、`tcp`（主机端 FK：`xyz_m`、`rpy_deg`、`quat` [w,x,y,z]）、夹爪、最近的 `action`、`epoch_id`。不需要租约 |
+| `snapshot` | `max_width`（800）、`quality`（80） | JPEG 图像 + JSON `{width, height, device_ts_ms, age_ms}` |
+| `snapshot_annotated` | `min_score`（0.3）、`max_width`、`quality` | 画上检测器最新检测框的 JPEG + JSON `{detections, det_frame_id, det_age_vs_frame_ms, note?}` |
+| `detect` | `wait_ms`（2500，0..5000）、`min_score`（0.3） | `{frame_id, ts_ms, count, detections[{label, score, box_norm, center_norm, track_id}]}`；调用 `POST /api/v1/detection/trigger`，返回 404 时改用 开启 → `latest` → 关闭（只在自己开启推理时才关闭） |
+| `move_to` | `x, y, z`（m）、`roll_deg/pitch_deg/yaw_deg` 或 `quat`、`speed_mps`（≤ 0.15）、`timeout_s` | `{action_id, state, settled, tcp_after, duration_s}`；`end_link` 走直线，不给姿态则保持当前姿态 |
+| `move_relative` | `frame`（`base`/`tool`/`camera`）、`dx/dy/dz`（≤ 0.30 m）、`dyaw_deg/dpitch_deg/droll_deg`（≤ 90）、`level`、`speed_mps` | 同 `move_to` |
+| `gripper` | `command`（`open`/`close`/`move`）、`fraction`（0 闭合 .. 1 张开）、`grasp` | `{holding, gap_rad, torque_nm, fraction, state}` |
+| `home` / `park` | — | 动作结果；`park` 结束时为 Idle 且已卸力 |
+| `stop` | — | `{state}`；其他工具运动时也可调用 |
+| `e_stop` | — | `{safety_state, epoch_id}`；不需要租约 |
+| `enable` / `clear_fault` | — | 上力矩 / 清除 EStop 或 Fault |
+| `take_control` | `force`（false） | 获取租约；`force=true` 从 Web 驾驶舱接管控制 |
+| `release_control` | — | 释放租约（驾驶舱会自动获取） |
+
+租约规则：
+
+- 启动时以非强制方式申请租约。Web 驾驶舱或其他客户端持有租约时，服务继续运行但不持有租约，执行器类工具返回 `LEASE_BUSY`；每次执行器调用会再尝试一次非强制申请。服务不会自行发送 `force=true`。
+- 服务持有租约期间每 150 ms 心跳续约；驾驶舱每 500 ms 的非强制重试不会夺走租约。
+- 驾驶舱通过其确认按钮抢占后，工具返回 `LEASE_LOST`。服务不会自动重新申请，只能通过 `take_control` 取回控制。
+- `take_control(force=true)` 只在用户明确确认接管后调用。处于 armd 抢占冷却期内会返回 `PREEMPT_COOLDOWN` 和 `remaining_ms`。
+- 调用 `release_control` 后，或使用 `--no-auto-lease` 时，工具返回 `NO_LEASE`，直到调用 `take_control`。
+- 进程退出时会话释放租约；因异常（含 Ctrl-C）退出时 `safe_exit="error"` 先让机械臂回停靠位。进程被强制结束时，armd 看门狗锁存 Fault，机械臂保持当前位置。
+
+错误以 `isError` 结果返回，文本为 JSON `{code, message, hint, safety_state}`；错误码包括 `LEASE_BUSY`、`LEASE_LOST`、`NO_LEASE`、`ESTOP_ACTIVE`、`FAULT_ACTIVE`、`NOT_ARMED`、`WORKSPACE_VIOLATION`、`IK_UNREACHABLE`、`IK_BRANCH_FLIP`、`MOTION_BUSY`、`MOTION_TIMEOUT`（已发送 stop）、`TRACKING_STALL`、`STOPPED`、`SUPERSEDED`、`BUSY`（已有运动类工具在执行时再次调用）、`CAMERA_UNAVAILABLE`、`SNAPSHOT_TIMEOUT`、`DETECTOR_UNAVAILABLE`、`UNSUPPORTED`。MCP 客户端取消运动类调用时，服务会发送 `stop`。
+
+移动、夹爪和动作状态需要支持动作接口的 armd（`/api/v1/action/*`，observation 中有 `action`）。`home` / `park` 在旧版 armd 上也可用。
+
+截图等待相机流的下一个 IDR 帧（默认超时 6 s），用 PyAV 解码，未安装时用 `ffmpeg` 程序（`rebot_companion.snapshot`）。检测框坐标按图像归一化；只有检测器输入与视频流宽高比一致时才准确（未在设备上验证）。
 
 ---
 
