@@ -25,13 +25,16 @@ import numpy as np
 
 from rebot_companion import ArmdClient, CalibrationError, HandEyeCalibration, ReCameraClient, kinematics
 from rebot_companion.calibration import rotation_spread_deg
+from rebot_companion.ik import pitch_from_rotation
 
 GUIDE = """
 Pose the arm by hand or with teleop (e.g. the rebot-armd Web cockpit, or torque off and move it
 manually), hold it still, then press Enter to capture. Recommendations:
   * 9+ samples spread over the camera view and over depth (near / far), not on one line or plane.
   * keep the marker fully visible and facing the camera (< 60 deg tilt).
-  * method=point: the marker centre must sit on the TCP (gripper tip); keep J5 at 0.
+  * method=point: the marker centre must sit on the TCP (gripper tip).
+  * FK covers J1..J6 (URDF chain): J5 = wrist swing, J6 = tool roll; both may be moved freely.
+    (The Web cockpit labels them the other way round: its "roll" slider is J5, "swing" is J6.)
   * method=axxb : change J1 yaw AND wrist pitch between samples (>= 15 deg each), not only position.
 """
 
@@ -102,10 +105,6 @@ def capture(args, arm: ArmdClient, cam: ReCameraClient, calib: HandEyeCalibratio
         return f"rejected: observation has {len(pos)} joints (< 4); is armd connected to the arm?"
     if any(abs(v) > args.vel_threshold for v in velocities_of(obs)):
         return "rejected: arm is moving; hold it still and retry"
-    if len(pos) > 4 and abs(pos[4]) > math.radians(1.0) and not args.allow_j5:
-        return (
-            f"rejected: J5 = {math.degrees(pos[4]):.1f} deg; the FK model assumes J5 = 0 (use --allow-j5 to override)"
-        )
 
     markers = cam.trigger(wait_ms=args.trigger_wait_ms)
     if args.marker_id is not None:
@@ -119,7 +118,7 @@ def capture(args, arm: ArmdClient, cam: ReCameraClient, calib: HandEyeCalibratio
 
     obs2 = arm.get_observation()
     pos2 = list(obs2.joint_positions)
-    if len(pos2) < 4 or max(abs(a - b) for a, b in zip(pos[:4], pos2[:4])) > 0.002:
+    if len(pos2) < 4 or max(abs(a - b) for a, b in zip(pos[:6], pos2[:6])) > 0.002:
         return "rejected: arm moved during detection; retry"
     if any(abs(v) > args.vel_threshold for v in velocities_of(obs2)):
         return "rejected: arm is moving; hold it still and retry"
@@ -130,13 +129,12 @@ def capture(args, arm: ArmdClient, cam: ReCameraClient, calib: HandEyeCalibratio
             return f"rejected: TCP within 10 mm of sample #{i + 1}; move further"
     if calib.marker_id is None:
         calib.marker_id = m.id
-    tcp = kinematics.fk(kinematics.to_model(pos, sign, offset))
     calib.add_sample(
         G,
         m.pose,
         joints=pos,
         marker_id=m.id,
-        tcp_pitch=tcp.pitch,
+        tcp_pitch=pitch_from_rotation(G.rotation),
         marker_reprojection_error=m.reprojection_error,
         corners=m.corners,
         ts=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -163,7 +161,6 @@ def main() -> int:
     ap.add_argument("--from-web-export", type=Path, default=None, help="re-solve samples from a Web cockpit export")
     ap.add_argument("--vel-threshold", type=float, default=0.02, help="rad/s; reject capture above this")
     ap.add_argument("--trigger-wait-ms", type=int, default=2500)
-    ap.add_argument("--allow-j5", action="store_true", help="accept samples with J5 != 0 (FK ignores J5)")
     ap.add_argument("--iksign", default=None, help="J1..J4 motor sign, e.g. 1,1,1,1 (same as Web ?iksign=)")
     ap.add_argument("--ikoff", default=None, help="J1..J4 motor offset in degrees (same as Web ?ikoff=)")
     args = ap.parse_args()
