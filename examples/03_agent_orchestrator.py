@@ -34,7 +34,10 @@ PLACEHOLDER_CAM_TO_BASE = Transform.from_translation_euler([0.30, -0.40, 0.50], 
 
 
 class RobotCompanionAgentTools:
-    """Tools exposed to an LLM / VLM Agent (compatible with OpenAI Function Calling & Anthropic Tools).
+    """Tools exposed to an LLM / VLM Agent.
+
+    Definitions use the OpenAI function-calling shape (``parameters``); for the Anthropic Messages API
+    rename ``parameters`` to ``input_schema``.
 
     ``hand_eye`` is a :class:`HandEyeResult` from :meth:`HandEyeCalibration.load_result`. Without it
     the placeholder transform is used and motion is refused unless ``dry_run`` is true.
