@@ -31,9 +31,10 @@ def arm_demo(url: str, move: bool) -> int:
             if obs.is_stopped:
                 print(f"[*] clear_fault: {s.clear_fault()['safety_state']}")
             s.torque(True)
-            s.home(duration=2.0)
-            target = [0.0] * schema.dof
-            target[0] = 0.2
+            homed = s.home(duration=2.0)
+            # Start from the measured home pose (J6 home is pi/2 on the B601-DM) and change joint 1 only.
+            target = list(homed.positions)
+            target[0] += 0.2
             done = s.move_to(target, duration=1.5)
             print(f"[*] Arrived: q={[round(q, 3) for q in done.positions]}")
             s.home(duration=1.5)
