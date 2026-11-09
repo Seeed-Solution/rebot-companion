@@ -377,3 +377,40 @@ def test_safe_exit_policies(armd):
     assert s.safe_exit_outcome.action == "not_needed"
     with pytest.raises(ValueError):
         armd.client.session(safe_exit="sometimes")
+
+
+def test_heartbeats_keep_flowing_through_jog_unload_cycles_with_a_polling_thread(armd):
+    """Real-arm script shape (armd fce83ff): torque, jog, unload, torque, jog, while a
+    second thread polls latest_observation() every 20 ms. Heartbeats must not stall."""
+    beats: list[float] = []
+    orig = armd.handle
+
+    def handle(conn, msg, kind, *rest):
+        if kind == "heartbeat":
+            beats.append(time.monotonic())
+        return orig(conn, msg, kind, *rest)
+
+    armd.handle = handle
+    stop = threading.Event()
+    with armd.client.session(client_id="cycles") as s:
+
+        def poll():
+            while not stop.is_set():
+                s.latest_observation()
+                time.sleep(0.02)
+
+        th = threading.Thread(target=poll, daemon=True)
+        th.start()
+        try:
+            for _ in range(2):
+                s.torque(True)
+                s.move_to(q(0.3), duration=0.3)
+                s.unload(timeout=5)
+            s.torque(True)
+            s.move_to(q(0.3), duration=0.3)
+            assert s.has_lease
+        finally:
+            stop.set()
+            th.join(1)
+    gaps = [b - a for a, b in zip(beats, beats[1:])]
+    assert len(beats) > 5 and max(gaps) < armd.lease_timeout / 2, max(gaps)
