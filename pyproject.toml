@@ -1,16 +1,38 @@
 [project]
 name = "rebot-companion"
 version = "0.1.0"
-description = "Robot Arm Vision Companion SDK & Orchestration Toolkit for Seeed reCamera and rebot-armd"
+description = "Python SDK and MCP server for a reBot B601-DM arm driven by rebot-armd, with Seeed reCamera snapshots and detections"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "Seeed Studio" }]
 requires-python = ">=3.10"
+keywords = ["robotics", "robot-arm", "rebot", "recamera", "mcp", "hand-eye-calibration", "seeed"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Image Recognition",
+]
 dependencies = [
     "httpx>=0.27.0",
     "websockets>=12.0",
     "numpy>=1.24.0",
     "scipy>=1.10.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/Seeed-Solution/rebot-companion"
+Repository = "https://github.com/Seeed-Solution/rebot-companion"
+Issues = "https://github.com/Seeed-Solution/rebot-companion/issues"
 
 [project.scripts]
 rebot-mcp = "rebot_companion.mcp_server:main"
