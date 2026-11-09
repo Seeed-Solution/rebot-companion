@@ -52,6 +52,7 @@ rebot-companion/
 │   ├── camera_client.py        # reCamera atomic API client (trigger / latest result)
 │   ├── arm_client.py           # rebot-armd client (REST reads + WebSocket lease session)
 │   ├── kinematics.py           # B601-DM forward / inverse kinematics (port of the Web cockpit)
+│   ├── ik.py                   # IK adapter: base-frame pose -> armd 7-joint vector (incl. gripper)
 │   ├── transforms.py           # SE(3) transforms, Euler ZYX convention
 │   ├── calibration.py          # hand-eye calibration: point registration + AX=XB
 │   └── pipeline.py             # Stage 2 deterministic pipeline
@@ -84,6 +85,8 @@ Optional OpenCV extra for the intrinsics tool: `uv sync --extra calib` (`uv sync
 uv run python examples/01_atomic_api_demo.py --url http://192.168.42.1:8090
 ```
 
+`ReCameraClient.trigger()` posts a JSON body (aruco-detector >= 0.1.3 answers `415` to a POST without `Content-Type: application/json`; a 415 raises `CameraError`). It raises `CameraTriggerTimeout` on an HTTP timeout or a `success: false` reply; an empty list means the frame had no marker. Markers without a `pose` are skipped.
+
 ### 3. Run hand-eye calibration
 ```bash
 uv run python examples/02_hand_eye_calib.py --arm-url http://<armd-host>:8765
@@ -92,8 +95,13 @@ See "Hand-eye calibration" below.
 
 ### 4. Run the Stage 2 hardened pick & place
 ```bash
-uv run python examples/04_hardened_pick_place.py
+uv run python examples/04_hardened_pick_place.py --dry-run   # detect + workspace check, arm does not move
+uv run python examples/04_hardened_pick_place.py             # full cycle through B601IkAdapter
 ```
+
+The example loads the calibration with `HandEyeCalibration.load_result()`, so eye_to_hand and eye_in_hand files are both handled. A cycle without an IK solver ends with `success=False`, `stage="dry_run"`; `stage="completed"` means the arm ran the whole cycle.
+
+Cycle steps: open the gripper in place, approach (+80 mm) and grasp with the gripper open, close the gripper, lift, place, open the gripper, then `finish_action` (default `unload`). The gripper is joint index 6 of armd's 7-joint vector: `ik.GRIPPER_OPEN = -5.7` (open) .. `ik.GRIPPER_CLOSED = 0.0` (closed); armd soft limit -5.75 .. 0.10. `ik.B601IkAdapter` fills J1–J4 from the analytic IK (tool pointing down by default), J5 = 0, J6 = armd home (pi/2) or the current value (`j6=None`), J7 = gripper. armd rejects targets with any other length.
 
 ---
 
@@ -136,18 +144,20 @@ rebot-armd accepts actuator commands only on the WebSocket connection that holds
   `s.torque(True)`, `s.home()`, `s.move_to(q, duration=2.0)` (blocks until arrival), `s.servo_stream(frames, rate_hz=50)`, `s.unload()`.
 - `ArmdClient.e_stop()` works without a lease.
 - If the arm is still torqued when the session ends, armd latches `Fault(WatchdogTimeout)` about 2.5 s later, with the arm holding position. Finish with `s.unload()`, or later call `s.clear_fault()` then `s.torque(True)`.
+- Safe exit: `arm.session(safe_exit="error")` (default) unloads a torqued arm when the `with` block raises (including Ctrl-C): clear a Fault, re-arm, `unload(wait=True)` bounded by `safe_exit_timeout` (30 s), then release the lease. `safe_exit="always"` also does this on a normal exit; `"off"` only releases. The result is in `s.safe_exit_outcome` (`unloaded`, `not_needed`, `unsupported`, `estop`, `no_lease`, `failed`). A latched EStop is not cleared. When armd has no resting-pose profile, `unload` answers `UNSUPPORTED`; the outcome is `unsupported` and the arm stays torqued.
+- `s.torque(False)` is refused by armd (`ARM_NOT_AT_RESTING_POSE`) unless the arm is settled at the resting pose; use `s.unload()`.
+- `s.unload()` raises `UnloadFailed` as soon as armd reports `Armed` with torque on after the unload motion (failed torque cut). After `s.unload(wait=False)`, closing the session waits for the unload, because a lease release cancels it in armd.
+- Servo: `servo_stream()` needs `rate_hz >= 10` (armd drops the stream 200 ms after the last frame). armd drops frames that jump more than 0.35 rad from its commanded position without a reply (gripper exempt); `servo()` raises `ServoJumpError` for such a step instead of sending it.
 - After a `force=True` preemption, motion is refused with `HANDOVER_SETTLING` for up to 1.5 s.
 
 ```python
 from rebot_companion import ArmdClient
 
 arm = ArmdClient("http://127.0.0.1:8765")
-q = arm.get_observation().positions
 with arm.session() as s:
     s.torque(True)
-    s.home()
-    target = [0.0] * len(q)
-    target[0] = 0.2  # J1 +0.2 rad from home
+    target = list(s.home().positions)  # keep home J6 (pi/2) and the gripper
+    target[0] += 0.2  # J1 +0.2 rad from home
     s.move_to(target, duration=2.0)
     s.unload()  # park + torque off before the lease is released
 ```
@@ -194,7 +204,11 @@ Pose the arm by hand (torque off) or with teleop, hold it still and press Enter.
 
 ### Calibration file format
 
-`save_to_file()` writes a superset of the Web cockpit export, so files from either side load with `HandEyeCalibration.load_from_file()` (returns the transform) and `HandEyeCalibration.load_samples()` (returns samples to re-solve).
+`save_to_file()` writes a superset of the Web cockpit export, so files from either side load with `HandEyeCalibration.load_result()` (returns `HandEyeResult(setup, transform)`) and `HandEyeCalibration.load_samples()` (returns samples to re-solve).
+
+- `HandEyeResult.cam_to_base(joints)`: eye_to_hand returns `T_cam_to_base`; eye_in_hand returns `T_base_gripper(joints) @ T_cam_to_gripper`, with `joints` the armd positions when the image was taken. The pipeline reads them right before the trigger and fails the cycle if the arm moved during detection.
+- `HandEyeCalibration.load_from_file()` returns `T_cam_to_base` for eye_to_hand files and raises `ValueError` for eye_in_hand files (their transform is `T_cam_to_gripper`).
+- Legacy SDK files without `mode` / `setup` are rejected by `load_result()`.
 
 ```jsonc
 {

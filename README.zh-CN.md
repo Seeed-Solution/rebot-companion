@@ -55,6 +55,7 @@ rebot-companion/
 │   ├── camera_client.py        # reCamera 原子能力客户端 (trigger / latest result)
 │   ├── arm_client.py           # rebot-armd 客户端 (REST 读状态 + WebSocket 租约会话)
 │   ├── kinematics.py           # B601-DM 正/逆运动学 (移植自 Web 驾驶舱)
+│   ├── ik.py                   # IK 适配器：基座系位姿 -> armd 7 关节向量（含夹爪）
 │   ├── transforms.py           # 空间 SE(3) 刚体变换，欧拉角 ZYX 约定
 │   ├── calibration.py          # 手眼标定：点配准 + AX=XB
 │   └── pipeline.py             # 阶段二固化流水线执行引擎
@@ -87,6 +88,8 @@ uv run pytest
 uv run python examples/01_atomic_api_demo.py --url http://192.168.42.1:8090
 ```
 
+`ReCameraClient.trigger()` 以 JSON body 发送 POST（aruco-detector >= 0.1.3 对没有 `Content-Type: application/json` 的 POST 返回 `415`；收到 415 抛 `CameraError`）。HTTP 超时或返回 `success: false` 时抛 `CameraTriggerTimeout`；返回空列表表示该帧没有标记。没有 `pose` 字段的标记会被跳过。
+
 ### 3. 运行手眼标定
 ```bash
 uv run python examples/02_hand_eye_calib.py --arm-url http://<armd-host>:8765
@@ -95,8 +98,13 @@ uv run python examples/02_hand_eye_calib.py --arm-url http://<armd-host>:8765
 
 ### 4. 运行阶段二固化闭环抓取
 ```bash
-uv run python examples/04_hardened_pick_place.py
+uv run python examples/04_hardened_pick_place.py --dry-run   # 只检测并做工作空间检查，机械臂不动
+uv run python examples/04_hardened_pick_place.py             # 经 B601IkAdapter 跑完整周期
 ```
+
+示例用 `HandEyeCalibration.load_result()` 读标定文件，eye_to_hand 和 eye_in_hand 文件都能处理。没有 IK 求解器时周期返回 `success=False`、`stage="dry_run"`；`stage="completed"` 表示机械臂执行完了整个周期。
+
+周期步骤：原地张开夹爪，夹爪张开状态下接近（+80 mm）并到达抓取位，闭合夹爪，抬起，放置，张开夹爪，最后执行 `finish_action`（默认 `unload`）。夹爪是 armd 7 关节向量的第 6 号索引：`ik.GRIPPER_OPEN = -5.7`（张开）.. `ik.GRIPPER_CLOSED = 0.0`（闭合）；armd 软限位 -5.75 .. 0.10。`ik.B601IkAdapter` 的 J1–J4 来自解析 IK（默认工具竖直向下），J5 = 0，J6 = armd home（pi/2）或当前值（`j6=None`），J7 = 夹爪。其他长度的目标会被 armd 拒绝。
 
 ---
 
@@ -139,18 +147,20 @@ rebot-armd 只接受持有控制租约（lease）的 WebSocket 连接发来的�
   `s.torque(True)`、`s.home()`、`s.move_to(q, duration=2.0)`（阻塞直到到位）、`s.servo_stream(frames, rate_hz=50)`、`s.unload()`。
 - `ArmdClient.e_stop()` 不需要租约。
 - 会话结束时机械臂仍处于上力矩状态，armd 约 2.5 s 后锁存 `Fault(WatchdogTimeout)`，机械臂保持当前位置。结束前调用 `s.unload()`，或之后调用 `s.clear_fault()` 再 `s.torque(True)`。
+- 安全退出：`arm.session(safe_exit="error")`（默认）在 `with` 块抛异常（含 Ctrl-C）且机械臂上力矩时：清除 Fault、重新上力矩、`unload(wait=True)`（受 `safe_exit_timeout` 限制，默认 30 s），再释放租约。`safe_exit="always"` 在正常退出时也执行；`"off"` 只释放租约。结果在 `s.safe_exit_outcome`（`unloaded`、`not_needed`、`unsupported`、`estop`、`no_lease`、`failed`）。已锁存的 EStop 不会被清除。armd 没有停靠位配置时 `unload` 返回 `UNSUPPORTED`，结果为 `unsupported`，机械臂保持上力矩。
+- 机械臂不在停靠位并静止时，armd 拒绝 `s.torque(False)`（`ARM_NOT_AT_RESTING_POSE`）；请用 `s.unload()`。
+- unload 运动结束后 armd 报告 `Armed` 且仍上力矩（卸力失败）时，`s.unload()` 立即抛 `UnloadFailed`。`s.unload(wait=False)` 之后关闭会话会先等待 unload 完成，因为释放租约会在 armd 中取消 unload。
+- 伺服：`servo_stream()` 要求 `rate_hz >= 10`（armd 在最后一帧 200 ms 后停止跟随）。相对其指令位置跳变超过 0.35 rad 的帧会被 armd 静默丢弃（夹爪除外）；`servo()` 遇到这样的步长抛 `ServoJumpError`，不发送。
 - 被 `force=True` 抢占后，最长 1.5 s 内运动命令会被 `HANDOVER_SETTLING` 拒绝。
 
 ```python
 from rebot_companion import ArmdClient
 
 arm = ArmdClient("http://127.0.0.1:8765")
-q = arm.get_observation().positions
 with arm.session() as s:
     s.torque(True)
-    s.home()
-    target = [0.0] * len(q)
-    target[0] = 0.2  # J1 相对 home +0.2 rad
+    target = list(s.home().positions)  # 保留 home 的 J6 (pi/2) 和夹爪
+    target[0] += 0.2  # J1 相对 home +0.2 rad
     s.move_to(target, duration=2.0)
     s.unload()  # 释放租约前回停靠位并卸力
 ```
@@ -197,7 +207,11 @@ uv run python examples/02_hand_eye_calib.py --from-web-export rebot_hand_eye_202
 
 ### 标定文件格式
 
-`save_to_file()` 写出的是 Web 驾驶舱导出格式的超集，两边的文件都可以用 `HandEyeCalibration.load_from_file()`（返回变换）和 `HandEyeCalibration.load_samples()`（返回样本以便重新求解）读取。
+`save_to_file()` 写出的是 Web 驾驶舱导出格式的超集，两边的文件都可以用 `HandEyeCalibration.load_result()`（返回 `HandEyeResult(setup, transform)`）和 `HandEyeCalibration.load_samples()`（返回样本以便重新求解）读取。
+
+- `HandEyeResult.cam_to_base(joints)`：eye_to_hand 返回 `T_cam_to_base`；eye_in_hand 返回 `T_base_gripper(joints) @ T_cam_to_gripper`，`joints` 为拍照时 armd 的关节位置。流水线在触发前读取关节，检测期间机械臂发生移动则本周期失败。
+- `HandEyeCalibration.load_from_file()` 对 eye_to_hand 文件返回 `T_cam_to_base`，对 eye_in_hand 文件抛 `ValueError`（其变换是 `T_cam_to_gripper`）。
+- 没有 `mode` / `setup` 字段的旧版 SDK 文件会被 `load_result()` 拒绝。
 
 ```jsonc
 {
