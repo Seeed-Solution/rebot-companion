@@ -215,7 +215,8 @@ def test_preemption_cancels_with_lease_lost(armd):
         time.sleep(0.2)
         with armd.client.session(client_id="b", force=True, safe_exit="off"):
             t.join(3)
-        assert isinstance(result["exc"], LeaseError)
+        assert isinstance(result["exc"], LeaseError)  # lease_lost arrives before armd's next tick
+        time.sleep(0.1)
         assert armd.action["state"] == "cancelled" and armd.action["code"] == "LEASE_LOST"
     finally:
         a.close()
