@@ -167,9 +167,8 @@ def test_load_web_export(tmp_path: Path):
     assert calib.marker_id == 3 and len(calib.samples) == 5
     assert not calib.samples[0].has_rotation
     # gripper rotation reconstructed from joints via FK
-    np.testing.assert_allclose(
-        calib.samples[1].gripper_pose.matrix, K.tcp_pose(calib.samples[1].joints[:4]).matrix, atol=1e-12
-    )
+    s1 = calib.samples[1]
+    np.testing.assert_allclose(s1.gripper_pose.rotation, K.tcp_pose_from_joints(s1.joints).rotation, atol=1e-12)
     np.testing.assert_allclose(calib.solve().matrix, X_gt.matrix, atol=1e-9)
     # position-only samples cannot feed AX=XB
     with pytest.raises(CalibrationError, match="orientation"):
@@ -394,3 +393,52 @@ def test_load_result_rejects_ambiguous_files(tmp_path: Path):
         HandEyeCalibration.load_result(f)
     with pytest.raises(ValueError):
         HandEyeResult(setup="eye_on_base", transform=Transform())
+
+
+# ------------------------------------------- FK poses with the wrist joints moving ---
+def _wrist_joint_samples(rng, n):
+    """Raw armd 7-joint vectors with J5 (swing) and J6 (roll) away from 0, gripper arbitrary."""
+    out = []
+    while len(out) < n:
+        q = [
+            rng.uniform(-0.8, 0.8),
+            rng.uniform(-1.4, -0.6),
+            rng.uniform(-2.0, -1.2),
+            rng.uniform(0.0, 1.2),
+            rng.uniform(-1.0, 1.0),
+            rng.uniform(-2.5, 2.5),
+            rng.uniform(-5.7, 0.0),
+        ]
+        if abs(q[4]) > 0.2 and abs(q[5] - np.pi / 2) > 0.2:
+            out.append(q)
+    return out
+
+
+@pytest.mark.parametrize("mode,method", [("eye_to_hand", "point"), ("eye_to_hand", "axxb"), ("eye_in_hand", "axxb")])
+def test_recover_x_with_nonzero_j5_j6(mode, method, tmp_path: Path):
+    rng = np.random.default_rng(42)
+    X_gt = (
+        Transform.from_translation_euler([0.55, -0.35, 0.60], 175.0, -5.0, 120.0)
+        if mode == "eye_to_hand"
+        else Transform.from_translation_euler([0.05, 0.0, 0.04], 0.0, -90.0, 180.0)
+    )
+    Y_gt = (
+        Transform.from_matrix(np.eye(4))
+        if method == "point"
+        else Transform.from_translation_euler([0.03, -0.01, 0.05], 10.0, 80.0, -20.0)
+        if mode == "eye_to_hand"
+        else Transform.from_translation_euler([0.35, 0.05, 0.0], 0.0, 0.0, 30.0)
+    )
+    calib = HandEyeCalibration(mode=mode, method=method)
+    for q in _wrist_joint_samples(rng, 10):
+        G = gripper_pose(q)
+        # J5 / J6 change the TCP pose: ignoring them would give a different gripper pose
+        assert not np.allclose(G.matrix, gripper_pose(q[:4] + [0.0, 0.0, 0.0]).matrix, atol=1e-3)
+        M = X_gt.inverse() @ G @ Y_gt if mode == "eye_to_hand" else (G @ X_gt).inverse() @ Y_gt
+        calib.add_sample(G, M, joints=q)
+    np.testing.assert_allclose(calib.solve().matrix, X_gt.matrix, atol=1e-8)
+    assert calib.rmse < 1e-8
+    # re-solve from the saved samples (gripper pose stored as T_base_gripper)
+    f = tmp_path / "s.json"
+    calib.save_to_file(f)
+    np.testing.assert_allclose(HandEyeCalibration.load_samples(f, method=method).solve().matrix, X_gt.matrix, atol=1e-8)

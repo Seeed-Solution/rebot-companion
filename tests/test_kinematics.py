@@ -1,9 +1,12 @@
 """FK/IK must match the rebot-armd Web cockpit (values from tools/gen_web_fixtures.mjs)."""
 
 import math
+import xml.etree.ElementTree as ET
+from pathlib import Path
 
 import numpy as np
 import pytest
+from scipy.spatial.transform import Rotation
 
 from rebot_companion import kinematics as K
 
@@ -54,16 +57,17 @@ def test_fk_matches_js(q, expected):
 
 @pytest.mark.parametrize("q,expected", FK_JS)
 def test_tcp_pose_consistent_with_fk(q, expected):
+    # full URDF FK vs the planar Web FK at J5 = J6 = 0: < 0.2 mm (rounded Web constants, joint1 x offset)
     T = K.tcp_pose(q)
-    np.testing.assert_allclose(T.translation, expected[:3], atol=1e-12)
+    np.testing.assert_allclose(T.translation, expected[:3], atol=2e-4)
     R = T.rotation
     np.testing.assert_allclose(R.T @ R, np.eye(3), atol=1e-12)
     # tool axis (x of the TCP frame) points along the yaw direction, tipped down by pitch + DW
     p4 = expected[3] + K.DW
     np.testing.assert_allclose(
-        R[:, 0], [math.cos(q[0]) * math.cos(p4), math.sin(q[0]) * math.cos(p4), -math.sin(p4)], atol=1e-12
+        R[:, 0], [math.cos(q[0]) * math.cos(p4), math.sin(q[0]) * math.cos(p4), -math.sin(p4)], atol=2e-4
     )
-    np.testing.assert_allclose(R[:, 1], [-math.sin(q[0]), math.cos(q[0]), 0.0], atol=1e-12)
+    np.testing.assert_allclose(R[:, 1], [-math.sin(q[0]), math.cos(q[0]), 0.0], atol=2e-4)
 
 
 @pytest.mark.parametrize("target,prev,ok,q,branch,dist", IK_JS)
@@ -92,3 +96,77 @@ def test_to_model_sign_offset():
     np.testing.assert_allclose(K.tcp_pose_from_joints(pos, sign, off).matrix, K.tcp_pose(q).matrix)
     with pytest.raises(ValueError):
         K.to_model([0.0, 0.0])
+    # J5 / J6 (indices 4, 5) map 1:1, the gripper (index 6) is ignored
+    pos = [0.1, -0.5, -1.0, 0.3, 0.4, -0.7, 0.02]
+    np.testing.assert_allclose(
+        K.tcp_pose_from_joints(pos, sign, off).matrix, K.tcp_pose(K.to_model(pos, sign, off) + [0.4, -0.7]).matrix
+    )
+    np.testing.assert_allclose(
+        K.tcp_pose_from_joints(pos).matrix, K.tcp_pose_from_joints(pos[:6] + [-5.7]).matrix, atol=1e-15
+    )
+
+
+# ------------------------------------------------------------- full URDF FK ---
+URDF = Path(__file__).parent / "fixtures" / "reBot-DevArm_gripper.urdf"
+PARK = [0.0, 0.0, 0.0, 0.0, 0.0, math.pi / 2]
+
+
+def _urdf_fk(q):
+    """Independent FK: parse the vendored URDF and chain homogeneous transforms base_link -> end_link."""
+    root = ET.parse(URDF).getroot()
+    joints = {j.find("child").get("link"): j for j in root.findall("joint")}
+    chain, link = [], "end_link"
+    while link in joints:
+        chain.append(joints[link])
+        link = joints[link].find("parent").get("link")
+    assert link == "base_link"
+    T, i = np.eye(4), 0
+    for j in reversed(chain):
+        o = j.find("origin")
+        F = np.eye(4)
+        F[:3, :3] = Rotation.from_euler("xyz", [float(v) for v in o.get("rpy").split()]).as_matrix()
+        F[:3, 3] = [float(v) for v in o.get("xyz").split()]
+        T = T @ F
+        if j.get("type") == "revolute":
+            axis = np.array([float(v) for v in j.find("axis").get("xyz").split()])
+            J = np.eye(4)
+            J[:3, :3] = Rotation.from_rotvec(axis * q[i]).as_matrix()
+            T = T @ J
+            i += 1
+    assert i == 6
+    return T
+
+
+def test_full_fk_matches_urdf_chain():
+    rng = np.random.default_rng(7)
+    for _ in range(300):
+        q = rng.uniform(-math.pi, math.pi, 6)
+        ref = _urdf_fk(q)
+        T = K.tcp_pose(q)
+        assert np.linalg.norm(T.translation - ref[:3, 3]) < 1e-4  # 0.1 mm
+        ang = np.degrees(Rotation.from_matrix(T.rotation.T @ ref[:3, :3]).magnitude())
+        assert ang < 0.01
+
+
+def test_full_fk_equals_planar_fk_with_j5_zero():
+    rng = np.random.default_rng(11)
+    for _ in range(500):
+        q = list(rng.uniform([-math.pi, -2.5, -3.0, -math.pi], [math.pi, 2.5, 3.0, math.pi]))
+        p = K.fk(q)
+        for j6 in (0.0, math.pi / 2, rng.uniform(-math.pi, math.pi)):
+            T = K.tcp_pose(q + [0.0, j6])
+            assert np.linalg.norm(T.translation - [p.x, p.y, p.z]) < 2e-4
+            # J6 rolls about the tool axis: tool axis (x) unchanged up to the URDF 1.5708 / 3.1415 rounding
+            np.testing.assert_allclose(T.rotation[:, 0], K.tcp_pose(q).rotation[:, 0], atol=2e-4)
+
+
+def test_park_pose_wrist_motion():
+    park = K.tcp_pose(PARK).translation
+    roll = K.tcp_pose(PARK[:5] + [PARK[5] + 0.2]).translation
+    swing = K.tcp_pose(PARK[:4] + [0.2, PARK[5]]).translation
+    assert np.linalg.norm(roll - park) < 1e-9  # J6 = tool roll: TCP stays put
+    d = swing - park  # J5 = wrist swing about the vertical axis: TCP moves sideways
+    assert d[1] == pytest.approx(-0.036, abs=1e-3)
+    assert abs(d[2]) < 1e-5 and abs(d[0]) < 5e-3
+    R = K.tcp_pose(PARK[:5] + [PARK[5] + 0.2]).rotation.T @ K.tcp_pose(PARK).rotation
+    assert Rotation.from_matrix(R).magnitude() == pytest.approx(0.2, abs=1e-9)

@@ -48,7 +48,7 @@ METHOD_NAMES = {"point": "point_registration_horn", "axxb": "axxb_park_martin"}
 TRANSFORM_KEYS = {"eye_to_hand": "T_cam_to_base", "eye_in_hand": "T_cam_to_gripper"}
 OFFSET_KEYS = {"eye_to_hand": "T_marker_to_gripper", "eye_in_hand": "T_marker_to_base"}
 ASSUMPTIONS = {
-    ("eye_to_hand", "point"): "ArUco marker centre coincides with the TCP; TCP from forward kinematics (URDF b601dm)",
+    ("eye_to_hand", "point"): "ArUco marker centre coincides with the TCP; TCP from URDF forward kinematics (J1..J6)",
     ("eye_to_hand", "axxb"): "ArUco marker rigidly attached to the gripper at an unknown offset (estimated)",
     ("eye_in_hand", "axxb"): "ArUco marker fixed in the base frame; camera rigidly attached to the gripper",
 }
@@ -93,7 +93,11 @@ def gripper_pose(
     sign: Sequence[float] = kinematics.DEFAULT_SIGN,
     offset: Sequence[float] = kinematics.DEFAULT_OFFSET,
 ) -> Transform:
-    """``T_base_gripper`` from raw armd joint positions. Single FK entry point used for eye_in_hand."""
+    """``T_base_gripper`` from raw armd joint positions (J1..J6 via the URDF chain; gripper ignored).
+
+    Single FK entry point for calibration samples and eye_in_hand. Motor indices 4 / 5 are URDF
+    joint5 (wrist swing) / joint6 (tool roll), 1:1.
+    """
     return kinematics.tcp_pose_from_joints(joints, sign, offset)
 
 
