@@ -121,7 +121,8 @@ def test_detect_once_uses_trigger():
     )
     res = DetectionClient("http://armd", transport=t).detect_once(wait_ms=1000)
     assert res["frame_id"] == 9 and not res["timeout"]
-    assert calls == [("POST", "/api/v1/detection/trigger", {"wait_ms": "1000"})]
+    # a provider without /api/v1/vision/mode (404) gets the trigger without pipelines
+    assert calls == [("GET", "/api/v1/vision/mode", {}), ("POST", "/api/v1/detection/trigger", {"wait_ms": "1000"})]
 
 
 def test_detect_once_falls_back_and_disables_only_if_enabled_here():
@@ -157,3 +158,57 @@ def test_detector_502_maps_to_unavailable():
     _, t = _proxy({("GET", "/api/v1/detection/latest"): lambda r: httpx.Response(502, json={"error": "x"})})
     with pytest.raises(DetectorUnavailable):
         DetectionClient("http://armd", transport=t).latest()
+
+
+def _v2_routes(seen_bodies, per_request=True):
+    import json
+
+    def trigger(r):
+        body = json.loads(r.content) if r.content else None
+        seen_bodies.append(body)
+        p = (body or {}).get("pipelines", ["yolo"])
+        ran = {k: {"ran": k in p} for k in ("yolo", "aruco")}
+        return httpx.Response(
+            200, json={"api_version": 2, "success": True, "frame_id": 12, "ts_ms": 7, "pipelines": ran}
+        )
+
+    mode = {"api_version": 2 if per_request else 1, "mode": "off"}
+    if per_request:
+        mode["per_request_pipelines"] = True
+    return {
+        ("GET", "/api/v1/vision/mode"): lambda r: httpx.Response(200, json=mode),
+        ("POST", "/api/v1/detection/trigger"): trigger,
+    }
+
+
+def test_detect_once_sends_pipelines_to_api2_providers():
+    bodies = []
+    calls, t = _proxy(_v2_routes(bodies))
+    client = DetectionClient("http://armd", transport=t)
+    res = client.detect_once(wait_ms=800)
+    assert bodies[-1] == {"pipelines": ["yolo", "aruco"]} and res["pipelines"] == ["yolo", "aruco"]
+    res = client.detect_once(wait_ms=800, pipelines=["aruco"])
+    assert bodies[-1] == {"pipelines": ["aruco"]} and res["pipelines"] == ["aruco"]
+    client.detect_once(pipelines=("yolo", "yolo"))
+    assert bodies[-1] == {"pipelines": ["yolo"]}
+    # the mode is read once and never written
+    assert [c for c in calls if c[1] == "/api/v1/vision/mode"] == [("GET", "/api/v1/vision/mode", {})]
+    with pytest.raises(ValueError):
+        client.detect_once(pipelines=["video"])
+    with pytest.raises(ValueError):
+        client.detect_once(pipelines=[])
+
+
+def test_detect_once_keeps_the_old_trigger_for_api1_and_older_providers():
+    for routes in (_v2_routes([], per_request=False), {}):
+        bodies = []
+
+        def trigger(req, bodies=bodies):
+            bodies.append(req.content)
+            return httpx.Response(200, json={"success": True, "frame_id": 3, "ts_ms": 1})
+
+        _, t = _proxy({**routes, ("POST", "/api/v1/detection/trigger"): trigger})
+        client = DetectionClient("http://armd", transport=t)
+        res = client.detect_once(wait_ms=100, pipelines=["aruco"])
+        assert bodies == [b""] and client.pipelines_supported is False
+        assert res["frame_id"] == 3 and res["pipelines"] is None

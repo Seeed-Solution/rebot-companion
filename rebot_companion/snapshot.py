@@ -639,6 +639,8 @@ class DetectionClient:
         self.timeout = timeout
         self._transport = transport
         self.trigger_supported: bool | None = None  # None until the first trigger call
+        # perception API 2 (rebot-vision >= 1.3): triggers run the pipelines they name
+        self.pipelines_supported: bool | None = None  # None until probed
 
     def _call(self, method: str, path: str, wait_ms: int = 0, **kw: Any) -> httpx.Response:
         # armd waits wait_ms (capped at 5000) + 2 s for the upstream.
@@ -670,16 +672,42 @@ class DetectionClient:
         res.raise_for_status()
         return res.json()
 
-    def detect_once(self, wait_ms: int = 2500) -> dict:
-        """One fresh inference result, normalised to ``{frame_id, ts_ms, raw, timeout}``.
+    def supports_pipelines(self) -> bool:
+        """Whether the provider runs the pipelines a trigger names (perception API 2).
 
-        Uses ``POST /api/v1/detection/trigger``. Detector builds without it answer 404; then
-        inference is enabled, ``latest`` is long-polled for a newer frame, and inference is
-        disabled again only if this call enabled it.
+        Read once from ``GET /api/v1/vision/mode`` (``per_request_pipelines``); a provider
+        without the route (404) or any other error counts as no.
+        """
+        if self.pipelines_supported is None:
+            try:
+                res = self._call("GET", "/api/v1/vision/mode")
+                ok = res.status_code == 200 and res.json().get("per_request_pipelines") is True
+            except (DetectorUnavailable, ValueError):
+                return False  # not cached: the provider may come up later
+            self.pipelines_supported = ok
+        return self.pipelines_supported
+
+    def detect_once(self, wait_ms: int = 2500, pipelines: Sequence[str] | None = None) -> dict:
+        """One fresh inference result, normalised to ``{frame_id, ts_ms, raw, timeout, pipelines}``.
+
+        Uses ``POST /api/v1/detection/trigger``. ``pipelines`` (``"yolo"`` / ``"aruco"``) is sent
+        when the provider supports per-request pipelines (perception API 2); ``None`` then means
+        both. Older providers run their current mode and ``pipelines`` is ignored. ``pipelines``
+        in the result lists what ran on the frame when the provider reports it, else ``None``.
+        Detector builds without the trigger answer 404; then inference is enabled, ``latest`` is
+        long-polled for a newer frame, and inference is disabled again only if this call
+        enabled it.
         """
         wait_ms = max(0, min(int(wait_ms), 5000))
+        if pipelines is not None:
+            pipelines = list(dict.fromkeys(pipelines))
+            if not pipelines or any(p not in PIPELINES for p in pipelines):
+                raise ValueError(f"pipelines must be a non-empty subset of {list(PIPELINES)}")
         if self.trigger_supported is not False:
-            res = self._call("POST", "/api/v1/detection/trigger", wait_ms, params={"wait_ms": wait_ms})
+            kw: dict = {"params": {"wait_ms": wait_ms}}
+            if self.supports_pipelines():
+                kw["json"] = {"pipelines": pipelines or list(PIPELINES)}
+            res = self._call("POST", "/api/v1/detection/trigger", wait_ms, **kw)
             if res.status_code != 404:
                 self.trigger_supported = True
                 res.raise_for_status()
@@ -688,6 +716,7 @@ class DetectionClient:
                     "frame_id": body.get("frame_id"),
                     "ts_ms": body.get("ts_ms"),
                     "timeout": bool(body.get("timeout")) or body.get("success") is False,
+                    "pipelines": _ran(body),
                     "raw": body,
                 }
             self.trigger_supported = False
@@ -708,8 +737,20 @@ class DetectionClient:
             "frame_id": body.get("frame_id"),
             "ts_ms": body.get("ts_ms"),
             "timeout": bool(body.get("timeout")),
+            "pipelines": _ran(body),
             "raw": body,
         }
+
+
+PIPELINES = ("yolo", "aruco")
+
+
+def _ran(body: dict) -> list[str] | None:
+    """Pipelines that ran on a result frame (rebot-vision ``pipelines.*.ran``), else ``None``."""
+    p = body.get("pipelines")
+    if not isinstance(p, dict):
+        return None
+    return [k for k in PIPELINES if isinstance(p.get(k), dict) and p[k].get("ran") is True]
 
 
 def annotated_snapshot(
