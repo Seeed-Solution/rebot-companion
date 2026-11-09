@@ -1,7 +1,7 @@
 import httpx
 import pytest
 
-from rebot_companion.camera_client import CameraTriggerTimeout, MarkerDetection, ReCameraClient
+from rebot_companion.camera_client import CameraError, CameraTriggerTimeout, MarkerDetection, ReCameraClient
 
 
 @pytest.fixture
@@ -52,3 +52,27 @@ def test_trigger_http_timeout_raises_timeout(patch_httpx):
 def test_marker_without_pose_is_rejected():
     with pytest.raises(ValueError, match="no pose"):
         MarkerDetection.from_dict({"id": 1})
+
+
+def test_trigger_posts_json_content_type(patch_httpx):
+    seen = []
+
+    def handler(req):
+        seen.append(req)
+        if req.headers.get("content-type") != "application/json":
+            return httpx.Response(415)
+        return httpx.Response(200, json={"success": True, "markers": []})
+
+    cam = patch_httpx(handler)
+    assert cam.trigger(wait_ms=100) == []
+    assert seen[0].method == "POST" and seen[0].headers["content-type"] == "application/json"
+    assert seen[0].content == b"{}"
+    assert seen[0].url.params["wait_ms"] == "100"
+    cam.set_inference(True)
+    assert seen[1].headers["content-type"] == "application/json"
+
+
+def test_trigger_415_is_a_clear_error(patch_httpx):
+    cam = patch_httpx(lambda req: httpx.Response(415))
+    with pytest.raises(CameraError, match="Content-Type: application/json"):
+        cam.trigger(wait_ms=100)

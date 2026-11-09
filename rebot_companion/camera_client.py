@@ -12,6 +12,19 @@ from .transforms import Transform
 log = logging.getLogger(__name__)
 
 
+class CameraError(Exception):
+    """reCamera API error other than a trigger timeout."""
+
+
+def _check(res: httpx.Response) -> None:
+    if res.status_code == 415:
+        raise CameraError(
+            f"{res.request.method} {res.request.url.path} rejected with 415 Unsupported Media Type: the "
+            "aruco-detector (>= 0.1.3) requires 'Content-Type: application/json' on POST"
+        )
+    res.raise_for_status()
+
+
 class CameraTriggerTimeout(Exception):
     """The trigger produced no result in time (HTTP timeout or ``success: false``).
 
@@ -76,7 +89,7 @@ class ReCameraClient:
         """Toggle inference on or off (controls camera idle throttling)."""
         with httpx.Client(timeout=self.timeout_sec) as client:
             res = client.post(f"{self.base_url}/api/inference", json={"enabled": enabled})
-            res.raise_for_status()
+            _check(res)
             return res.json()
 
     def trigger(self, wait_ms: int = 2500) -> list[MarkerDetection]:
@@ -87,8 +100,9 @@ class ReCameraClient:
         """
         try:
             with httpx.Client(timeout=float(wait_ms) / 1000.0 + 2.0) as client:
-                res = client.post(f"{self.base_url}/api/trigger?wait_ms={wait_ms}")
-                res.raise_for_status()
+                # aruco-detector >= 0.1.3 answers 415 to a POST without a JSON content type.
+                res = client.post(f"{self.base_url}/api/trigger?wait_ms={wait_ms}", json={})
+                _check(res)
                 data = res.json()
         except httpx.TimeoutException as exc:
             raise CameraTriggerTimeout(f"reCamera trigger timed out: {exc}") from exc
