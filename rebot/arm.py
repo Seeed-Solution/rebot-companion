@@ -62,7 +62,7 @@ def _collision_message(exc: ActionFailed) -> str:
     what = f"joint J{joint} blocked" if joint else "the arm met resistance"
     if isinstance(nm, (int, float)):
         what += f" ({nm:.1f} N·m)"
-    return f"COLLISION: {what}; the arm stopped and resumes by itself when the contact is gone"
+    return f"{what}; the arm stopped and resumes by itself when the contact is gone"
 
 
 def _base_url(host: Optional[str], port: Optional[int]) -> str:
@@ -308,9 +308,7 @@ class Arm:
                 raise
             except ActionFailed as exc:
                 if exc.code == "COLLISION":
-                    raise ActionFailed(
-                        "COLLISION", f"{what}: {_collision_message(exc)}", exc.status, exc.obs
-                    ) from None
+                    raise ActionFailed("COLLISION", _collision_message(exc), exc.status, exc.obs) from None
                 raise
 
         return self._run(go)

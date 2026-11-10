@@ -124,3 +124,53 @@ def test_templates_are_short_and_stdlib_only(name):
     assert len(src.splitlines()) < 120
     imports = [ln for ln in src.splitlines() if ln.startswith(("import ", "from "))]
     assert all(ln.split()[1].split(".")[0] in {"rebot", "sys"} for ln in imports)
+
+
+def test_demo_wave_retries_a_step_after_a_collision(armd, capsys):
+    armd.devplat = True
+    mod = load("demo_wave")
+    with open_arm(armd) as arm:
+        arm.set_collision_guard(enabled=True)
+        teach(arm, "wave_1", "wave_2", "wave_3")
+        armd.collision_next_actions = 1
+        assert mod.run(arm, dict(mod.CONFIG, rounds=1)) == 1
+    assert "The arm touched something and stopped" in capsys.readouterr().out
+    assert kinds(armd).count("move_to_pose") == 3  # the interrupted home ran again, the tour ran in full
+
+
+def test_demo_wave_stops_when_collisions_escalate(armd, capsys):
+    armd.devplat = True
+    mod = load("demo_wave")
+    with open_arm(armd) as arm:
+        arm.set_collision_guard(enabled=True)
+        teach(arm, "wave_1", "wave_2", "wave_3")
+        armd.collision_next_actions = 99
+        assert mod.run(arm, dict(mod.CONFIG, rounds=1)) == 0
+    assert "repeated collisions" in capsys.readouterr().out
+    assert "move_to_pose" not in kinds(armd)  # stopped at the first step
+
+
+def test_sort_by_label_retries_after_a_collision(armd, capsys):
+    armd.devplat = True
+    mod = load("sort_by_label")
+    armd.detections = [det("cup")]
+    with open_arm(armd) as arm:
+        arm.set_collision_guard(enabled=True)
+        teach(arm, "scan", "bin_a", "bin_b")
+        armd.collision_next_actions = 1
+        assert mod.run(arm, dict(mod.CONFIG, max_cycles=1)) == (1, 0)
+    assert "trying the step once more" in capsys.readouterr().out
+
+
+def test_sort_by_label_stops_when_collisions_escalate(armd, capsys):
+    armd.devplat = True
+    mod = load("sort_by_label")
+    armd.detections = [det("cup")]
+    with open_arm(armd) as arm:
+        arm.set_collision_guard(enabled=True)
+        teach(arm, "scan", "bin_a", "bin_b")
+        armd.collision_next_actions = 99
+        ok, bad = mod.run(arm, dict(mod.CONFIG, max_cycles=6))
+        assert ok == 0 and bad >= 1
+        assert armd.state == "Fault"
+    assert "place" not in kinds(armd)

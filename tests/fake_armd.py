@@ -125,6 +125,7 @@ class FakeArmd:
         self.collision_trips: list[float] = []
         self.collision_max_auto_resumes = 3
         self.collision_bodies: list[dict] = []
+        self.collision_next_actions = 0  # trip halfway through each of the next N actions (resume after 0.2 s)
         self.trigger_bodies: list = []
         self._stop = threading.Event()
         self._next_conn = 1
@@ -250,6 +251,9 @@ class FakeArmd:
                     self.finish_action("failed", code, message)
                     self.stop_motion()
                     self.state = "Armed"
+                elif running and self.collision_next_actions > 0 and a >= 0.5 and self.action["kind"] != "park":
+                    self.collision_next_actions -= 1
+                    self.trip_collision(resume_after_s=0.2)
                 elif a >= 1.0:
                     self.traj = None
                     if self.state == "Moving":
