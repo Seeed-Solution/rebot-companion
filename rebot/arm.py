@@ -50,7 +50,19 @@ _HINTS = {
     "NOT_ARMED": "cannot be reached because torque is off; call arm.enable()",
     "MOTION_BUSY": "cannot start while another motion runs; call arm.stop() first",
     "ESTOP_ACTIVE": "cannot be reached while the E-stop is latched",
+    "COLLISION_HOLD": "is refused while the arm holds after a collision; call arm.wait_until_clear() first",
 }
+
+SENSITIVITIES = ("low", "medium", "high")
+
+
+def _collision_message(exc: ActionFailed) -> str:
+    c = getattr(exc.obs, "collision", None) or {}
+    joint, nm = c.get("joint"), c.get("residual_nm")
+    what = f"joint J{joint} blocked" if joint else "the arm met resistance"
+    if isinstance(nm, (int, float)):
+        what += f" ({nm:.1f} N·m)"
+    return f"COLLISION: {what}; the arm stopped and resumes by itself when the contact is gone"
 
 
 def _base_url(host: Optional[str], port: Optional[int]) -> str:
@@ -294,6 +306,12 @@ class Arm:
                     raw = dict(exc.raw, message=f"{what} {hint} ({exc.message})")
                     raise type(exc)(raw) from None
                 raise
+            except ActionFailed as exc:
+                if exc.code == "COLLISION":
+                    raise ActionFailed(
+                        "COLLISION", f"{what}: {_collision_message(exc)}", exc.status, exc.obs
+                    ) from None
+                raise
 
         return self._run(go)
 
@@ -482,6 +500,46 @@ class Arm:
             return sorted(out, key=lambda d: -d.score)
 
         return self._run(go)
+
+    # ---- collision guard (capability collision_guard) ------------------------
+
+    def collision_guard(self) -> dict:
+        """Effective guard configuration: enabled, sensitivity and the scaled thresholds (N·m)."""
+        return self._run(self.client.get_collision_guard)
+
+    def set_collision_guard(self, enabled: Optional[bool] = None, sensitivity: Optional[str] = None) -> dict:
+        """Switch the collision guard on/off and/or set ``sensitivity`` ("low", "medium", "high").
+
+        The guard is off by default and its thresholds are uncalibrated placeholders.
+        Returns the effective configuration.
+        """
+        if sensitivity is not None and sensitivity not in SENSITIVITIES:
+            raise ValueError(f"sensitivity must be one of {', '.join(SENSITIVITIES)}")
+
+        def go() -> dict:
+            self.session.set_collision_guard(enabled, sensitivity)
+            return self.client.get_collision_guard()
+
+        return self._run(go)
+
+    def wait_until_clear(self, timeout_s: float = 10.0) -> ArmStatus:
+        """After a COLLISION: block until the arm has resumed (``collision.active`` is false).
+
+        Raises :class:`ArmFaultError` (code ``COLLISION``) when repeated collisions escalated to a fault
+        that needs a person, and :class:`MotionTimeout` after ``timeout_s``. Returns at once when the
+        guard is off.
+        """
+
+        def clear(o: ArmStatus) -> bool:
+            if o.is_stopped:
+                raise ArmFaultError(o)
+            return not (o.collision or {}).get("active")
+
+        return self._run(
+            lambda: self.session._wait_until(
+                self.session._frames, clear, timeout_s, "the collision to clear", check_stopped=False
+            )
+        )
 
     # ---- faults --------------------------------------------------------------
 

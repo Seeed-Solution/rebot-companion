@@ -118,6 +118,13 @@ class FakeArmd:
         self.conn_hz: dict[int, tuple[int, float]] = {}  # conn -> (obs_hz, last sent)
         self.ws_paths: list[str] = []
         self.detections: list = []
+        # collision guard (capability collision_guard, armd contract §11)
+        self.collision_cap = True
+        self.collision_cfg = {"enabled": False, "sensitivity": "medium"}
+        self.collision_state: dict | None = None  # active trip: joint, residual_nm, since, resume_at
+        self.collision_trips: list[float] = []
+        self.collision_max_auto_resumes = 3
+        self.collision_bodies: list[dict] = []
         self.trigger_bodies: list = []
         self._stop = threading.Event()
         self._next_conn = 1
@@ -155,16 +162,64 @@ class FakeArmd:
         if self.state == "EStop":
             fault = {"code": "ESTOP", "message": "E-stop latched", "recoverable": False}
         elif self.state == "Fault":
-            code = {"WatchdogTimeout": "WATCHDOG_TIMEOUT", "FollowingError": "FOLLOWING_ERROR"}.get(self.fault, "OTHER")
+            code = {
+                "WatchdogTimeout": "WATCHDOG_TIMEOUT",
+                "FollowingError": "FOLLOWING_ERROR",
+                "Collision": "COLLISION",
+            }.get(self.fault, "OTHER")
             fault = {"code": code, "message": str(self.fault), "recoverable": code == "WATCHDOG_TIMEOUT"}
         prev = self.prev_action if time.monotonic() - self.prev_action_at <= 2.0 else None
-        return {"fault": fault, "previous_action": self._public(prev), "residual_torques": [0.0] * 6}
+        return {
+            "fault": fault,
+            "previous_action": self._public(prev),
+            "residual_torques": [0.0] * 6,
+            "collision": self.collision_field(),
+        }
+
+    def collision_field(self) -> dict | None:
+        if not (self.collision_cap and self.collision_cfg["enabled"]):
+            return None
+        trip = self.collision_state
+        now = time.monotonic()
+        return {
+            "active": trip is not None,
+            "joint": trip["joint"] if trip else None,
+            "residual_nm": trip["residual_nm"] if trip else None,
+            "threshold_nm": 6.0 if trip else None,
+            "since_s": round(now - trip["since"], 2) if trip else None,
+            "resume_in_s": round(max(0.0, trip["resume_at"] - now), 2) if trip else None,
+            "trips_in_window": len(self.collision_trips),
+            "enabled": True,
+            "sensitivity": self.collision_cfg["sensitivity"],
+        }
+
+    def trip_collision(self, joint: int = 2, residual_nm: float = 7.1, resume_after_s: float = 0.3) -> None:
+        """Test hook: a protective stop. Cancels the running action (code COLLISION), holds, resumes by itself
+        after ``resume_after_s``; the (max_auto_resumes+1)-th trip escalates to a Fault with code COLLISION."""
+        with self.lock:
+            now = time.monotonic()
+            self.collision_trips = [t for t in self.collision_trips if now - t < 60.0] + [now]
+            if self.action_running():
+                self.finish_action("failed", "COLLISION", f"joint J{joint} blocked ({residual_nm:.1f} N·m)")
+            self.stop_motion()
+            if len(self.collision_trips) > self.collision_max_auto_resumes:
+                self.collision_state = None
+                self.trigger_fault("Collision")
+                return
+            if self.state == "Moving":
+                self.state = "Armed"
+            self.collision_state = {
+                "joint": joint,
+                "residual_nm": residual_nm,
+                "since": now,
+                "resume_at": now + resume_after_s,
+            }
 
     def capabilities(self) -> dict:
         caps = {"version": 5, "cartesian": True, "gripper": True, "grasp": True}
         if self.devplat:
             caps.update(version=6, obs_rate=True, fault_codes=True, poses=True, keepout=True)
-            caps.update(place=self.place_cap)
+            caps.update(place=self.place_cap, collision_guard=self.collision_cap)
             caps.update(speed_cap=False, residual_torques=True, tick_stats=False)
         return caps
 
@@ -183,6 +238,8 @@ class FakeArmd:
                 and now - self.last_heartbeat > self.lease_timeout
             ):
                 self.trigger_fault("WatchdogTimeout")
+            if self.collision_state and now >= self.collision_state["resume_at"]:
+                self.collision_state = None
             if self.traj and not self.freeze_motion:
                 start, end, t0, dur = self.traj
                 a = min(1.0, (now - t0) / dur)
@@ -633,6 +690,8 @@ class FakeArmd:
         return None, local_gen, label, last_seq, last_req
 
     def motion_gate(self, targets, servo=False):
+        if self.collision_state and self.state in ("Armed", "Moving"):
+            return 409, "COLLISION_HOLD"
         if self.state == "EStop":
             return 409, "ESTOP_ACTIVE"
         if self.state == "Fault":
@@ -677,8 +736,18 @@ class FakeArmd:
         if path == "/api/v1/safety/clear_fault":
             if self.state in ("EStop", "Fault"):
                 self.state, self.fault = "Idle", None
+                self.collision_state, self.collision_trips = None, []
                 self.epoch += 1
                 self.pending_rearm = True
+            return None
+        if path == "/api/v1/safety/collision":
+            if not (self.devplat and self.collision_cap):
+                return 400, "INVALID_COMMAND"
+            self.collision_bodies.append(dict(body))
+            if "enabled" in body:
+                self.collision_cfg["enabled"] = bool(body["enabled"])
+            if body.get("sensitivity") in ("low", "medium", "high"):
+                self.collision_cfg["sensitivity"] = body["sensitivity"]
             return None
         if path.startswith("/api/v1/action/"):
             return self.execute_action(path, body)
@@ -760,6 +829,11 @@ class FakeArmd:
                 )
             if method == "GET" and path == "/api/v1/poses" and self.devplat:
                 return Response(200, json={"poses": list(self.poses.values())})
+            if method == "GET" and path == "/api/v1/safety/collision" and self.devplat and self.collision_cap:
+                scale = {"low": 1.5, "medium": 1.0, "high": 0.7}[self.collision_cfg["sensitivity"]]
+                return Response(
+                    200, json={**self.collision_cfg, "thresholds_nm": [round(x * scale, 2) for x in [6, 6, 6, 2.5, 2.5, 2.5]]}
+                )
             if method == "GET" and path == "/api/v1/workspace/keepout" and self.devplat:
                 return Response(200, json={"boxes": self.keepout, "source": "runtime" if self.keepout else "profile"})
             if method == "GET" and path == "/api/v1/vision/mode":

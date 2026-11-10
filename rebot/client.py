@@ -220,6 +220,7 @@ class ArmStatus:
     previous_action: ActionStatus | None = None
     fault: dict | None = None  # {"code", "message", "recoverable"} (capability fault_codes)
     residual_torques: list[float] | None = None  # capability residual_torques
+    collision: dict | None = None  # capability collision_guard; None while the guard is off or unavailable
 
     @classmethod
     def from_dict(cls, d: dict) -> ArmStatus:
@@ -250,6 +251,7 @@ class ArmStatus:
             ),
             fault=dict(d["fault"]) if isinstance(d.get("fault"), dict) else None,
             residual_torques=floats("residual_torques") if isinstance(d.get("residual_torques"), list) else None,
+            collision=dict(d["collision"]) if isinstance(d.get("collision"), dict) else None,
         )
 
     @property
@@ -392,6 +394,11 @@ class ArmdClient:
         """``GET /api/v1/workspace/keepout`` (capability ``keepout``): ``{boxes, source}``."""
         self.require("keepout", "Keep-out boxes")
         return dict(self._get("/api/v1/workspace/keepout") or {})
+
+    def get_collision_guard(self) -> dict:
+        """``GET /api/v1/safety/collision`` (capability ``collision_guard``): effective guard configuration."""
+        self.require("collision_guard", "The collision guard")
+        return dict(self._get("/api/v1/safety/collision") or {})
 
     def get_tick_stats(self) -> dict:
         """``GET /api/v1/diagnostics/tick`` (capability ``tick_stats``): control-loop timing."""
@@ -1209,6 +1216,16 @@ class ArmSession:
         if tag is not None:
             body["tag"] = str(tag)
         return self._action("/api/v1/action/place", body, timeout, legacy_wait=None)
+
+    def set_collision_guard(self, enabled: bool | None = None, sensitivity: str | None = None) -> dict:
+        """``/api/v1/safety/collision`` (capability ``collision_guard``): switch the guard or change its sensitivity."""
+        self.require("collision_guard", "The collision guard")
+        body: dict = {}
+        if enabled is not None:
+            body["enabled"] = bool(enabled)
+        if sensitivity is not None:
+            body["sensitivity"] = sensitivity
+        return self.command("/api/v1/safety/collision", body)
 
     def set_keepout(self, boxes: Sequence[dict]) -> dict:
         """Replace the runtime keep-out boxes (``[{name, min_m, max_m}]``, at most 16). Capability ``keepout``."""
