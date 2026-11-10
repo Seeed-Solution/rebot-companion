@@ -187,6 +187,15 @@ class ActionResult:
     ack: dict
     duration_s: float
 
+    @property
+    def holding(self) -> bool | None:
+        """Gripper/grasp verdict: True when an object is held, None when the action does not report it."""
+        return self.action.holding if self.action is not None else None
+
+    @property
+    def ok(self) -> bool:
+        return self.action is None or self.action.state == "done"
+
 
 @dataclass
 class ArmStatus:

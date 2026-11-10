@@ -30,6 +30,10 @@ High-level actions follow the contract in rebot-armd
   watchdog), lease released / preempted -> cancelled LEASE_LOST, stop -> cancelled STOPPED, a new
   jog / preset / action -> cancelled SUPERSEDED. Park: done when Idle with torque off, else failed
   UNLOAD_FAILED.
+* Developer platform (armd capabilities version 6, ``devplat = True``): ``?obs_hz=`` decimation,
+  ``fault{code,message,recoverable}``, ``previous_action``, named poses + ``move_to_pose``.
+  ``/api/v1/action/grasp`` closes the gripper on ``gripper_contact`` and reports ``holding``.
+  The detector proxy answers ``trigger`` with ``detections`` (perception API 2).
 * Scripted knobs: ``action_duration``, ``action_failure = (code, message)`` (fails at half the
   path), ``action_reject = (status, code)`` (rejects the command), ``gripper_contact`` (jaw angle
   where an object stops a close, None = empty), ``actions_supported = False`` (pre-action armd).
@@ -104,6 +108,15 @@ class FakeArmd:
         self.ack_extra: dict = {}
         self.cancel_reason = "STOPPED"
         self.acquires: list[tuple[str, bool]] = []  # (client_id, force) per acquire_lease
+        # developer platform (capabilities version 6)
+        self.devplat = False
+        self.poses: dict[str, dict] = {}
+        self.prev_action: dict | None = None
+        self.prev_action_at = 0.0
+        self.conn_hz: dict[int, tuple[int, float]] = {}  # conn -> (obs_hz, last sent)
+        self.ws_paths: list[str] = []
+        self.detections: list = []
+        self.trigger_bodies: list = []
         self._stop = threading.Event()
         self._next_conn = 1
 
@@ -127,8 +140,30 @@ class FakeArmd:
             "disable_pending": False,
             "feedback_valid": True,
             "commanded_positions": list(self.positions),
-            "action": dict(self.action) if self.action else None,
+            "action": self._public(self.action),
+            **(self.devplat_fields() if self.devplat else {}),
         }
+
+    @staticmethod
+    def _public(action: dict | None) -> dict | None:
+        return {k: v for k, v in action.items() if not k.startswith("_")} if action else None
+
+    def devplat_fields(self) -> dict:
+        fault = None
+        if self.state == "EStop":
+            fault = {"code": "ESTOP", "message": "E-stop latched", "recoverable": False}
+        elif self.state == "Fault":
+            code = {"WatchdogTimeout": "WATCHDOG_TIMEOUT", "FollowingError": "FOLLOWING_ERROR"}.get(self.fault, "OTHER")
+            fault = {"code": code, "message": str(self.fault), "recoverable": code == "WATCHDOG_TIMEOUT"}
+        prev = self.prev_action if time.monotonic() - self.prev_action_at <= 2.0 else None
+        return {"fault": fault, "previous_action": self._public(prev), "residual_torques": [0.0] * 6}
+
+    def capabilities(self) -> dict:
+        caps = {"version": 5, "cartesian": True, "gripper": True, "grasp": True}
+        if self.devplat:
+            caps.update(version=6, obs_rate=True, fault_codes=True, poses=True, keepout=True)
+            caps.update(speed_cap=False, residual_torques=True, tick_stats=False)
+        return caps
 
     def trigger_fault(self, reason: str) -> None:
         self.state, self.fault = "Fault", reason
@@ -181,6 +216,11 @@ class FakeArmd:
             self.reconcile_action()
             text = json.dumps(self.observation())
         for conn_id in list(self.conns):
+            hz, last = self.conn_hz.get(conn_id, (0, 0.0))
+            if hz:
+                if now - last < 1.0 / hz:
+                    continue
+                self.conn_hz[conn_id] = (hz, now)
             self.send(conn_id, text)
 
     def resting_violation(self) -> bool:
@@ -203,7 +243,7 @@ class FakeArmd:
                 self.finish_action("done")
             else:
                 self.finish_action("failed", "UNLOAD_FAILED", "torque cut failed after unload")
-        elif kind == "gripper" and self.action.get("_grasp"):
+        elif kind in ("gripper", "grasp") and self.action.get("_grasp"):
             contact = self.gripper_contact
             gap = GRIP_CLOSED - self.positions[6]
             holding = contact is not None and gap >= 0.30
@@ -232,6 +272,8 @@ class FakeArmd:
     def start_action(self, kind: str, target: list[float], duration: float, tag=None, grasp=False) -> None:
         if self.action_running():
             self.finish_action("cancelled", "SUPERSEDED", "replaced by a new motion")
+        if self.action is not None:
+            self.prev_action, self.prev_action_at = dict(self.action), time.monotonic()
         aid = self.next_action_id
         self.next_action_id += 1
         self.action = {
@@ -272,6 +314,15 @@ class FakeArmd:
         elif kind == "move_relative":
             if body.get("frame") not in ("base", "tool", "camera") or len(body.get("d") or []) != 3:
                 return 400, "INVALID_COMMAND"
+        elif kind == "move_to_pose":
+            if not self.devplat:
+                return 400, "INVALID_COMMAND"
+            pose = self.poses.get(body.get("name"))
+            if pose is None:
+                return 404, "POSE_NOT_FOUND"
+        elif kind == "grasp":
+            if not isinstance(body.get("label"), str) or len(body.get("box_norm") or []) != 4:
+                return 400, "INVALID_COMMAND"
         elif kind == "gripper":
             if "width_m" in body:
                 return 422, "UNSUPPORTED"
@@ -284,7 +335,15 @@ class FakeArmd:
             return self.action_reject
         target = list(self.positions)
         grasp = False
-        if kind == "gripper":
+        if kind == "move_to_pose":
+            target = list(pose["positions"])
+            if not body.get("include_gripper"):
+                target[6] = self.positions[6]
+        elif kind == "grasp":
+            grasp = True
+            contact = self.gripper_contact
+            target[6] = contact + 0.15 if contact is not None else -0.05
+        elif kind == "gripper":
             if cmd == "open":
                 target[6] = GRIP_OPEN
             elif cmd == "move":
@@ -333,6 +392,10 @@ class FakeArmd:
             conn = self._next_conn
             self._next_conn += 1
             self.conns[conn] = (ws, threading.Lock())
+            path = ws.request.path
+            self.ws_paths.append(path)
+            if "obs_hz=" in path:
+                self.conn_hz[conn] = (int(path.split("obs_hz=")[1].split("&")[0]), 0.0)
         local_gen = 0
         label: str | None = None
         last_seq: int | None = None
@@ -625,6 +688,19 @@ class FakeArmd:
             self.start_motion("park", self.home, 0.3)
             self.pending_unload = True
             return None
+        if path in ("/api/v1/poses/save", "/api/v1/poses/delete"):
+            if not self.devplat:
+                return 400, "INVALID_COMMAND"
+            name = body.get("name")
+            if not isinstance(name, str) or not name:
+                return 400, "INVALID_COMMAND"
+            if path.endswith("delete"):
+                return None if self.poses.pop(name, None) else (404, "POSE_NOT_FOUND")
+            positions = list(body.get("positions") or self.positions)
+            if len(positions) != DOF:
+                return 400, "INVALID_COMMAND"
+            self.poses[name] = {"name": name, "positions": positions, "tcp": None, "saved_at_ms": 1}
+            return None
         if path == "/api/v1/motion/stop":
             self.cancel_reason = "STOPPED"
             self.stop_motion()
@@ -651,6 +727,7 @@ class FakeArmd:
                         "dof": DOF,
                         "joint_names": [f"joint_{i + 1}" for i in range(DOF)],
                         "fields": [],
+                        "capabilities": self.capabilities(),
                         "limits": [
                             {
                                 "name": f"joint_{i + 1}",
@@ -661,6 +738,22 @@ class FakeArmd:
                             }
                             for i, (lo, hi) in enumerate(LIMITS)
                         ],
+                    },
+                )
+            if method == "GET" and path == "/api/v1/poses" and self.devplat:
+                return Response(200, json={"poses": list(self.poses.values())})
+            if method == "GET" and path == "/api/v1/vision/mode":
+                return Response(200, json={"api_version": 2, "mode": "off", "per_request_pipelines": True})
+            if method == "POST" and path == "/api/v1/detection/trigger":
+                self.trigger_bodies.append(json.loads(request.content) if request.content else None)
+                return Response(
+                    200,
+                    json={
+                        "api_version": 2,
+                        "success": True,
+                        "frame_id": 7,
+                        "ts_ms": 1000,
+                        "detections": self.detections,
                     },
                 )
             if method == "POST" and path == "/api/v1/safety/e_stop":
@@ -683,7 +776,8 @@ def armd():
     threading.Thread(target=server.serve_forever, daemon=True).start()
     threading.Thread(target=fake.run_ticker, daemon=True).start()
     fake.url = f"http://127.0.0.1:{port}"
-    fake.client = ArmdClient(fake.url, transport=MockTransport(fake.rest))
+    fake.transport = MockTransport(fake.rest)
+    fake.client = ArmdClient(fake.url, transport=fake.transport)
     yield fake
     fake.stop()
     server.shutdown()

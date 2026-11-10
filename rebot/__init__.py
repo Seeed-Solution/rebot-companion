@@ -3,6 +3,7 @@
 Runs unchanged on a PC (arm over the network) and on the reCamera itself (127.0.0.1).
 """
 
+from .arm import Arm
 from .client import (
     ActionResult,
     ActionStatus,
@@ -32,6 +33,7 @@ from .errors import (
 )
 
 __all__ = [
+    "Arm",
     "ArmdClient",
     "ArmSession",
     "ArmStatus",
