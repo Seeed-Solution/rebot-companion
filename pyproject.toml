@@ -44,6 +44,10 @@ agent = [
     "mcp>=2.3,<3",  # 2.x API: mcp.server.mcpserver.MCPServer (FastMCP was renamed)
     "pillow>=10",
 ]
+record = [
+    "av>=12",
+    "pyarrow>=14",
+]
 
 [build-system]
 requires = ["hatchling"]
@@ -63,6 +67,8 @@ dev = [
     "pytest-asyncio>=0.23.0",
     "ruff>=0.6",
     "websockets>=12.0",
+    "av>=12",
+    "pyarrow>=14",
 ]
 
 [tool.ruff]
