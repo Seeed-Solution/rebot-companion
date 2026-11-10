@@ -577,6 +577,21 @@ class Controller:
         ack = s.torque(True)
         return {"recovered": True, "cleared": code, "safety_state": ack.get("safety_state")}
 
+    def describe_safety(self) -> dict:
+        d = self.client.get_safety_describe()
+        stops = [x.get("id") for x in d.get("stops") or [] if x.get("available", True)]
+        faults = d.get("faults") or []
+        rec = [f["code"] for f in faults if f.get("recoverable")]
+        hw = d.get("hardware") or {}
+        spd = (d.get("limits") or {}).get("action_speed_max") or {}
+        d["summary"] = (
+            f"Stops: {', '.join(stops) or 'none'}. Recoverable faults: {', '.join(rec) or 'none'} "
+            f"(the other {len(faults) - len(rec)} need a person). Physical e-stop: "
+            f"{'present' if hw.get('physical_estop') else 'ABSENT (software stops only)'}. "
+            f"Max action speed: {spd.get('linear_mps')} m/s linear, {spd.get('angular_rps')} rad/s angular."
+        )
+        return d
+
     def collision_guard_status(self) -> dict:
         return self.client.get_collision_guard()
 
@@ -856,6 +871,14 @@ def build_server(ctrl: Controller, allow_clear_fault: bool = False, allow_preemp
     )
     async def recover() -> dict:
         return await motion(ctrl.recover)
+
+    @tool(
+        "What the arm's safety system does and does not do: stops, faults (with recoverable flags), speed and "
+        "joint limits, timing, and hardware facts such as whether a physical e-stop exists. Plus a one-line "
+        "'summary'. Read it before planning motions. No lease needed. Needs capability 'safety_describe'."
+    )
+    async def describe_safety() -> dict:
+        return await run(ctrl.describe_safety)
 
     @tool(
         "Collision guard configuration: {enabled, sensitivity, thresholds_nm}. get_state.collision shows a "

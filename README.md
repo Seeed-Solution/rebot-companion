@@ -29,7 +29,7 @@ Python SDK and stdio [MCP](https://modelcontextprotocol.io) server bridging **Se
 
 ## Key Features
 
-- **Stdio MCP server for AI agents (`rebot-mcp`)**: 23 tools by default (state, snapshots, detection, motion, gripper, stop, named poses, place, keep-out boxes, fault recovery, collision guard). Works with MCP clients that support stdio servers; end-to-end tests used the Python `mcp` client against a real arm. Fault clearing and cockpit takeover are off unless enabled at launch (see [MCP server](#mcp-server-agent-control)).
+- **Stdio MCP server for AI agents (`rebot-mcp`)**: 24 tools by default (state, snapshots, detection, motion, gripper, stop, named poses, place, keep-out boxes, fault recovery, collision guard, safety description). Works with MCP clients that support stdio servers; end-to-end tests used the Python `mcp` client against a real arm. Fault clearing and cockpit takeover are off unless enabled at launch (see [MCP server](#mcp-server-agent-control)).
 - **Hand-eye calibration**: eye-to-hand (closed-form Horn point registration) and eye-in-hand (Park & Martin $AX=XB$), cross-checked against OpenCV `CALIB_HAND_EYE_PARK` in the tests. Accuracy is verified on synthetic data only; it has not been measured on a real arm yet.
 - **Two stages**: Stage 1, an agent orchestrates the tools; Stage 2, a deterministic local pick-and-place pipeline that needs no LLM.
 - **Kinematics**: full URDF forward kinematics (within 0.1 mm of an independent URDF parser in the tests) and an analytic planar inverse kinematics solver for the B601-DM.
@@ -470,6 +470,7 @@ Tools:
 | `set_keepout` | `boxes` (max 16) | replaces the runtime keep-out boxes (`[]` removes them). Changes the device configuration. Capability `keepout` |
 | `recover` | — | clears a fault armd marks recoverable (`WATCHDOG_TIMEOUT`, `CONTROL_DEADLINE`, `HANDOVER_UNSETTLED`) and re-enables torque; any other fault or E-stop returns `NOT_RECOVERABLE` and stays latched. Capability `fault_codes` |
 | `collision_guard_status` | — | `{enabled, sensitivity, thresholds_nm}`; no lease needed. `get_state.collision` shows a stop in progress. Capability `collision_guard` |
+| `describe_safety` | — | stops, faults (with `recoverable`), speed and joint limits, timing, `hardware.physical_estop`, plus a one-line `summary`; no lease needed. Capability `safety_describe` |
 | `set_collision_guard` | `enabled`, `sensitivity` (`low`/`medium`/`high`) | switches the collision guard and/or sets its sensitivity. Changes the device configuration. Capability `collision_guard` |
 | `clear_fault` | — | clear EStop or Fault; listed only with `--allow-clear-fault` |
 | `take_control` | `force` (only with `--allow-preempt`) | acquire a free lease; with `--allow-preempt`, `force=true` takes control from the web cockpit |

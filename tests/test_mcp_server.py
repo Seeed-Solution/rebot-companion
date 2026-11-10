@@ -43,6 +43,7 @@ TOOLS = {
     "recover",
     "collision_guard_status",
     "set_collision_guard",
+    "describe_safety",
 }
 
 
@@ -414,3 +415,14 @@ async def test_collision_tools_need_capability(armd, make_ctrl):
     async with Client(build_server(make_ctrl())) as c:
         assert body(await c.call_tool("collision_guard_status", {}))["code"] == "UNSUPPORTED"
         assert body(await c.call_tool("set_collision_guard", {"enabled": True}))["code"] == "UNSUPPORTED"
+
+
+@pytest.mark.asyncio
+async def test_describe_safety(armd, make_ctrl):
+    async with Client(build_server(make_ctrl())) as c:
+        assert body(await c.call_tool("describe_safety", {}))["code"] == "UNSUPPORTED"
+    armd.devplat = True
+    async with Client(build_server(make_ctrl())) as c:
+        d = body(await c.call_tool("describe_safety", {}))
+    assert d["hardware"]["physical_estop"] is False
+    assert "ABSENT" in d["summary"] and "WATCHDOG_TIMEOUT" in d["summary"] and "e_stop" in d["summary"]

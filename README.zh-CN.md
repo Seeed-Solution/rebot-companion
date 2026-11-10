@@ -29,7 +29,7 @@
 
 ## 核心特性
 
-- **面向 AI Agent 的 stdio MCP 服务器（`rebot-mcp`）**：默认提供 23 个工具（状态、快照、检测、运动、夹爪、停止、命名位姿、放置、禁入区、故障恢复、碰撞保护）。可用于支持 stdio 服务器的 MCP 客户端；端到端测试使用 Python `mcp` 客户端连接真机。清除故障和从驾驶舱接管默认关闭，需启动时显式开启（见 [MCP 服务器](#mcp-服务器agent-控制)）。
+- **面向 AI Agent 的 stdio MCP 服务器（`rebot-mcp`）**：默认提供 24 个工具（状态、快照、检测、运动、夹爪、停止、命名位姿、放置、禁入区、故障恢复、碰撞保护、安全说明）。可用于支持 stdio 服务器的 MCP 客户端；端到端测试使用 Python `mcp` 客户端连接真机。清除故障和从驾驶舱接管默认关闭，需启动时显式开启（见 [MCP 服务器](#mcp-服务器agent-控制)）。
 - **手眼标定**：眼在手外（闭式 Horn 点配准）与眼在手上（Park & Martin $AX=XB$），测试中与 OpenCV `CALIB_HAND_EYE_PARK` 交叉对比。精度仅在合成数据上验证，尚未在真机上实测。
 - **两阶段**：阶段 1 由 Agent 编排工具；阶段 2 为不依赖大模型的本地确定性抓放流水线。
 - **运动学**：完整 URDF 正运动学（测试中与独立 URDF 解析器相差 0.1 mm 以内）及 B601-DM 平面解析逆运动学。
@@ -449,6 +449,7 @@ claude mcp add rebot -- uv run --directory /path/to/rebot-companion --extra agen
 | `set_keepout` | `boxes`（最多 16 个） | 替换运行时禁入区（`[]` 为清空）。会修改设备配置。能力 `keepout` |
 | `recover` | — | 清除 armd 标为可恢复的故障（`WATCHDOG_TIMEOUT`、`CONTROL_DEADLINE`、`HANDOVER_UNSETTLED`）并重新开启力矩；其他故障和急停返回 `NOT_RECOVERABLE` 并保持锁定。能力 `fault_codes` |
 | `collision_guard_status` | — | `{enabled, sensitivity, thresholds_nm}`；不需要租约。`get_state.collision` 显示进行中的碰撞停止。能力 `collision_guard` |
+| `describe_safety` | — | 停止方式、故障（含 `recoverable`）、速度和关节限位、时序、`hardware.physical_estop`，以及一行 `summary`；不需要租约。能力 `safety_describe` |
 | `set_collision_guard` | `enabled`、`sensitivity`（`low`/`medium`/`high`） | 开关碰撞保护和/或设置灵敏度。会修改设备配置。能力 `collision_guard` |
 | `clear_fault` | — | 清除 EStop 或 Fault；仅在 `--allow-clear-fault` 时列出 |
 | `take_control` | `force`（仅在 `--allow-preempt` 时） | 获取空闲租约；带 `--allow-preempt` 时，`force=true` 从 Web 驾驶舱抢占控制 |
