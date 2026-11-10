@@ -91,6 +91,13 @@ Every call blocks until armd reports the result and raises a `RebotError` subcla
   default** and its thresholds are **uncalibrated placeholders** (not measured on a real arm); do not
   rely on it as protection. Switching it on (`set_collision_guard`) is a configuration change: do it only
   when the user asks.
+- **Safety description** (capability `safety_describe`). Before writing a program, call the MCP tool
+  `describe_safety` (or `Arm.safety()` in a script). Keep speeds within `limits` (`action_speed_max`
+  and the joint limits). Never automate recovery of a fault with `recoverable: false`. When
+  `hardware.physical_estop` is false, tell the user that the arm has no physical e-stop: only software
+  stops exist, so someone must be able to cut power.
+- **After torque off.** `park()` or a thermal trip turns torque off and the wrist may droop. Call
+  `home()` before the first `move_to` of a program; without it the simulator reported `IK_BRANCH_FLIP`.
 - **Speed.** Use `speed_scale` <= 0.5 for the first real runs of any new script or pose, 0.3 when
   the arm moves near people, bins or the table. Raise it only after a successful run.
 - **Always `with Arm() as arm:`.** It parks and releases control on errors, Ctrl+C and SIGTERM. Do not
@@ -134,7 +141,7 @@ Every call blocks until armd reports the result and raises a `RebotError` subcla
 `rebot-mcp` exposes `get_state`, `snapshot`, `snapshot_annotated`, `detect`, `move_to`,
 `move_relative`, `gripper`, `home`, `park`, `stop`, `e_stop`, `enable`, `take_control`,
 `release_control`, `list_poses`, `save_pose`, `move_to_pose`, `place`, `get_keepout`, `set_keepout`,
-`recover`, `collision_guard_status` and `set_collision_guard`. `get_state.collision` shows a collision
+`recover`, `collision_guard_status`, `set_collision_guard` and `describe_safety`. `get_state.collision` shows a collision
 stop in progress. Use them to find positions and test steps; put the final behaviour in a script so
 it runs without the assistant. Tools needing a newer armd return `UNSUPPORTED`.
 

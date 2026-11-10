@@ -56,6 +56,8 @@ def run(arm, cfg):
     for cycle in range(1, cfg["max_cycles"] + 1):
         arm.feed()  # tell the guard the script is alive
         try:
+            if cycle == 1:  # known position first: after torque off the wrist may droop
+                retry_after_collision(arm, arm.home)
             retry_after_collision(arm, lambda: arm.move_to_pose(cfg["scan_pose"], speed_scale=speed))
             retry_after_collision(arm, arm.gripper_open)  # start every cycle with an open gripper
             targets = [d for d in arm.detect(min_score=cfg["min_score"]) if d.label.lower() in cfg["bins"]]
