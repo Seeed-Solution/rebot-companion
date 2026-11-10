@@ -23,7 +23,8 @@
 
 用于 **reBot B601-DM** 机械臂的 Python SDK 和 stdio [MCP](https://modelcontextprotocol.io) 服务器。机械臂由运行在 **Seeed reCamera** 上的 [rebot-armd](https://github.com/Seeed-Solution/rebot-armd) 驱动；本项目同时提供相机快照、目标检测、ArUco 标记位姿和手眼标定。
 
-- `rebot_companion`（SDK）：rebot-armd 客户端（REST 读取、WebSocket 控制租约、关节与笛卡尔动作）、reCamera ArUco 触发客户端、从相机 H.264 流截取 JPEG 快照、B601-DM 运动学、手眼标定、确定性抓放流水线。
+- `rebot`（机械臂控制核心）：只依赖 Python 标准库，Python >= 3.8。`Arm` 类用于编写不经修改即可在电脑和 reCamera 上运行的短程序（设备上尚未运行过）（见[编写自己的程序](#编写自己的程序)），底层是 armd 协议客户端和检测接口。
+- `rebot_companion`（SDK）：rebot-armd 客户端（从 `rebot` 重新导出）（REST 读取、WebSocket 控制租约、关节与笛卡尔动作）、reCamera ArUco 触发客户端、从相机 H.264 流截取 JPEG 快照、B601-DM 运动学、手眼标定、确定性抓放流水线。
 - `rebot-mcp`：stdio [MCP](https://modelcontextprotocol.io) 服务器，把机械臂、快照和检测作为工具提供给各类 AI Agent。
 
 ## 核心特性
@@ -32,7 +33,7 @@
 - **手眼标定**：眼在手外（闭式 Horn 点配准）与眼在手上（Park & Martin $AX=XB$），测试中与 OpenCV `CALIB_HAND_EYE_PARK` 交叉对比。精度仅在合成数据上验证，尚未在真机上实测。
 - **两阶段**：阶段 1 由 Agent 编排工具；阶段 2 为不依赖大模型的本地确定性抓放流水线。
 - **运动学**：完整 URDF 正运动学（测试中与独立 URDF 解析器相差 0.1 mm 以内）及 B601-DM 平面解析逆运动学。
-- **reCamera 接入**：本项目不在相机上运行任何代码。支持按需触发检测（ArUco 标记 6-DoF 位姿、YOLO 2D 框），以及在主机端从相机 H.264 流解码 JPEG 快照。
+- **reCamera 接入**：`rebot_companion` 和 MCP 服务器在主机上运行；仅依赖标准库的 `rebot` 包也用于在相机上运行（尚未在设备上运行过）。支持按需触发检测（ArUco 标记 6-DoF 位姿、YOLO 2D 框），以及在主机端从相机 H.264 流解码 JPEG 快照。
 
 > 本软件会驱动真实的机械臂。运行任何会动的代码之前，先阅读[安全](#安全)。
 
@@ -45,6 +46,7 @@
 - [硬件与软件要求](#硬件与软件要求)
 - [安装](#安装)
 - [快速上手](#快速上手)
+- [编写自己的程序](#编写自己的程序)
 - [项目结构](#项目结构)
 - [拓扑](#拓扑)
 - [机械臂控制](#机械臂控制)
@@ -113,7 +115,8 @@ SDK 不在相机上运行。相机和 armd 提供单一用途的接口：
 
 上位机：
 
-- Python >= 3.10 和 [uv](https://docs.astral.sh/uv/)。
+- `rebot_companion` 与 MCP 服务器需要 Python >= 3.10 和 [uv](https://docs.astral.sh/uv/)。
+  单独使用 `rebot` 包只需 Python >= 3.8，不需要第三方包。
 - 快照：PyAV（在 `agent` extra 中）或 `PATH` 上的 `ffmpeg`。
 - 可选：Node.js，仅用于重新生成测试用的 JS 参考值。
 
@@ -172,13 +175,97 @@ with arm.session() as s:
 
 ---
 
+## 编写自己的程序
+
+`rebot` 是 SDK 中供用户脚本使用的部分，只导入 Python 标准库，因此同一份脚本可以在电脑上
+（通过网络控制机械臂）和 reCamera 上（`127.0.0.1`）运行。
+
+```python
+from rebot import Arm
+
+with Arm() as arm:                         # $REBOT_HOST，未设置时为 127.0.0.1；获取控制权并上力矩
+    arm.home()
+    for obj in arm.detect("cup"):          # 检测结果按分数从高到低：label、score、box_norm
+        if arm.grasp(obj).holding:
+            arm.move_to((0.25, -0.15, 0.15))   # 米，机械臂基座坐标系（x 向前、y 向左、z 向上）
+            arm.gripper_open()
+        break
+# 离开 with 块时停靠机械臂（关闭力矩）并释放控制权，
+# 出错或 Ctrl+C 时也一样。
+```
+
+在电脑上运行（`rebot/` 文件夹与脚本放在同一目录，或用 `uv sync` 安装本包）：
+
+```bash
+REBOT_HOST=192.168.42.1 python3 main.py
+```
+
+在 reCamera 上运行：把 `rebot/` 文件夹和脚本复制到设备上，用设备的 `python3` 运行：
+
+```bash
+scp -r rebot main.py <user>@192.168.42.1:~/arm/
+ssh <user>@192.168.42.1 'cd ~/arm && python3 main.py'
+```
+
+| 方法 | 作用 |
+|---|---|
+| `Arm(host=None, port=None, enable=True, park_on_exit=True, force=False, obs_hz=10)` | 连接、获取控制租约、上力矩 |
+| `home()`、`park()` | 回零位；回休息位并关闭力矩（下一次运动会重新上力矩） |
+| `move_to(xyz, rpy=None, speed=None)` | 夹爪直线运动到目标；`rpy` 单位为弧度，`speed` 单位为 m/s |
+| `move_relative(dx, dy, dz, frame="base", droll, dpitch, dyaw, speed)` | 在 `base`、`tool` 或 `camera` 坐标系中相对运动 |
+| `move_joints(positions, duration=None)` | 关节空间运动（7 个值，弧度） |
+| `gripper_open()`、`gripper_close()`、`gripper_move(fraction)` | 夹爪；`gripper_close().holding` 表示是否夹住物体 |
+| `detect(label=None, pipelines=("yolo",), min_score=0.3)` | 经 armd 运行一次检测，返回检测列表 |
+| `grasp(detection)` 或 `grasp("cup", box=(x0, y0, x1, y1))` | armd 的抓取动作；结果中的 `.holding` |
+| `state()` | 最新 observation（`positions`、`safety_state`、`is_torqued`、`fault` 等） |
+| `poses()`、`save_pose(name)`、`delete_pose(name)`、`move_to_pose(name, speed_scale=1.0)` | 保存在 armd 中的命名位姿 |
+| `stop()`、`e_stop()` | 停止并保持；锁存急停 |
+| `recover(max_attempts=1)` | 清除 armd 标记为可恢复的故障，然后上力矩 |
+| `guard(timeout_s)`、`feed()` | 主循环不再调用 `feed()` 时释放控制权 |
+
+行为：
+
+- 错误都是 `rebot.RebotError` 的子类，带 `.code` 和 `.message`，例如
+  `IK_BRANCH_FLIP: target (0.9, 0, 0.1) needs the arm to flip its elbow; choose a closer or higher
+  target (...)`（取自下文的集成测试输出）。
+- `recover()` 只清除 observation 中 `fault.recoverable` 为 true 的故障（看门狗超时、控制周期超时、
+  交接未稳定）。急停、其他故障，以及不报告故障码的 armd 上的所有故障，都抛出 `ArmFaultError`；
+  这些故障需要检查机械臂后在 Web 驾驶舱中清除。离开 `with` 块时也不会清除它们。
+- `guard(timeout_s)`：后台线程在 `timeout_s` 秒内没有调用 `feed()` 时释放租约（在 `Arm` 方法内部的
+  时间算作已调用），之后由 armd 的租约看门狗处理机械臂，后续调用都抛出 `GuardTimeout`。
+- 命名位姿、`move_to_pose`、`obs_hz` 和故障码需要报告 capabilities 版本 6（`poses`、`obs_rate`、
+  `fault_codes`）的 armd。旧版 armd 上位姿相关方法抛出 `UnsupportedError`（`code == "UNSUPPORTED"`），
+  不发送 `obs_hz`（armd 按每个控制周期推送），`recover()` 不清除故障。
+
+验证情况：
+
+- `import rebot` 不加载任何第三方模块（`numpy`、`httpx`、`websockets` 不出现在 `sys.modules` 中）。
+  `rebot` 的单元测试（WebSocket 客户端、`Arm`、协议）在 CPython 3.8.20 和 3.13 上对进程内 fake armd
+  通过；CI 在 3.8 上运行它们（任务 `stdlib-core`）。未检查 reCamera 上 `python3` 的版本，需为 3.8 或更高。
+- `tests/test_integration_armd.py` 用从 rebot-armd `ad923df` 编译的 armd（`--follower mock`，B601-DM
+  profile）驱动 `Arm`：连接、上力矩、`move_to`、`home`、`park`、释放、退出时停靠、错误信息。该 armd
+  报告 capabilities 版本 5，因此版本 6 的功能只在 fake armd 上验证过。未在硬件上运行。
+
+```bash
+ARMD_BIN=/path/to/armd ARMD_PROFILE=/path/to/rebot-b601dm.json uv run pytest tests/test_integration_armd.py -s
+```
+
+---
+
 ## 项目结构
 
 ```text
 rebot-companion/
 ├── pyproject.toml              # uv 项目；extras：[agent] = MCP 服务器，[calib] = OpenCV
-├── rebot_companion/            # SDK
-│   ├── arm_client.py           # rebot-armd 客户端（REST 读取 + WebSocket 租约会话 + 动作）
+├── rebot/                      # 机械臂控制核心，仅标准库（Python >= 3.8）
+│   ├── arm.py                  # 用户程序使用的 Arm 类
+│   ├── client.py               # rebot-armd 客户端（REST 读取 + WebSocket 租约会话 + 动作）
+│   ├── detection.py            # 经 armd 检测代理获取检测结果
+│   ├── errors.py               # RebotError 及其子类
+│   ├── _ws.py                  # 最小 RFC 6455 WebSocket 客户端
+│   └── _http.py                # 基于 urllib 的 JSON 请求
+├── rebot_companion/            # SDK（numpy / scipy）
+│   ├── arm_client.py           # 重新导出 rebot.client
 │   ├── camera_client.py        # reCamera rebot-vision / aruco-detector 客户端（触发 / 最新结果）
 │   ├── snapshot.py             # 从 H.264 流截取 JPEG 快照 + 检测框叠加
 │   ├── mcp_server.py           # stdio MCP 服务器（rebot-mcp）
@@ -569,7 +656,9 @@ node tools/gen_web_fixtures.mjs ../rebot-armd/src/api/index.html   # 重新生�
 ```
 
 测试使用进程内的模拟对象（armd：`tests/fake_armd.py`）和录制的数据，不需要硬件。CI
-（`.github/workflows/ci.yml`）在 Python 3.10、3.11、3.12 和 3.13 上安装全部 extras 运行 ruff 和 pytest。
+（`.github/workflows/ci.yml`）在 Python 3.10、3.11、3.12 和 3.13 上安装全部 extras 运行 ruff 和 pytest，
+并在 Python 3.8 上只安装 pytest 和 websockets 运行 `rebot` 的测试。`tests/test_integration_armd.py`
+仅在 `ARMD_BIN` 指向 armd 可执行文件时运行。
 另见 [CONTRIBUTING.md](./CONTRIBUTING.md) 和 [SECURITY.md](./SECURITY.md)（英文）。
 
 ---
