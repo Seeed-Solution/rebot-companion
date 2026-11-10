@@ -71,7 +71,7 @@ Python SDK and stdio [MCP](https://modelcontextprotocol.io) server bridging **Se
                             ▼
 ┌──────────────────────────────┬─────────────────────────────┐
 │ rebot-armd (arm daemon)      │ reCamera services           │
-│ REST + WS lease  :8765       │ aruco-detector HTTP  :8090  │
+│ REST + WS lease  :8765       │ rebot-vision HTTP    :8090  │
 │ actions, limits, watchdog    │ H.264 WebSocket      :8001  │
 │ detection API /api/v1/...    │ RTSP /live0          :8554  │
 └──────────────────────────────┴─────────────────────────────┘
@@ -79,7 +79,7 @@ Python SDK and stdio [MCP](https://modelcontextprotocol.io) server bridging **Se
 
 The SDK does not run on the camera. The camera and armd provide single-purpose endpoints:
 
-- `POST /api/trigger` (aruco-detector, :8090): one detection, returns marker poses
+- `POST /api/trigger` (rebot-vision, :8090): one detection, returns marker poses
   (`x, y, z, roll, pitch, yaw`).
 - `ws://<host>:8001/`: H.264 stream; `rebot_companion.snapshot` decodes one IDR frame to JPEG.
 - `rtsp://<host>:8554/live0` (1280x720): used by the intrinsics tool.
@@ -110,9 +110,12 @@ Software on the devices:
 - rebot-armd, reachable over HTTP/WebSocket (default port 8765). The Cartesian move, gripper
   and action-status features need an armd build that serves `/api/v1/action/*` and reports
   `action` in the observation; `home` / `park` also work with older builds.
-- aruco-detector on the reCamera for marker triggers. The trigger needs a JSON body
-  (aruco-detector >= 0.1.3 answers `415` otherwise; the SDK sends one). Distortion keys need
-  aruco-detector >= 0.1.1.
+- `rebot-vision` on the reCamera for marker triggers (part of the `rebot-teleop` package, which
+  also carries rebot-armd; no separate camera app is needed). The camera's own aruco-detector
+  also works: its trigger needs a JSON body (aruco-detector >= 0.1.3 answers `415` otherwise;
+  the SDK sends one) and distortion keys need aruco-detector >= 0.1.1.
+- The SenseCraft solution `rebot_agent_arm` installs `rebot-teleop`, this MCP server and the
+  calibration verify step.
 
 Host:
 
@@ -182,7 +185,7 @@ rebot-companion/
 ├── pyproject.toml              # uv project; extras: [agent] = MCP server, [calib] = OpenCV
 ├── rebot_companion/            # SDK
 │   ├── arm_client.py           # rebot-armd client (REST reads + WebSocket lease session + actions)
-│   ├── camera_client.py        # reCamera aruco-detector client (trigger / latest result)
+│   ├── camera_client.py        # reCamera rebot-vision / aruco-detector client (trigger / latest result)
 │   ├── snapshot.py             # JPEG snapshots from the H.264 stream + detection overlay
 │   ├── mcp_server.py           # stdio MCP server (rebot-mcp)
 │   ├── kinematics.py           # B601-DM FK (full URDF chain) and planar FK/IK (port of the Web cockpit)
@@ -204,7 +207,7 @@ rebot-companion/
 ```mermaid
 flowchart LR
     subgraph Bench["Workcell"]
-        CAM["reCamera (SG2002)<br/>aruco-detector HTTP :8090<br/>H.264 WS :8001, RTSP :8554"]
+        CAM["reCamera (SG2002)<br/>rebot-vision HTTP :8090<br/>H.264 WS :8001, RTSP :8554"]
         ARMD["rebot-armd<br/>REST/WS :8765, Web cockpit"]
         ARM["reBot B601-DM arm"]
     end
@@ -222,7 +225,7 @@ Default addresses:
 |---|---|---|
 | rebot-armd | `http://192.168.42.1:8765` (armd on the reCamera) | `http://127.0.0.1:8765` (pass `--arm-url`) |
 | camera H.264 stream | `ws://192.168.42.1:8001/` | — |
-| aruco-detector | — | `http://192.168.42.1:8090` |
+| rebot-vision (`:8090`) | — | `http://192.168.42.1:8090` |
 
 ---
 
@@ -359,7 +362,7 @@ Tools:
 | `enable` | — | torque on |
 | `clear_fault` | — | clear EStop or Fault; listed only with `--allow-clear-fault` |
 | `take_control` | `force` (only with `--allow-preempt`) | acquire a free lease; with `--allow-preempt`, `force=true` takes control from the web cockpit |
-| `release_control` | — | release the lease (the cockpit acquires it automatically) |
+| `release_control` | — | release the lease; if the arm is torqued, armd's watchdog parks it |
 
 The limits in the table (speed ≤ 0.15 m/s, step ≤ 0.30 m, rotation ≤ 90 deg) are checked by
 the server's input schema before a call reaches armd; armd applies its own limits as well.
@@ -380,6 +383,11 @@ Lease and safety rules:
     use it only after the user explicitly confirms. Inside armd's cooldown it returns
     `PREEMPT_COOLDOWN` with `remaining_ms`.
   - `--allow-clear-fault` adds the `clear_fault` tool.
+- The cockpit takes the lease on its first control input, not when the page opens, and releases it
+  after 30 s without input only while torque is off. With no cockpit holding the lease, `take_control`
+  succeeds without `force`. A cockpit with torque on keeps the lease: the user turns torque off in the
+  cockpit (the lease is released after 30 s idle), or the server runs with `--allow-preempt`. While the
+  server holds the lease, the cockpit shows observer mode and names the holder (the `--client-id` label).
 - After `release_control`, or with `--no-auto-lease`, tools return `NO_LEASE` until `take_control`.
 - One motion tool runs at a time; a second call returns `BUSY`. `stop` and `e_stop` run at any time.
   If the MCP client cancels a motion call, the server sends `stop`.
@@ -414,7 +422,7 @@ z up, metres / radians):
   any value in the samples. Tests compare it with an independent URDF parser: < 0.1 mm, < 0.01 deg.
 - URDF joint5 = wrist swing (axis vertical at the park pose J1..J5 = 0, J6 = pi/2; +0.2 rad
   moves the TCP ~36 mm in -y), joint6 = tool roll (about the tool axis; the TCP position does
-  not change). The Web cockpit UI labels these two the other way round.
+  not change). The Web cockpit UI uses the same labels (J5 swing, J6 roll).
 - Motor → URDF mapping: armd index 0..3 → URDF joint1..joint4 with `model = (motor - offset) / sign`
   (Web `toModel` / `CFG.cart.sign` / `CFG.cart.off`, defaults sign `1,1,1,1`, offset `0`; same as
   the Web `?iksign=` / `?ikoff=` overrides; the wizard takes `--iksign` / `--ikoff`). Index 4 →
@@ -532,8 +540,10 @@ uv run python tools/calibrate_intrinsics.py --images intrinsics_frames/20261109-
 3. The tool prints the reprojection RMS and writes `aruco-intrinsics.conf` with
    `CAMERA_WIDTH CAMERA_HEIGHT FX FY CX CY K1 K2 P1 P2 K3` (OpenCV order) at the inference
    resolution (`--infer-size`, default 640x360).
-4. Merge the keys into `/etc/aruco-detector.conf` on the device and restart aruco-detector.
-   The distortion keys need aruco-detector >= 0.1.1; the file is preserved across upgrades;
+4. With `rebot-vision`: copy the values as lowercase keys (`fx fy cx cy k1 k2 p1 p2 k3`) into
+   `/userdata/rebot-teleop/vision.json` and restart the app (`/etc/init.d/K92rebot-teleop restart`).
+   With the camera's aruco-detector: merge the keys into `/etc/aruco-detector.conf` and restart it;
+   the distortion keys need aruco-detector >= 0.1.1 and the file is preserved across upgrades.
    JSON replies carry `"undistorted": true/false`.
 
 Resolution assumption: calibration runs on the 1280x720 RTSP stream, the detector infers at

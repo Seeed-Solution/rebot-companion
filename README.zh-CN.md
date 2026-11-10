@@ -71,7 +71,7 @@
                             ▼
 ┌──────────────────────────────┬─────────────────────────────┐
 │ rebot-armd（机械臂守护进程） │ reCamera 服务               │
-│ REST + WS 租约   :8765       │ aruco-detector HTTP  :8090  │
+│ REST + WS 租约   :8765       │ rebot-vision HTTP    :8090  │
 │ 动作、限位、看门狗           │ H.264 WebSocket      :8001  │
 │ 检测 API /api/v1/...         │ RTSP /live0          :8554  │
 └──────────────────────────────┴─────────────────────────────┘
@@ -79,7 +79,7 @@
 
 SDK 不在相机上运行。相机和 armd 提供单一用途的接口：
 
-- `POST /api/trigger`（aruco-detector，:8090）：执行一次检测，返回标记位姿
+- `POST /api/trigger`（rebot-vision，:8090）：执行一次检测，返回标记位姿
   （`x, y, z, roll, pitch, yaw`）。
 - `ws://<host>:8001/`：H.264 视频流；`rebot_companion.snapshot` 解码一个 IDR 帧为 JPEG。
 - `rtsp://<host>:8554/live0`（1280x720）：内参标定工具使用。
@@ -107,8 +107,9 @@ SDK 不在相机上运行。相机和 armd 提供单一用途的接口：
 
 - rebot-armd，可通过 HTTP/WebSocket 访问（默认端口 8765）。笛卡尔运动、夹爪和动作状态功能需要
   提供 `/api/v1/action/*` 且在 observation 中报告 `action` 的 armd 版本；`home` / `park` 在旧版本上也可用。
-- reCamera 上的 aruco-detector，用于标记触发。触发请求需要 JSON body（aruco-detector >= 0.1.3
-  否则返回 `415`；SDK 会发送 JSON body）。畸变参数需要 aruco-detector >= 0.1.1。
+- reCamera 上的 `rebot-vision`，用于标记触发（包含在 `rebot-teleop` 安装包内，与 rebot-armd 一起安装，无需另装相机应用）。相机自带的 aruco-detector 也可使用：触发请求需要 JSON body（aruco-detector >= 0.1.3
+  否则返回 `415`；SDK 会发送 JSON body），畸变参数需要 aruco-detector >= 0.1.1。
+- SenseCraft 方案 `rebot_agent_arm` 安装 `rebot-teleop`、本 MCP 服务器并运行标定验证步骤。
 
 上位机：
 
@@ -178,7 +179,7 @@ rebot-companion/
 ├── pyproject.toml              # uv 项目；extras：[agent] = MCP 服务器，[calib] = OpenCV
 ├── rebot_companion/            # SDK
 │   ├── arm_client.py           # rebot-armd 客户端（REST 读取 + WebSocket 租约会话 + 动作）
-│   ├── camera_client.py        # reCamera aruco-detector 客户端（触发 / 最新结果）
+│   ├── camera_client.py        # reCamera rebot-vision / aruco-detector 客户端（触发 / 最新结果）
 │   ├── snapshot.py             # 从 H.264 流截取 JPEG 快照 + 检测框叠加
 │   ├── mcp_server.py           # stdio MCP 服务器（rebot-mcp）
 │   ├── kinematics.py           # B601-DM FK（完整 URDF 链）与平面 FK/IK（Web 驾驶舱移植）
@@ -200,7 +201,7 @@ rebot-companion/
 ```mermaid
 flowchart LR
     subgraph Bench["工位"]
-        CAM["reCamera (SG2002)<br/>aruco-detector HTTP :8090<br/>H.264 WS :8001, RTSP :8554"]
+        CAM["reCamera (SG2002)<br/>rebot-vision HTTP :8090<br/>H.264 WS :8001, RTSP :8554"]
         ARMD["rebot-armd<br/>REST/WS :8765, Web 驾驶舱"]
         ARM["reBot B601-DM 机械臂"]
     end
@@ -218,7 +219,7 @@ flowchart LR
 |---|---|---|
 | rebot-armd | `http://192.168.42.1:8765`（armd 运行在 reCamera 上） | `http://127.0.0.1:8765`（用 `--arm-url` 指定） |
 | 相机 H.264 流 | `ws://192.168.42.1:8001/` | — |
-| aruco-detector | — | `http://192.168.42.1:8090` |
+| rebot-vision（`:8090`） | — | `http://192.168.42.1:8090` |
 
 ---
 
@@ -346,7 +347,7 @@ claude mcp add rebot -- uv run --directory /path/to/rebot-companion --extra agen
 | `enable` | — | 开启力矩 |
 | `clear_fault` | — | 清除 EStop 或 Fault；仅在 `--allow-clear-fault` 时列出 |
 | `take_control` | `force`（仅在 `--allow-preempt` 时） | 获取空闲租约；带 `--allow-preempt` 时，`force=true` 从 Web 驾驶舱抢占控制 |
-| `release_control` | — | 释放租约（Web 驾驶舱会自动获取） |
+| `release_control` | — | 释放租约；机械臂带力矩时，armd 看门狗会将其收纳 |
 
 表中的限制（速度 ≤ 0.15 m/s、步长 ≤ 0.30 m、旋转 ≤ 90 deg）由服务器的输入 schema 在调用到达 armd
 之前检查；armd 另有自己的限制。
@@ -364,6 +365,9 @@ claude mcp add rebot -- uv run --directory /path/to/rebot-companion --extra agen
   - `--allow-preempt` 增加 `take_control(force=true)`。服务器指令要求 agent 只在用户明确确认后使用。
     在 armd 冷却期内返回 `PREEMPT_COOLDOWN` 和 `remaining_ms`。
   - `--allow-clear-fault` 增加 `clear_fault` 工具。
+- 驾驶舱在第一次控制输入时取得租约（打开页面时不取得），仅在力矩关闭时于 30 秒无输入后释放。没有驾驶舱持有租约时，
+  `take_control` 无需 `force` 即可成功。力矩开启的驾驶舱会一直持有租约：用户在驾驶舱中关闭力矩（空闲 30 秒后释放租约），
+  或服务器以 `--allow-preempt` 启动。服务器持有租约时，驾驶舱进入观察者模式并显示持有者（`--client-id` 标签）。
 - `release_control` 之后，或使用 `--no-auto-lease` 时，工具返回 `NO_LEASE`，直到调用 `take_control`。
 - 同一时间只运行一个运动工具；第二个调用返回 `BUSY`。`stop` 和 `e_stop` 随时可执行。
   MCP 客户端取消运动调用时，服务器发送 `stop`。
@@ -392,7 +396,7 @@ claude mcp add rebot -- uv run --directory /path/to/rebot-companion --extra agen
   `base_link` → `joint1`..`joint6` → `end_joint` → `end_link`。返回 SE(3) TCP 位姿，x 轴 = 工具轴。
   手眼标定使用此 FK，因此样本中 J5、J6 可以取任意值。测试将其与独立的 URDF 解析器对比：< 0.1 mm、< 0.01 deg。
 - URDF joint5 = 腕部摆动（在停靠位 J1..J5 = 0、J6 = pi/2 时轴竖直；+0.2 rad 使 TCP 沿 -y 移动约 36 mm），
-  joint6 = 工具滚转（绕工具轴；TCP 位置不变）。Web 驾驶舱界面对这两个关节的标注与此相反。
+  joint6 = 工具滚转（绕工具轴；TCP 位置不变）。Web 驾驶舱界面使用相同的标注（J5 腕摆，J6 滚转）。
 - 电机 → URDF 映射：armd 下标 0..3 → URDF joint1..joint4，`model = (motor - offset) / sign`（Web
   `toModel` / `CFG.cart.sign` / `CFG.cart.off`，默认 sign `1,1,1,1`、offset `0`；与 Web 的
   `?iksign=` / `?ikoff=` 覆盖参数相同；向导接受 `--iksign` / `--ikoff`）。下标 4 → joint5、下标 5 →
@@ -496,8 +500,10 @@ uv run python tools/calibrate_intrinsics.py --images intrinsics_frames/20261109-
    （默认 20 个视角，`--target`；帧会保存以便离线重算）。
 3. 工具打印重投影 RMS，并按推理分辨率（`--infer-size`，默认 640x360）写出 `aruco-intrinsics.conf`，包含
    `CAMERA_WIDTH CAMERA_HEIGHT FX FY CX CY K1 K2 P1 P2 K3`（OpenCV 顺序）。
-4. 将这些键合并到设备上的 `/etc/aruco-detector.conf` 并重启 aruco-detector。畸变参数需要
-   aruco-detector >= 0.1.1；该文件在升级时保留；JSON 回复中带 `"undistorted": true/false`。
+4. 使用 `rebot-vision` 时：将这些值以小写键（`fx fy cx cy k1 k2 p1 p2 k3`）写入
+   `/userdata/rebot-teleop/vision.json` 并重启应用（`/etc/init.d/K92rebot-teleop restart`）。
+   使用相机自带的 aruco-detector 时：将这些键合并到 `/etc/aruco-detector.conf` 并重启它；
+   畸变参数需要 aruco-detector >= 0.1.1，该文件在升级时保留。JSON 回复中带 `"undistorted": true/false`。
 
 分辨率假设：标定在 1280x720 的 RTSP 流上进行，检测器在同一传感器的 640x360 画面上推理。工具假设两者
 视场相同（无裁剪），按宽高比例缩放 fx、fy、cx、cy（像素中心约定）。这一点未在设备上验证；请用卷尺
