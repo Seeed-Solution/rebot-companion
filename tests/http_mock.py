@@ -22,7 +22,7 @@ class Request:
         self.method = method
         self.url = _Url(url)
         self.content = body or b""
-        self.headers = headers
+        self.headers = {k.lower(): v for k, v in headers.items()}
 
 
 def Response(status: int, json=None) -> HttpResponse:  # noqa: N802 (mirrors httpx.Response)

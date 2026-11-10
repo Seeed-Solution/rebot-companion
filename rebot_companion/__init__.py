@@ -1,7 +1,6 @@
 """rebot-companion: Robot Arm Vision Companion SDK and Orchestration Framework."""
 
-from . import ik, kinematics, snapshot
-from .arm_client import (
+from rebot.client import (
     ActionFailed,
     ActionResult,
     ActionStatus,
@@ -20,6 +19,8 @@ from .arm_client import (
     ServoRejected,
     UnloadFailed,
 )
+
+from . import ik, kinematics, snapshot
 from .calibration import CalibrationError, CalibrationResult, CalibrationSample, HandEyeCalibration, HandEyeResult
 from .camera_client import CameraError, CameraTriggerTimeout, MarkerDetection, ReCameraClient
 from .ik import B601IkAdapter, IkError

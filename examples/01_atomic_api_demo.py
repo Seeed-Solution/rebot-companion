@@ -4,8 +4,8 @@
 import argparse
 import sys
 
+from rebot.client import ArmdClient, ArmdError
 from rebot_companion import ReCameraClient
-from rebot_companion.arm_client import ArmdClient, ArmdError
 
 
 def arm_demo(url: str, move: bool) -> int:

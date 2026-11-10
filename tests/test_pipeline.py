@@ -4,8 +4,8 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 
+from rebot.client import ArmCommandRejected, ArmdClient, ArmSession, ArmStatus, SafeExitOutcome
 from rebot_companion import kinematics as K
-from rebot_companion.arm_client import ArmCommandRejected, ArmdClient, ArmSession, ArmStatus, SafeExitOutcome
 from rebot_companion.calibration import HandEyeResult
 from rebot_companion.camera_client import MarkerDetection, ReCameraClient
 from rebot_companion.ik import GRIPPER_CLOSED, GRIPPER_OPEN, HOME_POSITIONS, B601IkAdapter, IkError

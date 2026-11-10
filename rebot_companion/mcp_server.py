@@ -37,14 +37,12 @@ from collections.abc import Callable
 from typing import Annotated, Any, Literal
 
 import anyio
-import httpx
 from mcp.server.mcpserver import Image, MCPServer
 from mcp.types import CallToolResult, TextContent
 from pydantic import Field
 from scipy.spatial.transform import Rotation
 
-from . import kinematics
-from .arm_client import (
+from rebot.client import (
     GRIPPER_INDEX,
     ActionFailed,
     ActionResult,
@@ -57,15 +55,15 @@ from .arm_client import (
     LeaseError,
     MotionTimeout,
 )
+from rebot.detection import DetectionClient, DetectorUnavailable, parse_detections
+
+from . import kinematics
 from .snapshot import (
     CameraUnavailable,
-    DetectionClient,
-    DetectorUnavailable,
     SnapshotError,
     SnapshotTimeout,
     VideoGrabber,
     annotated_snapshot,
-    parse_detections,
 )
 
 log = logging.getLogger("rebot_mcp")
@@ -188,7 +186,7 @@ def map_exception(exc: BaseException) -> ToolFail | None:
         if exc.reason == "preemption_cooldown":
             return ToolFail("PREEMPT_COOLDOWN", str(exc), remaining_ms=exc.raw.get("remaining_ms"))
         return ToolFail("LEASE_LOST", str(exc))
-    if isinstance(exc, (ArmConnectionError, httpx.HTTPError)):
+    if isinstance(exc, ArmConnectionError):  # includes HTTP errors (rebot._http.HttpError)
         return ToolFail("ARMD_UNAVAILABLE", str(exc), "check that armd is reachable")
     if isinstance(exc, SnapshotTimeout):
         return ToolFail("SNAPSHOT_TIMEOUT", str(exc))

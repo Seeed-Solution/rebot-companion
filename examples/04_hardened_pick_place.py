@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from rebot import ArmdError
 from rebot_companion import (
     ArmdClient,
     B601IkAdapter,
@@ -18,7 +19,6 @@ from rebot_companion import (
     ReCameraClient,
     Transform,
 )
-from rebot_companion.arm_client import ArmdError
 from rebot_companion.pipeline import PipelineConfig
 
 

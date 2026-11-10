@@ -8,8 +8,9 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from rebot.client import ArmCommandRejected, ArmdClient, ArmdError, ArmSession, SafeExitOutcome
+
 from . import kinematics
-from .arm_client import ArmCommandRejected, ArmdClient, ArmdError, ArmSession, SafeExitOutcome
 from .calibration import HandEyeResult
 from .camera_client import CameraTriggerTimeout, MarkerDetection, ReCameraClient
 from .ik import GRIPPER_CLOSED, GRIPPER_INDEX, GRIPPER_OPEN
