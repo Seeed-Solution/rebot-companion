@@ -34,6 +34,7 @@ Issues = "https://github.com/Seeed-Solution/rebot-companion/issues"
 
 [project.scripts]
 rebot-mcp = "rebot_companion.mcp_server:main"
+rebot-record = "rebot_companion.lerobot_recorder:main"
 
 [project.optional-dependencies]
 calib = [

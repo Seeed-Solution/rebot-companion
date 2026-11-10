@@ -35,10 +35,12 @@ Scripted recording without the live sources: ``start_episode(sample=False)`` the
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import queue
 import shutil
+import sys
 import threading
 import time
 from collections.abc import Sequence
@@ -927,3 +929,132 @@ def _write_json(path: Path, data: Any) -> None:
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(data, indent=4), encoding="utf-8")
     tmp.replace(path)
+
+
+# --------------------------------------------------------------------------- CLI
+
+
+def _stdin_lines(q: queue.Queue) -> None:
+    for line in sys.stdin:
+        q.put(line.strip().lower())
+    q.put("q")  # EOF
+
+
+def _wait_key(keys: queue.Queue, timeout: float | None = None) -> str | None:
+    try:
+        return keys.get(timeout=timeout)
+    except queue.Empty:
+        return None
+
+
+def _record_one(rec: LeRobotRecorder, keys: queue.Queue, episode_s: float, prompt: bool) -> str:
+    """Record one episode; returns ``saved``, ``discarded`` or ``quit``."""
+    rec.start_episode()
+    print(
+        f"  recording up to {episode_s:g} s" + ("  [Enter] stop  [d] discard  [q] discard and quit" if prompt else "")
+    )
+    end = time.monotonic() + episode_s
+    key = None
+    while time.monotonic() < end:
+        if rec.check_sources():
+            print(f"  source error: {rec.check_sources()}")
+            break
+        key = _wait_key(keys, min(0.2, max(0.0, end - time.monotonic()))) if prompt else None
+        if key is not None:
+            break
+        if not prompt:
+            time.sleep(min(0.2, max(0.0, end - time.monotonic())))
+    s = rec.stop_episode()
+    print(
+        f"  {s.frames} frames ({s.duration_s:.1f} s), late ticks {s.late_ticks}, camera repeats {s.camera_repeats}, "
+        f"obs age max {s.obs_age_ms_max:.0f} ms, camera age max {s.camera_age_ms_max:.0f} ms"
+    )
+    if key in ("d", "q") or s.frames == 0:
+        rec.discard()
+        print("  discarded")
+        return "quit" if key == "q" else "discarded"
+    if prompt:
+        print("  [Enter] save  [d] discard  [q] save and quit")
+        key = _wait_key(keys)
+        if key == "d":
+            rec.discard()
+            print("  discarded")
+            return "discarded"
+    idx = rec.save()
+    print(f"  saved episode {idx}")
+    return "quit" if key == "q" else "saved"
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    p = argparse.ArgumentParser(
+        prog="rebot-record",
+        description="Record reBot arm + reCamera episodes into a LeRobot v3.0 dataset (lease-free observer).",
+    )
+    p.add_argument("--armd", default="192.168.16.1", help="armd host or URL (default port 8765)")
+    p.add_argument("--camera", default="192.168.16.1", help="reCamera host or ws:// URL (default port 8001)")
+    p.add_argument("--no-camera", action="store_true", help="record state and action only")
+    p.add_argument("--repo-id", required=True, help="dataset id, e.g. user/pick_cup")
+    p.add_argument("--root", help="dataset directory (default ~/.cache/huggingface/lerobot/<repo-id>)")
+    p.add_argument("--task", required=True, help="task description stored with every episode")
+    p.add_argument("--episodes", type=int, default=1, help="episodes to save (default 1)")
+    p.add_argument("--episode-s", type=float, default=30.0, help="maximum episode length in seconds")
+    p.add_argument("--fps", type=int, default=30)
+    p.add_argument("--extras", default="", help="comma list of extra features: velocity,effort")
+    p.add_argument("--camera-key", default="observation.images.recamera")
+    p.add_argument("--image-size", help="resize video to WxH (default: camera size)")
+    p.add_argument("--vcodec", default="auto", help="auto (libsvtav1 if available, else h264), libsvtav1, h264")
+    p.add_argument("--no-prompt", action="store_true", help="start/save episodes without waiting for Enter")
+    p.add_argument("--reset-s", type=float, default=0.0, help="pause between episodes with --no-prompt")
+    args = p.parse_args(argv)
+    logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
+
+    root = Path(args.root) if args.root else Path.home() / ".cache/huggingface/lerobot" / args.repo_id
+    size = tuple(int(v) for v in args.image_size.lower().split("x")) if args.image_size else None
+    try:
+        rec = LeRobotRecorder(
+            root,
+            args.repo_id,
+            fps=args.fps,
+            camera_url=None if args.no_camera else args.camera,
+            armd_host=args.armd,
+            task=args.task,
+            camera_key=args.camera_key,
+            extras=[e for e in args.extras.split(",") if e],
+            image_size=size,
+            video=VideoSettings(vcodec=args.vcodec),
+        )
+        print(f"connecting to armd {args.armd}" + ("" if args.no_camera else f" and camera {args.camera}") + " ...")
+        rec.open()
+    except (RecorderError, ValueError, ImportError) as exc:
+        print(f"rebot-record: {exc}", file=sys.stderr)
+        return 1
+    keys: queue.Queue = queue.Queue()
+    if not args.no_prompt:
+        threading.Thread(target=_stdin_lines, args=(keys,), daemon=True).start()
+    print(f"dataset {args.repo_id} -> {root}")
+    try:
+        while rec.num_episodes < args.episodes:
+            n = rec.num_episodes + 1
+            if args.no_prompt:
+                if n > 1 and args.reset_s > 0:
+                    print(f"reset: {args.reset_s:g} s")
+                    time.sleep(args.reset_s)
+                print(f"episode {n}/{args.episodes}")
+            else:
+                print(f"episode {n}/{args.episodes}: [Enter] start  [q] quit")
+                if _wait_key(keys) == "q":
+                    break
+            if _record_one(rec, keys, args.episode_s, not args.no_prompt) == "quit":
+                break
+    except KeyboardInterrupt:
+        print("\ninterrupted; the current episode is discarded")
+    except RecorderError as exc:
+        print(f"rebot-record: {exc}", file=sys.stderr)
+    finally:
+        rec.close()
+    print(f"{rec.num_episodes} episode(s) in {root}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
