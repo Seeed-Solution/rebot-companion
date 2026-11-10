@@ -1170,6 +1170,46 @@ class ArmSession:
             body["tag"] = str(tag)
         return self._action("/api/v1/action/move_to_pose", body, timeout, legacy_wait=None)
 
+    def place(
+        self,
+        pose: str | None = None,
+        position: Sequence[float] | None = None,
+        rpy: Sequence[float] | None = None,
+        approach_height_m: float = 0.08,
+        release: bool = True,
+        retreat: bool = True,
+        speed_scale: float = 1.0,
+        tag: str | None = None,
+        timeout: float | None = None,
+    ) -> ActionResult:
+        """``/api/v1/action/place``: lift, approach above the target, descend, open, retreat. Capability ``place``.
+
+        Exactly one of ``pose`` (a named pose; its stored TCP is the place point) or ``position``
+        (x, y, z in metres). ``rpy``: orientation in radians, default the pose's / the current one.
+        """
+        if (pose is None) == (position is None):
+            raise ValueError("place() needs exactly one of pose= or position=")
+        if not 0.02 <= float(approach_height_m) <= 0.30:
+            raise ValueError("approach_height_m must be within 0.02..0.30")
+        if not 0.1 <= float(speed_scale) <= 1.0:
+            raise ValueError("speed_scale must be within 0.1..1.0")
+        self.require("place", "Placing")
+        body: dict = {
+            "approach_height_m": float(approach_height_m),
+            "release": bool(release),
+            "retreat": bool(retreat),
+            "speed_scale": float(speed_scale),
+        }
+        if pose is not None:
+            body["pose"] = str(pose)
+        else:
+            body["position"] = _vec(position, 3, "position")
+        if rpy is not None:
+            body["orientation"] = {"rpy": _vec(rpy, 3, "rpy")}
+        if tag is not None:
+            body["tag"] = str(tag)
+        return self._action("/api/v1/action/place", body, timeout, legacy_wait=None)
+
     def set_keepout(self, boxes: Sequence[dict]) -> dict:
         """Replace the runtime keep-out boxes (``[{name, min_m, max_m}]``, at most 16). Capability ``keepout``."""
         self.require("keepout", "Keep-out boxes")

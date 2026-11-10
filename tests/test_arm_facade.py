@@ -272,3 +272,72 @@ def test_lease_busy(armd):
             open_arm(armd)
         assert info.value.code == "LEASE_BUSY"
     assert armd.positions[:6] == pytest.approx(HOME[:6], abs=0.01)
+
+
+def test_place_pose_and_position(armd):
+    armd.devplat = True
+    with open_arm(armd) as arm:
+        arm.save_pose("bin_a")
+        res = arm.place(pose="bin_a", approach_height_m=0.1, speed_scale=0.5)
+        assert res.ok and res.action.kind == "place"
+        assert armd.action_bodies[-1] == (
+            "/api/v1/action/place",
+            {"pose": "bin_a", "approach_height_m": 0.1, "release": True, "retreat": True, "speed_scale": 0.5},
+        )
+        arm.place(position=(0.2, 0.1, 0.05), rpy=(0, 1.5, 0), release=False, retreat=False)
+        body = armd.action_bodies[-1][1]
+        assert body["position"] == [0.2, 0.1, 0.05] and body["orientation"] == {"rpy": [0.0, 1.5, 0.0]}
+        assert body["release"] is False and body["retreat"] is False
+        with pytest.raises(ArmCommandRejected) as info:
+            arm.place(pose="nope")
+        assert info.value.code == "POSE_NOT_FOUND"
+        with pytest.raises(ValueError):
+            arm.place()
+        with pytest.raises(ValueError):
+            arm.place(pose="bin_a", position=(0, 0, 0))
+        with pytest.raises(ValueError):
+            arm.place(pose="bin_a", approach_height_m=0.5)
+
+
+def test_place_unsupported(armd):
+    with open_arm(armd) as arm:  # capabilities version 5
+        with pytest.raises(UnsupportedError):
+            arm.place(position=(0.2, 0, 0.1))
+    armd.devplat = True
+    armd.place_cap = False
+    with open_arm(armd) as arm:
+        with pytest.raises(UnsupportedError):
+            arm.place(pose="x")
+
+
+def test_sigterm_handler_installed_and_restored(armd):
+    import signal
+
+    before = signal.getsignal(signal.SIGTERM)
+    arm = open_arm(armd)
+    handler = signal.getsignal(signal.SIGTERM)
+    assert handler is not before
+    with pytest.raises(SystemExit) as info:
+        handler(signal.SIGTERM, None)
+    assert info.value.code == 143
+    arm.close()
+    assert signal.getsignal(signal.SIGTERM) is before
+    with open_arm(armd, handle_sigterm=False) as arm2:
+        assert signal.getsignal(signal.SIGTERM) is before
+
+
+def test_sigterm_not_installed_off_main_thread(armd):
+    import signal
+    import threading
+
+    before = signal.getsignal(signal.SIGTERM)
+    out = []
+
+    def run():
+        with open_arm(armd) as arm:
+            out.append(signal.getsignal(signal.SIGTERM) is before)
+
+    t = threading.Thread(target=run)
+    t.start()
+    t.join()
+    assert out == [True]

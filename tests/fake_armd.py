@@ -110,6 +110,7 @@ class FakeArmd:
         self.acquires: list[tuple[str, bool]] = []  # (client_id, force) per acquire_lease
         # developer platform (capabilities version 6)
         self.devplat = False
+        self.place_cap = True
         self.poses: dict[str, dict] = {}
         self.prev_action: dict | None = None
         self.prev_action_at = 0.0
@@ -162,6 +163,7 @@ class FakeArmd:
         caps = {"version": 5, "cartesian": True, "gripper": True, "grasp": True}
         if self.devplat:
             caps.update(version=6, obs_rate=True, fault_codes=True, poses=True, keepout=True)
+            caps.update(place=self.place_cap)
             caps.update(speed_cap=False, residual_torques=True, tick_stats=False)
         return caps
 
@@ -320,6 +322,13 @@ class FakeArmd:
             pose = self.poses.get(body.get("name"))
             if pose is None:
                 return 404, "POSE_NOT_FOUND"
+        elif kind == "place":
+            if not (self.devplat and self.place_cap):
+                return 400, "INVALID_COMMAND"
+            if (body.get("pose") is None) == (body.get("position") is None):
+                return 400, "INVALID_COMMAND"
+            if body.get("pose") is not None and body["pose"] not in self.poses:
+                return 404, "POSE_NOT_FOUND"
         elif kind == "grasp":
             if not isinstance(body.get("label"), str) or len(body.get("box_norm") or []) != 4:
                 return 400, "INVALID_COMMAND"
@@ -339,6 +348,8 @@ class FakeArmd:
             target = list(pose["positions"])
             if not body.get("include_gripper"):
                 target[6] = self.positions[6]
+        elif kind == "place":
+            target[6] = GRIP_OPEN if body.get("release", True) else self.positions[6]
         elif kind == "grasp":
             grasp = True
             contact = self.gripper_contact

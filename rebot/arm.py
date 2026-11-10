@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import atexit
 import os
+import signal
 import threading
 import time
 from typing import Any, Callable, List, Optional, Sequence, Union
@@ -73,6 +74,9 @@ class Arm:
     ``park_on_exit``: on :meth:`close` (end of the ``with`` block) park the arm with torque off.
     ``force``: take control even if the web cockpit holds it (armd still applies its cooldown).
     ``obs_hz``: observations per second from armd (used only when armd supports ``obs_rate``).
+    ``handle_sigterm``: in the main thread, turn SIGTERM into ``SystemExit`` so the ``with`` block
+    parks and releases control (the device app runner stops apps with SIGTERM); the previous
+    handler is restored on :meth:`close`.
     """
 
     def __init__(
@@ -86,6 +90,7 @@ class Arm:
         client_id: Optional[str] = None,
         timeout: float = 5.0,
         transport: Any = None,
+        handle_sigterm: bool = True,
     ) -> None:
         self.url = _base_url(host, port)
         self.park_on_exit = park_on_exit
@@ -99,6 +104,8 @@ class Arm:
         self._guard_tripped = False
         self._guard_stop = threading.Event()
         self._guard_thread: Optional[threading.Thread] = None
+        self._sigterm_handler: Any = None
+        self._prev_sigterm: Any = None
         try:
             self.schema: ObservationSchema = self.client.get_schema()
         except RebotError as exc:
@@ -112,6 +119,8 @@ class Arm:
         self.session._schema = self.schema  # already fetched
         self.session.open()
         atexit.register(self.close)
+        if handle_sigterm:
+            self._install_sigterm()
         try:
             if enable:
                 self.enable()
@@ -127,9 +136,33 @@ class Arm:
     def __exit__(self, *exc: Any) -> None:
         self.close()
 
+    def _install_sigterm(self) -> None:
+        if threading.current_thread() is not threading.main_thread():
+            return
+
+        def on_sigterm(signum: int, frame: Any) -> None:
+            raise SystemExit(128 + signum)
+
+        try:
+            self._prev_sigterm = signal.signal(signal.SIGTERM, on_sigterm)
+            self._sigterm_handler = on_sigterm
+        except (ValueError, OSError):  # pragma: no cover - no signal support here
+            self._sigterm_handler = None
+
+    def _restore_sigterm(self) -> None:
+        handler, self._sigterm_handler = self._sigterm_handler, None
+        if handler is None or threading.current_thread() is not threading.main_thread():
+            return
+        try:
+            if signal.getsignal(signal.SIGTERM) is handler:  # someone else's handler stays
+                signal.signal(signal.SIGTERM, self._prev_sigterm if self._prev_sigterm is not None else signal.SIG_DFL)
+        except (ValueError, OSError):  # pragma: no cover
+            pass
+
     def close(self) -> None:
         """Park (when ``park_on_exit``) and release control. Safe to call more than once."""
         atexit.unregister(self.close)
+        self._restore_sigterm()
         self._guard_stop.set()
         s = self.session
         if s._ws is None:
@@ -355,6 +388,39 @@ class Arm:
         return self._motion(
             lambda: self.session.grasp(label, box_norm, frame_id=frame_id, ts_ms=ts_ms, timeout=timeout),
             f"grasp of '{label}'",
+        )
+
+    def place(
+        self,
+        pose: Optional[str] = None,
+        position: Optional[Sequence[float]] = None,
+        rpy: Optional[Sequence[float]] = None,
+        approach_height_m: float = 0.08,
+        release: bool = True,
+        retreat: bool = True,
+        speed_scale: float = 1.0,
+        timeout: Optional[float] = None,
+    ) -> ActionResult:
+        """Put the held object down: lift, move above the target, descend, open the gripper, retreat.
+
+        Target: a saved pose name (``pose="bin_a"``; its gripper position is the place point) or
+        ``position=(x, y, z)`` metres. ``rpy`` sets the orientation (radians). ``release=False``
+        keeps the object, ``retreat=False`` stays at the place point. Needs an armd with the
+        ``place`` capability (:class:`UnsupportedError` otherwise).
+        """
+        what = f"place at pose '{pose}'" if pose is not None else f"place at {_fmt(position or ())}"
+        return self._motion(
+            lambda: self.session.place(
+                pose=pose,
+                position=position,
+                rpy=rpy,
+                approach_height_m=approach_height_m,
+                release=release,
+                retreat=retreat,
+                speed_scale=speed_scale,
+                timeout=timeout,
+            ),
+            what,
         )
 
     def stop(self) -> None:
