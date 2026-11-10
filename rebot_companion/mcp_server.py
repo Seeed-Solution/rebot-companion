@@ -30,6 +30,7 @@ import functools
 import json
 import logging
 import math
+import re
 import sys
 import threading
 import time
@@ -39,7 +40,7 @@ from typing import Annotated, Any, Literal
 import anyio
 from mcp.server.mcpserver import Image, MCPServer
 from mcp.types import CallToolResult, TextContent
-from pydantic import Field
+from pydantic import BaseModel, Field
 from scipy.spatial.transform import Rotation
 
 from rebot.client import (
@@ -56,6 +57,7 @@ from rebot.client import (
     MotionTimeout,
 )
 from rebot.detection import DetectionClient, DetectorUnavailable, parse_detections
+from rebot.errors import UnsupportedError
 
 from . import kinematics
 from .snapshot import (
@@ -76,6 +78,15 @@ MAX_ROT_DEG = 90.0
 
 # Tool argument types (module level: annotations are evaluated from module globals).
 Speed = Annotated[float | None, Field(gt=0, le=MAX_LINEAR_MPS, description="linear speed, m/s (default 0.05)")]
+Vec3 = Annotated[list[float], Field(min_length=3, max_length=3)]
+
+
+class KeepoutBox(BaseModel):
+    name: str = Field(min_length=1, max_length=64)
+    min_m: Vec3
+    max_m: Vec3
+
+
 Step = Annotated[float | None, Field(ge=-MAX_STEP_M, le=MAX_STEP_M)]
 Rot = Annotated[float | None, Field(ge=-MAX_ROT_DEG, le=MAX_ROT_DEG)]
 
@@ -94,11 +105,19 @@ HINTS = {
     "TRACKING_STALL": "arm may be blocked; check with snapshot",
     "EPOCH_MISMATCH": "the arm was e-stopped or faulted meanwhile; check get_state",
     "BUSY": "another motion tool call is still running",
+    "POSE_NOT_FOUND": "call list_poses; teach the pose with save_pose or in the web cockpit",
+    "PLACE_TIMEOUT": "the place did not finish; stop was sent; check the scene with snapshot",
+    "UNSUPPORTED": "update rebot-armd on the device",
 }
+
+POSE_NAME = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 INSTRUCTIONS_BASE = """Controls a reBot B601-DM arm through rebot-armd, plus the wrist/scene camera.
 Coordinates: metres in the arm base frame (x forward, y left, z up); poses are of end_link.
-Use snapshot / snapshot_annotated / detect to look before moving. stop and e_stop always work."""
+Use snapshot / snapshot_annotated / detect to look before moving. stop and e_stop always work.
+Named poses (list_poses, save_pose, move_to_pose) and place need a recent armd; save_pose and
+set_keepout change the device's saved configuration, so use them only when the user asks.
+recover clears only faults armd marks recoverable."""
 
 
 def build_instructions(allow_clear_fault: bool, allow_preempt: bool) -> str:
@@ -163,6 +182,8 @@ def map_exception(exc: BaseException) -> ToolFail | None:
     """SDK / snapshot exceptions -> ToolFail; None for unexpected errors."""
     if isinstance(exc, ToolFail):
         return exc
+    if isinstance(exc, UnsupportedError):
+        return ToolFail("UNSUPPORTED", str(exc))
     if isinstance(exc, ActionFailed):
         hint = None
         if exc.code == "FAULT":
@@ -351,6 +372,7 @@ class Controller:
                 "torques": [_r(v) for v in obs.torques],
                 "temperatures": [_r(v, 1) for v in obs.temperatures],
             },
+            "fault": obs.fault,
             "tcp": tcp_dict(obs.positions),
             "gripper": None if grip is None else {"rad": _r(grip), "fraction": _r(gripper_fraction(grip), 3)},
             "action": obs.action.to_dict() if obs.action else None,
@@ -453,6 +475,87 @@ class Controller:
     def clear_fault(self) -> dict:
         ack = self.actuator().clear_fault()
         return {"safety_state": ack.get("safety_state"), "epoch_id": ack.get("epoch_id")}
+
+    # ---- poses, place, keep-out, recovery (armd capabilities version 6) -------
+
+    def list_poses(self) -> dict:
+        poses = self.client.get_poses()
+        return {
+            "count": len(poses),
+            "poses": [
+                {"name": p["name"], "positions": [_r(v) for v in p["positions"]], "tcp": p.get("tcp")} for p in poses
+            ],
+        }
+
+    def save_pose(self, name: str) -> dict:
+        if not POSE_NAME.match(name):
+            raise ToolFail("INVALID_ARGUMENT", "name must be 1-64 characters: letters, digits, _ and -")
+        s = self.actuator()
+        s.save_pose(name)
+        return {"saved": name, "positions": [_r(v) for v in self.observation().positions]}
+
+    def move_to_pose(self, name: str, speed_scale: float) -> dict:
+        return self._action_dict(self.actuator().move_to_pose(name, speed_scale=speed_scale))
+
+    def place(
+        self,
+        pose: str | None,
+        x: float | None,
+        y: float | None,
+        z: float | None,
+        rpy_deg: list[float] | None,
+        approach_height_m: float,
+        release: bool,
+        retreat: bool,
+        speed_scale: float,
+        timeout_s: float | None,
+    ) -> dict:
+        xyz = [x, y, z]
+        if pose is not None and any(v is not None for v in xyz):
+            raise ToolFail("INVALID_ARGUMENT", "give pose or x, y, z, not both")
+        if pose is None and any(v is None for v in xyz):
+            raise ToolFail("INVALID_ARGUMENT", "give a pose name, or all of x, y, z")
+        s = self.actuator()
+        res = s.place(
+            pose=pose,
+            position=None if pose is not None else xyz,
+            rpy=None if rpy_deg is None else [math.radians(v) for v in rpy_deg],
+            approach_height_m=approach_height_m,
+            release=release,
+            retreat=retreat,
+            speed_scale=speed_scale,
+            timeout=timeout_s,
+        )
+        return self._action_dict(res)
+
+    def get_keepout(self) -> dict:
+        return self.client.get_keepout()
+
+    def set_keepout(self, boxes: list[dict]) -> dict:
+        self.actuator().set_keepout(boxes)
+        return self.client.get_keepout()
+
+    def recover(self) -> dict:
+        """Clear a fault armd marks recoverable and re-enable torque; refuses everything else."""
+        s = self.actuator()
+        obs = s.wait_for_observation(timeout=2.0)
+        if not obs.is_stopped:
+            return {"recovered": False, "safety_state": obs.safety_state, "note": "no fault to recover from"}
+        human = "ask the user to check the arm and clear the fault in the web cockpit"
+        if not s.schema().has("fault_codes"):
+            raise ToolFail(
+                "NOT_RECOVERABLE", f"armd reports no fault codes, so {obs.safety_state} is not cleared here", human
+            )
+        if not obs.recoverable:
+            msg = (obs.fault or {}).get("message") or obs.safety_state
+            raise ToolFail("NOT_RECOVERABLE", f"{obs.fault_code or obs.safety_state}: {msg}", human)
+        code = obs.fault_code
+        s.clear_fault()
+        s._wait_until(
+            s._frames, lambda o: not o.is_stopped and o.feedback_valid, 3.0, "fresh feedback", check_stopped=False
+        )
+        ack = s.torque(True)
+        return {"recovered": True, "cleared": code, "safety_state": ack.get("safety_state")}
 
     def snapshot(self, max_width: int, quality: int) -> list:
         snap = self.grabber.snapshot(jpeg_quality=quality, max_width=max_width)
@@ -659,6 +762,71 @@ def build_server(ctrl: Controller, allow_clear_fault: bool = False, allow_preemp
         @tool("Acquire the control lease when no other client holds it. Cannot take control from the web cockpit.")
         async def take_control() -> dict:
             return await run(ctrl.acquire, False)
+
+    # -- named poses, place, keep-out, recovery. Each needs an armd with the matching capability and
+    # returns UNSUPPORTED (with an update hint) otherwise.
+
+    @tool("Saved poses: {count, poses[{name, positions, tcp}]}. No lease needed. Needs armd capability 'poses'.")
+    async def list_poses() -> dict:
+        return await run(ctrl.list_poses)
+
+    @tool(
+        "CONFIGURATION CHANGE: save the arm's current joint positions under a name (letters, digits, _ and -, "
+        "max 64), replacing a pose with that name. Move the arm there first (the user can hand-guide it "
+        "or use the cockpit). Persisted on the device. Needs capability 'poses'."
+    )
+    async def save_pose(name: str) -> dict:
+        return await run(ctrl.save_pose, name)
+
+    @tool("Joint-space move to a saved pose; speed_scale 0.1..1.0 of the planned speed. Blocks until done.")
+    async def move_to_pose(name: str, speed_scale: Annotated[float, Field(ge=0.1, le=1.0)] = 0.5) -> dict:
+        return await motion(ctrl.move_to_pose, name, speed_scale)
+
+    @tool(
+        "Put the held object down: lift, move above the target, descend, open the gripper, retreat. Target: "
+        "a saved pose name (its gripper position is the place point) or x, y, z in m (base frame). "
+        "rpy_deg optionally sets the orientation [roll, pitch, yaw]. release=false keeps the object, "
+        "retreat=false stays at the target. Fails with IK_UNREACHABLE / WORKSPACE_VIOLATION (also for "
+        "keep-out boxes) / TRACKING_STALL / PLACE_TIMEOUT. Needs capability 'place'. Blocks until done."
+    )
+    async def place(
+        pose: str | None = None,
+        x: float | None = None,
+        y: float | None = None,
+        z: float | None = None,
+        rpy_deg: Annotated[list[float] | None, Field(min_length=3, max_length=3)] = None,
+        approach_height_m: Annotated[float, Field(ge=0.02, le=0.30)] = 0.08,
+        release: bool = True,
+        retreat: bool = True,
+        speed_scale: Annotated[float, Field(ge=0.1, le=1.0)] = 0.5,
+        timeout_s: Annotated[float | None, Field(gt=0, le=120)] = None,
+    ) -> dict:
+        return await motion(
+            ctrl.place, pose, x, y, z, rpy_deg, approach_height_m, release, retreat, speed_scale, timeout_s
+        )
+
+    @tool(
+        "Keep-out boxes the arm must not enter: {boxes[{name, min_m, max_m}], source}. "
+        "No lease needed. Needs capability 'keepout'."
+    )
+    async def get_keepout() -> dict:
+        return await run(ctrl.get_keepout)
+
+    @tool(
+        "CONFIGURATION CHANGE: replace the runtime keep-out boxes (max 16; min_m < max_m per axis, metres, base "
+        "frame). Motions into a box fail with WORKSPACE_VIOLATION. Pass [] to remove all. Persisted on the "
+        "device. Show the user the boxes before setting them. Needs capability 'keepout'."
+    )
+    async def set_keepout(boxes: Annotated[list[KeepoutBox], Field(max_length=16)]) -> dict:
+        return await motion(ctrl.set_keepout, [b.model_dump() for b in boxes])
+
+    @tool(
+        "Clear a fault that armd marks recoverable (WATCHDOG_TIMEOUT, CONTROL_DEADLINE, HANDOVER_UNSETTLED) "
+        "and turn torque on again. Any other fault or an E-stop returns NOT_RECOVERABLE and stays latched "
+        "for a person to clear in the web cockpit. Needs capability 'fault_codes'."
+    )
+    async def recover() -> dict:
+        return await motion(ctrl.recover)
 
     @tool("Release the control lease (the web cockpit will acquire it automatically).")
     async def release_control() -> dict:

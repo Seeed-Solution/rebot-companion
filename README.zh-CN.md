@@ -29,7 +29,7 @@
 
 ## 核心特性
 
-- **面向 AI Agent 的 stdio MCP 服务器（`rebot-mcp`）**：默认提供 14 个工具（状态、快照、检测、运动、夹爪、停止）。可用于支持 stdio 服务器的 MCP 客户端；端到端测试使用 Python `mcp` 客户端连接真机。清除故障和从驾驶舱接管默认关闭，需启动时显式开启（见 [MCP 服务器](#mcp-服务器agent-控制)）。
+- **面向 AI Agent 的 stdio MCP 服务器（`rebot-mcp`）**：默认提供 21 个工具（状态、快照、检测、运动、夹爪、停止、命名位姿、放置、禁入区、故障恢复）。可用于支持 stdio 服务器的 MCP 客户端；端到端测试使用 Python `mcp` 客户端连接真机。清除故障和从驾驶舱接管默认关闭，需启动时显式开启（见 [MCP 服务器](#mcp-服务器agent-控制)）。
 - **手眼标定**：眼在手外（闭式 Horn 点配准）与眼在手上（Park & Martin $AX=XB$），测试中与 OpenCV `CALIB_HAND_EYE_PARK` 交叉对比。精度仅在合成数据上验证，尚未在真机上实测。
 - **两阶段**：阶段 1 由 Agent 编排工具；阶段 2 为不依赖大模型的本地确定性抓放流水线。
 - **运动学**：完整 URDF 正运动学（测试中与独立 URDF 解析器相差 0.1 mm 以内）及 B601-DM 平面解析逆运动学。
@@ -432,9 +432,20 @@ claude mcp add rebot -- uv run --directory /path/to/rebot-companion --extra agen
 | `stop` | — | `{state}`；在其他工具运动时也可执行 |
 | `e_stop` | — | `{safety_state, epoch_id}`；不需要租约 |
 | `enable` | — | 开启力矩 |
+| `list_poses` | — | `{count, poses[{name, positions, tcp}]}`；不需要租约。需要 armd 能力 `poses` |
+| `save_pose` | `name`（字母、数字、`_`、`-`；最长 64） | 以 `name` 保存当前关节位置，同名位姿被替换。会修改设备上保存的位姿。能力 `poses` |
+| `move_to_pose` | `name`、`speed_scale`（0.1..1.0，默认 0.5） | 动作结果；关节空间运动。能力 `poses` |
+| `place` | `pose` 或 `x, y, z`；`rpy_deg`、`approach_height_m`（0.08，0.02..0.30）、`release`、`retreat`、`speed_scale`（0.5）、`timeout_s` | 动作结果；抬升、接近、下降、张开、撤离。能力 `place` |
+| `get_keepout` | — | `{boxes[{name, min_m, max_m}], source}`；不需要租约。能力 `keepout` |
+| `set_keepout` | `boxes`（最多 16 个） | 替换运行时禁入区（`[]` 为清空）。会修改设备配置。能力 `keepout` |
+| `recover` | — | 清除 armd 标为可恢复的故障（`WATCHDOG_TIMEOUT`、`CONTROL_DEADLINE`、`HANDOVER_UNSETTLED`）并重新开启力矩；其他故障和急停返回 `NOT_RECOVERABLE` 并保持锁定。能力 `fault_codes` |
 | `clear_fault` | — | 清除 EStop 或 Fault；仅在 `--allow-clear-fault` 时列出 |
 | `take_control` | `force`（仅在 `--allow-preempt` 时） | 获取空闲租约；带 `--allow-preempt` 时，`force=true` 从 Web 驾驶舱抢占控制 |
 | `release_control` | — | 释放租约；机械臂带力矩时，armd 看门狗会将其收纳 |
+
+`save_pose` 和 `set_keepout` 会写入设备（位姿和禁入区文件），默认已注册。
+需要能力的工具在 armd 版本较旧时返回 `UNSUPPORTED`，提示 "Update rebot-armd"。
+`recover` 不会清除急停或 armd 标为不可恢复的故障，因此不需要 `--allow-clear-fault`。
 
 表中的限制（速度 ≤ 0.15 m/s、步长 ≤ 0.30 m、旋转 ≤ 90 deg）由服务器的输入 schema 在调用到达 armd
 之前检查；armd 另有自己的限制。

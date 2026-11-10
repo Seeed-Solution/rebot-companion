@@ -34,6 +34,13 @@ TOOLS = {
     "enable",
     "take_control",
     "release_control",
+    "list_poses",
+    "save_pose",
+    "move_to_pose",
+    "place",
+    "get_keepout",
+    "set_keepout",
+    "recover",
 }
 
 
@@ -305,3 +312,62 @@ async def test_detect_with_pipelines(make_ctrl):
         assert TRIGGER_BODIES[-1] == {"pipelines": ["yolo"]}
         res = await c.call_tool("detect", {"pipelines": "video"})
         assert res.is_error
+
+
+@pytest.mark.asyncio
+async def test_poses_place_keepout_tools(armd, make_ctrl):
+    armd.devplat = True
+    async with Client(build_server(make_ctrl())) as c:
+        await c.call_tool("enable", {})
+        assert body(await c.call_tool("list_poses", {}))["count"] == 0
+        assert body(await c.call_tool("save_pose", {"name": "bin_a"}))["saved"] == "bin_a"
+        assert body(await c.call_tool("save_pose", {"name": "bad name"}))["code"] == "INVALID_ARGUMENT"
+        assert body(await c.call_tool("list_poses", {}))["poses"][0]["name"] == "bin_a"
+        r = body(await c.call_tool("move_to_pose", {"name": "bin_a", "speed_scale": 0.3}))
+        assert r["kind"] == "move_to_pose" and armd.action_bodies[-1][1]["speed_scale"] == 0.3
+        assert body(await c.call_tool("move_to_pose", {"name": "nope"}))["code"] == "POSE_NOT_FOUND"
+        r = body(await c.call_tool("place", {"pose": "bin_a"}))
+        assert r["kind"] == "place" and armd.action_bodies[-1][1]["pose"] == "bin_a"
+        await c.call_tool("place", {"x": 0.2, "y": 0.0, "z": 0.05, "rpy_deg": [0, 90, 0], "release": False})
+        sent = armd.action_bodies[-1][1]
+        assert sent["position"] == [0.2, 0.0, 0.05] and sent["release"] is False
+        assert sent["orientation"]["rpy"][1] == pytest.approx(1.5708, abs=1e-3)
+        assert body(await c.call_tool("place", {}))["code"] == "INVALID_ARGUMENT"
+        assert body(await c.call_tool("place", {"pose": "a", "x": 1, "y": 0, "z": 0}))["code"] == "INVALID_ARGUMENT"
+        box = {"name": "wall", "min_m": [0.3, -0.1, 0.0], "max_m": [0.4, 0.1, 0.3]}
+        assert body(await c.call_tool("set_keepout", {"boxes": [box]}))["boxes"] == [box]
+        assert body(await c.call_tool("get_keepout", {}))["boxes"] == [box]
+        assert (
+            await c.call_tool("set_keepout", {"boxes": [{"name": "x", "min_m": [0, 0], "max_m": [1, 1, 1]}]})
+        ).is_error
+
+
+@pytest.mark.asyncio
+async def test_new_tools_report_old_armd(armd, make_ctrl):
+    async with Client(build_server(make_ctrl())) as c:  # capabilities version 5
+        for tool, args in (
+            ("list_poses", {}),
+            ("save_pose", {"name": "a"}),
+            ("move_to_pose", {"name": "a"}),
+            ("place", {"pose": "a"}),
+            ("get_keepout", {}),
+        ):
+            err = body(await c.call_tool(tool, args))
+            assert err["code"] == "UNSUPPORTED" and "Update rebot-armd" in err["message"], tool
+
+
+@pytest.mark.asyncio
+async def test_recover_only_for_recoverable_faults(armd, make_ctrl):
+    armd.devplat = True
+    async with Client(build_server(make_ctrl())) as c:
+        await c.call_tool("enable", {})
+        assert body(await c.call_tool("recover", {}))["recovered"] is False
+        armd.trigger_fault("FollowingError")
+        err = body(await c.call_tool("recover", {}))
+        assert err["code"] == "NOT_RECOVERABLE" and "web cockpit" in err["hint"]
+        assert armd.state == "Fault"
+        armd.state, armd.fault = "Armed", None
+        armd.trigger_fault("WatchdogTimeout")
+        ok = body(await c.call_tool("recover", {}))
+        assert ok["recovered"] is True and ok["cleared"] == "WATCHDOG_TIMEOUT"
+        assert armd.state == "Armed"

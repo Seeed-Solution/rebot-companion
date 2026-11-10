@@ -29,7 +29,7 @@ Python SDK and stdio [MCP](https://modelcontextprotocol.io) server bridging **Se
 
 ## Key Features
 
-- **Stdio MCP server for AI agents (`rebot-mcp`)**: 14 tools by default (state, snapshots, detection, motion, gripper, stop). Works with MCP clients that support stdio servers; end-to-end tests used the Python `mcp` client against a real arm. Fault clearing and cockpit takeover are off unless enabled at launch (see [MCP server](#mcp-server-agent-control)).
+- **Stdio MCP server for AI agents (`rebot-mcp`)**: 21 tools by default (state, snapshots, detection, motion, gripper, stop, named poses, place, keep-out boxes, fault recovery). Works with MCP clients that support stdio servers; end-to-end tests used the Python `mcp` client against a real arm. Fault clearing and cockpit takeover are off unless enabled at launch (see [MCP server](#mcp-server-agent-control)).
 - **Hand-eye calibration**: eye-to-hand (closed-form Horn point registration) and eye-in-hand (Park & Martin $AX=XB$), cross-checked against OpenCV `CALIB_HAND_EYE_PARK` in the tests. Accuracy is verified on synthetic data only; it has not been measured on a real arm yet.
 - **Two stages**: Stage 1, an agent orchestrates the tools; Stage 2, a deterministic local pick-and-place pipeline that needs no LLM.
 - **Kinematics**: full URDF forward kinematics (within 0.1 mm of an independent URDF parser in the tests) and an analytic planar inverse kinematics solver for the B601-DM.
@@ -453,9 +453,20 @@ Tools:
 | `stop` | — | `{state}`; runs while another tool is moving |
 | `e_stop` | — | `{safety_state, epoch_id}`; no lease needed |
 | `enable` | — | torque on |
+| `list_poses` | — | `{count, poses[{name, positions, tcp}]}`; no lease needed. Needs armd capability `poses` |
+| `save_pose` | `name` (letters, digits, `_`, `-`; max 64) | saves the current joint positions under `name`, replacing a pose of that name. Changes the device's saved poses. Capability `poses` |
+| `move_to_pose` | `name`, `speed_scale` (0.1..1.0, default 0.5) | action result; joint-space move. Capability `poses` |
+| `place` | `pose` or `x, y, z`; `rpy_deg`, `approach_height_m` (0.08, 0.02..0.30), `release`, `retreat`, `speed_scale` (0.5), `timeout_s` | action result; lift, approach, descend, open, retreat. Capability `place` |
+| `get_keepout` | — | `{boxes[{name, min_m, max_m}], source}`; no lease needed. Capability `keepout` |
+| `set_keepout` | `boxes` (max 16) | replaces the runtime keep-out boxes (`[]` removes them). Changes the device configuration. Capability `keepout` |
+| `recover` | — | clears a fault armd marks recoverable (`WATCHDOG_TIMEOUT`, `CONTROL_DEADLINE`, `HANDOVER_UNSETTLED`) and re-enables torque; any other fault or E-stop returns `NOT_RECOVERABLE` and stays latched. Capability `fault_codes` |
 | `clear_fault` | — | clear EStop or Fault; listed only with `--allow-clear-fault` |
 | `take_control` | `force` (only with `--allow-preempt`) | acquire a free lease; with `--allow-preempt`, `force=true` takes control from the web cockpit |
 | `release_control` | — | release the lease; if the arm is torqued, armd's watchdog parks it |
+
+`save_pose` and `set_keepout` write to the device (poses and keep-out files) and are registered by default.
+Tools that need a capability return `UNSUPPORTED` with the message "Update rebot-armd" when armd is older.
+`recover` never clears an E-stop or a fault armd marks not recoverable, so it does not need `--allow-clear-fault`.
 
 The limits in the table (speed ≤ 0.15 m/s, step ≤ 0.30 m, rotation ≤ 90 deg) are checked by
 the server's input schema before a call reaches armd; armd applies its own limits as well.

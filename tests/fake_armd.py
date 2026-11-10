@@ -111,6 +111,7 @@ class FakeArmd:
         # developer platform (capabilities version 6)
         self.devplat = False
         self.place_cap = True
+        self.keepout: list[dict] = []
         self.poses: dict[str, dict] = {}
         self.prev_action: dict | None = None
         self.prev_action_at = 0.0
@@ -712,6 +713,12 @@ class FakeArmd:
                 return 400, "INVALID_COMMAND"
             self.poses[name] = {"name": name, "positions": positions, "tcp": None, "saved_at_ms": 1}
             return None
+        if path == "/api/v1/workspace/keepout":
+            boxes = body.get("boxes")
+            if not self.devplat or not isinstance(boxes, list) or len(boxes) > 16:
+                return 400, "INVALID_COMMAND"
+            self.keepout = [dict(b) for b in boxes]
+            return None
         if path == "/api/v1/motion/stop":
             self.cancel_reason = "STOPPED"
             self.stop_motion()
@@ -753,6 +760,8 @@ class FakeArmd:
                 )
             if method == "GET" and path == "/api/v1/poses" and self.devplat:
                 return Response(200, json={"poses": list(self.poses.values())})
+            if method == "GET" and path == "/api/v1/workspace/keepout" and self.devplat:
+                return Response(200, json={"boxes": self.keepout, "source": "runtime" if self.keepout else "profile"})
             if method == "GET" and path == "/api/v1/vision/mode":
                 return Response(200, json={"api_version": 2, "mode": "off", "per_request_pipelines": True})
             if method == "POST" and path == "/api/v1/detection/trigger":

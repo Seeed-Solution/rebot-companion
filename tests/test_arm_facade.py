@@ -322,7 +322,7 @@ def test_sigterm_handler_installed_and_restored(armd):
     assert info.value.code == 143
     arm.close()
     assert signal.getsignal(signal.SIGTERM) is before
-    with open_arm(armd, handle_sigterm=False) as arm2:
+    with open_arm(armd, handle_sigterm=False):
         assert signal.getsignal(signal.SIGTERM) is before
 
 
@@ -334,7 +334,7 @@ def test_sigterm_not_installed_off_main_thread(armd):
     out = []
 
     def run():
-        with open_arm(armd) as arm:
+        with open_arm(armd):
             out.append(signal.getsignal(signal.SIGTERM) is before)
 
     t = threading.Thread(target=run)
