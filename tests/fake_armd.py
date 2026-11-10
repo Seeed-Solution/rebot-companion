@@ -41,12 +41,12 @@ import json
 import threading
 import time
 
-import httpx
 import pytest
+from http_mock import MockTransport, Request, Response
 from websockets.exceptions import ConnectionClosed
 from websockets.sync.server import serve
 
-from rebot_companion.arm_client import ArmdClient
+from rebot.client import ArmdClient
 
 DOF = 7
 HOME = [0.0, 0.0, 0.0, 0.0, 0.0, 1.5707963, 0.0]
@@ -638,14 +638,14 @@ class FakeArmd:
         self.epoch += 1
         self.stop_motion()
 
-    # ---- REST (served through httpx.MockTransport) -------------------------
-    def rest(self, request: httpx.Request) -> httpx.Response:
+    # ---- REST (served through MockTransport) -------------------------
+    def rest(self, request: Request) -> Response:
         path, method = request.url.path, request.method
         with self.lock:
             if method == "GET" and path == "/api/v1/observation":
-                return httpx.Response(200, json=self.observation())
+                return Response(200, json=self.observation())
             if method == "GET" and path == "/api/v1/observation/schema":
-                return httpx.Response(
+                return Response(
                     200,
                     json={
                         "dof": DOF,
@@ -665,11 +665,11 @@ class FakeArmd:
                 )
             if method == "POST" and path == "/api/v1/safety/e_stop":
                 self.do_estop()
-                return httpx.Response(200, json={"safety_state": self.state, "epoch_id": self.epoch})
+                return Response(200, json={"safety_state": self.state, "epoch_id": self.epoch})
             if method == "POST":
                 code = "LEASE_ACTIVE" if self.lease else "LEASE_REQUIRED"
-                return httpx.Response(409, json={"error": code, "code": code, "message": "Use the WebSocket lease"})
-        return httpx.Response(404)
+                return Response(409, json={"error": code, "code": code, "message": "Use the WebSocket lease"})
+        return Response(404)
 
     def stop(self) -> None:
         self._stop.set()
@@ -683,7 +683,7 @@ def armd():
     threading.Thread(target=server.serve_forever, daemon=True).start()
     threading.Thread(target=fake.run_ticker, daemon=True).start()
     fake.url = f"http://127.0.0.1:{port}"
-    fake.client = ArmdClient(fake.url, transport=httpx.MockTransport(fake.rest))
+    fake.client = ArmdClient(fake.url, transport=MockTransport(fake.rest))
     yield fake
     fake.stop()
     server.shutdown()

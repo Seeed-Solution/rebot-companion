@@ -7,8 +7,8 @@ import base64
 import json
 import threading
 
-import httpx
 import pytest
+from http_mock import MockTransport, Request, Response
 
 pytest.importorskip("mcp")
 
@@ -40,13 +40,13 @@ TOOLS = {
 TRIGGER_BODIES: list = []
 
 
-def detector_transport() -> httpx.MockTransport:
-    def handler(req: httpx.Request) -> httpx.Response:
+def detector_transport() -> MockTransport:
+    def handler(req: Request) -> Response:
         if req.url.path == "/api/v1/vision/mode":
-            return httpx.Response(200, json={"api_version": 2, "mode": "off", "per_request_pipelines": True})
+            return Response(200, json={"api_version": 2, "mode": "off", "per_request_pipelines": True})
         if req.url.path == "/api/v1/detection/trigger":
             TRIGGER_BODIES.append(json.loads(req.content) if req.content else None)
-            return httpx.Response(
+            return Response(
                 200,
                 json={
                     "success": True,
@@ -57,12 +57,10 @@ def detector_transport() -> httpx.MockTransport:
                 },
             )
         if req.url.path == "/api/v1/detection/latest":
-            return httpx.Response(
-                200, json={"enabled": False, "frame_id": 4, "ts_ms": 1_762_000_000_000, "detections": []}
-            )
-        return httpx.Response(404)
+            return Response(200, json={"enabled": False, "frame_id": 4, "ts_ms": 1_762_000_000_000, "detections": []})
+        return Response(404)
 
-    return httpx.MockTransport(handler)
+    return MockTransport(handler)
 
 
 @pytest.fixture
