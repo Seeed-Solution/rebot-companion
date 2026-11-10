@@ -29,7 +29,7 @@ Python SDK and stdio [MCP](https://modelcontextprotocol.io) server bridging **Se
 
 ## Key Features
 
-- **Stdio MCP server for AI agents (`rebot-mcp`)**: 21 tools by default (state, snapshots, detection, motion, gripper, stop, named poses, place, keep-out boxes, fault recovery). Works with MCP clients that support stdio servers; end-to-end tests used the Python `mcp` client against a real arm. Fault clearing and cockpit takeover are off unless enabled at launch (see [MCP server](#mcp-server-agent-control)).
+- **Stdio MCP server for AI agents (`rebot-mcp`)**: 23 tools by default (state, snapshots, detection, motion, gripper, stop, named poses, place, keep-out boxes, fault recovery, collision guard). Works with MCP clients that support stdio servers; end-to-end tests used the Python `mcp` client against a real arm. Fault clearing and cockpit takeover are off unless enabled at launch (see [MCP server](#mcp-server-agent-control)).
 - **Hand-eye calibration**: eye-to-hand (closed-form Horn point registration) and eye-in-hand (Park & Martin $AX=XB$), cross-checked against OpenCV `CALIB_HAND_EYE_PARK` in the tests. Accuracy is verified on synthetic data only; it has not been measured on a real arm yet.
 - **Two stages**: Stage 1, an agent orchestrates the tools; Stage 2, a deterministic local pick-and-place pipeline that needs no LLM.
 - **Kinematics**: full URDF forward kinematics (within 0.1 mm of an independent URDF parser in the tests) and an analytic planar inverse kinematics solver for the B601-DM.
@@ -228,6 +228,8 @@ ssh <user>@192.168.42.1 'cd ~/arm && python3 main.py'
 | `poses()`, `save_pose(name)`, `delete_pose(name)`, `move_to_pose(name, speed_scale=1.0)` | named poses stored in armd |
 | `place(pose=None, position=None, rpy=None, approach_height_m=0.08, release=True, retreat=True, speed_scale=1.0)` | put the held object down: lift, approach, descend, open, retreat (capability `place`) |
 | `stop()`, `e_stop()` | stop and hold; latched emergency stop |
+| `wait_until_clear(timeout_s=10)` | after a `COLLISION` action failure: block until the arm has resumed (capability `collision_guard`) |
+| `set_collision_guard(enabled=None, sensitivity=None)`, `collision_guard()` | switch the collision guard, set `"low"`/`"medium"`/`"high"`, read its configuration (capability `collision_guard`) |
 | `recover(max_attempts=1)` | clear a fault that armd marks recoverable, then torque on |
 | `guard(timeout_s)`, `feed()` | release control when the main loop stops calling `feed()` |
 
@@ -467,13 +469,18 @@ Tools:
 | `get_keepout` | — | `{boxes[{name, min_m, max_m}], source}`; no lease needed. Capability `keepout` |
 | `set_keepout` | `boxes` (max 16) | replaces the runtime keep-out boxes (`[]` removes them). Changes the device configuration. Capability `keepout` |
 | `recover` | — | clears a fault armd marks recoverable (`WATCHDOG_TIMEOUT`, `CONTROL_DEADLINE`, `HANDOVER_UNSETTLED`) and re-enables torque; any other fault or E-stop returns `NOT_RECOVERABLE` and stays latched. Capability `fault_codes` |
+| `collision_guard_status` | — | `{enabled, sensitivity, thresholds_nm}`; no lease needed. `get_state.collision` shows a stop in progress. Capability `collision_guard` |
+| `set_collision_guard` | `enabled`, `sensitivity` (`low`/`medium`/`high`) | switches the collision guard and/or sets its sensitivity. Changes the device configuration. Capability `collision_guard` |
 | `clear_fault` | — | clear EStop or Fault; listed only with `--allow-clear-fault` |
 | `take_control` | `force` (only with `--allow-preempt`) | acquire a free lease; with `--allow-preempt`, `force=true` takes control from the web cockpit |
 | `release_control` | — | release the lease; if the arm is torqued, armd's watchdog parks it |
 
 `save_pose` and `set_keepout` write to the device (poses and keep-out files) and are registered by default.
 Tools that need a capability return `UNSUPPORTED` with the message "Update rebot-armd" when armd is older.
-`recover` never clears an E-stop or a fault armd marks not recoverable, so it does not need `--allow-clear-fault`.
+`recover` never clears an E-stop or a fault armd marks not recoverable (including a `COLLISION` fault), so it does not need `--allow-clear-fault`.
+`save_pose`, `set_keepout` and `set_collision_guard` write to the device; use them when the user asks.
+
+Collision guard: with the guard on, contact makes armd stop the arm and hold it. Running actions fail with `COLLISION`, motion commands are refused with `COLLISION_HOLD`, and the arm resumes by itself when the contact is gone. After repeated trips within a minute armd latches a `COLLISION` fault that a person clears in the cockpit. The guard is off by default and its thresholds are uncalibrated placeholders (not measured on a real arm). Both example templates wait with `wait_until_clear()` and retry the step once.
 
 The limits in the table (speed ≤ 0.15 m/s, step ≤ 0.30 m, rotation ≤ 90 deg) are checked by
 the server's input schema before a call reaches armd; armd applies its own limits as well.

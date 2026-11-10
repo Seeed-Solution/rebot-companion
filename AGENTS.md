@@ -64,9 +64,11 @@ with Arm() as arm:                     # $REBOT_HOST or 127.0.0.1; takes control
 | `detect(label=None, pipelines=("yolo",), min_score=0.3)` | list of `Detection` |
 | `grasp(detection)` | `result.holding` is True when an object is held |
 | `gripper_open()`, `gripper_close(grasp=True)`, `gripper_move(fraction)` | 0 closed .. 1 open |
-| `state()` | `positions`, `safety_state`, `is_torqued`, `fault`, `action` |
+| `state()` | `positions`, `safety_state`, `is_torqued`, `fault`, `action`, `collision` |
 | `stop()`, `e_stop()` | stop and hold; latched emergency stop |
 | `recover()` | clears only faults armd marks recoverable, then torque on |
+| `wait_until_clear(timeout_s=10)` | after `COLLISION`: blocks until the arm has resumed; raises `ArmFaultError` (code `COLLISION`) after repeated collisions; capability `collision_guard` |
+| `set_collision_guard(enabled=None, sensitivity=None)`, `collision_guard()` | switch the guard / set `"low"`, `"medium"`, `"high"`; read the configuration; capability `collision_guard` |
 | `guard(timeout_s)`, `feed()` | release control if `feed()` is not called for `timeout_s`; call `feed()` once per loop cycle |
 | `capabilities` | dict of armd capabilities; version 6 has `poses`, `place`, `fault_codes`, `keepout` |
 
@@ -80,6 +82,15 @@ Every call blocks until armd reports the result and raises a `RebotError` subcla
   `HANDOVER_UNSETTLED`) and raises `ArmFaultError` for anything else. When it raises, the script
   stops and tells the user to check the arm and clear the fault in the web cockpit. Do not retry in
   a loop and do not work around it (for example with `--allow-clear-fault` in the MCP server).
+- **Collision guard** (capability `collision_guard`). With the guard on, contact stops the arm and holds
+  it; the arm resumes by itself once the contact is gone, and motion commands are refused with
+  `COLLISION_HOLD` meanwhile. The action that was running fails with `COLLISION`. In a program: catch
+  `ActionFailed` with `code == "COLLISION"`, call `arm.wait_until_clear()`, retry the step once, and stop
+  if it fails again. After repeated trips armd latches a `COLLISION` fault: `arm.recover()` refuses it;
+  stop and ask the user to check the workspace and clear the fault in the cockpit. The guard is **off by
+  default** and its thresholds are **uncalibrated placeholders** (not measured on a real arm); do not
+  rely on it as protection. Switching it on (`set_collision_guard`) is a configuration change: do it only
+  when the user asks.
 - **Speed.** Use `speed_scale` <= 0.5 for the first real runs of any new script or pose, 0.3 when
   the arm moves near people, bins or the table. Raise it only after a successful run.
 - **Always `with Arm() as arm:`.** It parks and releases control on errors, Ctrl+C and SIGTERM. Do not
@@ -109,7 +120,10 @@ Every call blocks until armd reports the result and raises a `RebotError` subcla
 | `NOT_ARMED` | torque is off | `enable()` (the `Arm` methods do this themselves after a park) |
 | `UNSUPPORTED` | armd lacks the capability | tell the user to update rebot-armd on the device |
 | `WATCHDOG_TIMEOUT`, `CONTROL_DEADLINE`, `HANDOVER_UNSETTLED` | recoverable faults | `arm.recover()`, then continue |
-| `FOLLOWING_ERROR` | arm could not follow the command; the only collision indicator | stop; the user checks the arm and clears it in the cockpit |
+| `COLLISION` (action failed) | the guard stopped the arm on contact; it resumes by itself | `arm.wait_until_clear()`, retry the step once; stop if it happens again |
+| `COLLISION_HOLD` (command rejected) | the arm is holding after a collision | `arm.wait_until_clear()`, then send the command again |
+| `COLLISION` (fault, `ArmFaultError`) | repeated collisions latched a fault; not recoverable | stop; the user checks the workspace and clears it in the cockpit |
+| `FOLLOWING_ERROR` | arm could not follow the command; the only collision indicator when the guard is off | stop; the user checks the arm and clears it in the cockpit |
 | `ESTOP`, `ESTOP_ACTIVE`, `THERMAL_TRIP`, `BUS_LOSS`, `JOINT_LIMIT`, other fault codes | not recoverable | stop; the user clears it in the cockpit |
 | `LEASE_BUSY`, `LEASE_LOST`, `NO_LEASE` | another client (the cockpit) holds or took control | ask the user to release control in the cockpit |
 | `GuardTimeout` | the script stopped calling `feed()` and control was released | fix the loop, restart the script |
@@ -119,8 +133,9 @@ Every call blocks until armd reports the result and raises a `RebotError` subcla
 
 `rebot-mcp` exposes `get_state`, `snapshot`, `snapshot_annotated`, `detect`, `move_to`,
 `move_relative`, `gripper`, `home`, `park`, `stop`, `e_stop`, `enable`, `take_control`,
-`release_control`, `list_poses`, `save_pose`, `move_to_pose`, `place`, `get_keepout`, `set_keepout`
-and `recover`. Use them to find positions and test steps; put the final behaviour in a script so
+`release_control`, `list_poses`, `save_pose`, `move_to_pose`, `place`, `get_keepout`, `set_keepout`,
+`recover`, `collision_guard_status` and `set_collision_guard`. `get_state.collision` shows a collision
+stop in progress. Use them to find positions and test steps; put the final behaviour in a script so
 it runs without the assistant. Tools needing a newer armd return `UNSUPPORTED`.
 
 ## Checks before finishing

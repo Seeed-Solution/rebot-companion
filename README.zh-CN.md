@@ -29,7 +29,7 @@
 
 ## 核心特性
 
-- **面向 AI Agent 的 stdio MCP 服务器（`rebot-mcp`）**：默认提供 21 个工具（状态、快照、检测、运动、夹爪、停止、命名位姿、放置、禁入区、故障恢复）。可用于支持 stdio 服务器的 MCP 客户端；端到端测试使用 Python `mcp` 客户端连接真机。清除故障和从驾驶舱接管默认关闭，需启动时显式开启（见 [MCP 服务器](#mcp-服务器agent-控制)）。
+- **面向 AI Agent 的 stdio MCP 服务器（`rebot-mcp`）**：默认提供 23 个工具（状态、快照、检测、运动、夹爪、停止、命名位姿、放置、禁入区、故障恢复、碰撞保护）。可用于支持 stdio 服务器的 MCP 客户端；端到端测试使用 Python `mcp` 客户端连接真机。清除故障和从驾驶舱接管默认关闭，需启动时显式开启（见 [MCP 服务器](#mcp-服务器agent-控制)）。
 - **手眼标定**：眼在手外（闭式 Horn 点配准）与眼在手上（Park & Martin $AX=XB$），测试中与 OpenCV `CALIB_HAND_EYE_PARK` 交叉对比。精度仅在合成数据上验证，尚未在真机上实测。
 - **两阶段**：阶段 1 由 Agent 编排工具；阶段 2 为不依赖大模型的本地确定性抓放流水线。
 - **运动学**：完整 URDF 正运动学（测试中与独立 URDF 解析器相差 0.1 mm 以内）及 B601-DM 平面解析逆运动学。
@@ -221,6 +221,8 @@ ssh <user>@192.168.42.1 'cd ~/arm && python3 main.py'
 | `poses()`、`save_pose(name)`、`delete_pose(name)`、`move_to_pose(name, speed_scale=1.0)` | 保存在 armd 中的命名位姿 |
 | `place(pose=None, position=None, rpy=None, approach_height_m=0.08, release=True, retreat=True, speed_scale=1.0)` | 放下手中物体：抬升、接近、下降、张开、撤离（能力 `place`） |
 | `stop()`、`e_stop()` | 停止并保持；锁存急停 |
+| `wait_until_clear(timeout_s=10)` | 动作因 `COLLISION` 失败后：阻塞到机械臂自行恢复（能力 `collision_guard`） |
+| `set_collision_guard(enabled=None, sensitivity=None)`、`collision_guard()` | 开关碰撞保护、设置 `"low"`/`"medium"`/`"high"`、读取配置（能力 `collision_guard`） |
 | `recover(max_attempts=1)` | 清除 armd 标记为可恢复的故障，然后上力矩 |
 | `guard(timeout_s)`、`feed()` | 主循环不再调用 `feed()` 时释放控制权 |
 
@@ -446,13 +448,18 @@ claude mcp add rebot -- uv run --directory /path/to/rebot-companion --extra agen
 | `get_keepout` | — | `{boxes[{name, min_m, max_m}], source}`；不需要租约。能力 `keepout` |
 | `set_keepout` | `boxes`（最多 16 个） | 替换运行时禁入区（`[]` 为清空）。会修改设备配置。能力 `keepout` |
 | `recover` | — | 清除 armd 标为可恢复的故障（`WATCHDOG_TIMEOUT`、`CONTROL_DEADLINE`、`HANDOVER_UNSETTLED`）并重新开启力矩；其他故障和急停返回 `NOT_RECOVERABLE` 并保持锁定。能力 `fault_codes` |
+| `collision_guard_status` | — | `{enabled, sensitivity, thresholds_nm}`；不需要租约。`get_state.collision` 显示进行中的碰撞停止。能力 `collision_guard` |
+| `set_collision_guard` | `enabled`、`sensitivity`（`low`/`medium`/`high`） | 开关碰撞保护和/或设置灵敏度。会修改设备配置。能力 `collision_guard` |
 | `clear_fault` | — | 清除 EStop 或 Fault；仅在 `--allow-clear-fault` 时列出 |
 | `take_control` | `force`（仅在 `--allow-preempt` 时） | 获取空闲租约；带 `--allow-preempt` 时，`force=true` 从 Web 驾驶舱抢占控制 |
 | `release_control` | — | 释放租约；机械臂带力矩时，armd 看门狗会将其收纳 |
 
 `save_pose` 和 `set_keepout` 会写入设备（位姿和禁入区文件），默认已注册。
 需要能力的工具在 armd 版本较旧时返回 `UNSUPPORTED`，提示 "Update rebot-armd"。
-`recover` 不会清除急停或 armd 标为不可恢复的故障，因此不需要 `--allow-clear-fault`。
+`recover` 不会清除急停或 armd 标为不可恢复的故障（包括 `COLLISION` 故障），因此不需要 `--allow-clear-fault`。
+`save_pose`、`set_keepout` 和 `set_collision_guard` 会写入设备，用户提出时才使用。
+
+碰撞保护：开启后，接触会使 armd 停住机械臂并保持位置。运行中的动作以 `COLLISION` 失败，期间运动指令被 `COLLISION_HOLD` 拒绝，接触消失后机械臂自行恢复。一分钟内多次触发后，armd 锁定 `COLLISION` 故障，需要人在驾驶舱中清除。保护默认关闭，阈值是未标定的占位值（未在真机上实测）。两个示例模板用 `wait_until_clear()` 等待后重试该步骤一次。
 
 表中的限制（速度 ≤ 0.15 m/s、步长 ≤ 0.30 m、旋转 ≤ 90 deg）由服务器的输入 schema 在调用到达 armd
 之前检查；armd 另有自己的限制。
