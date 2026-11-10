@@ -216,7 +216,7 @@ ssh <user>@192.168.42.1 'cd ~/arm && python3 main.py'
 
 | Method | What it does |
 |---|---|
-| `Arm(host=None, port=None, enable=True, park_on_exit=True, force=False, obs_hz=10)` | connect, take the control lease, turn torque on |
+| `Arm(host=None, port=None, enable=True, park_on_exit=True, force=False, obs_hz=10, handle_sigterm=True)` | connect, take the control lease, turn torque on |
 | `home()`, `park()` | move home; move to the resting pose and turn torque off (the next motion turns torque on again) |
 | `move_to(xyz, rpy=None, speed=None)` | straight-line move of the gripper; `rpy` in radians, `speed` in m/s |
 | `move_relative(dx, dy, dz, frame="base", droll, dpitch, dyaw, speed)` | relative move in the `base`, `tool` or `camera` frame |
@@ -226,12 +226,19 @@ ssh <user>@192.168.42.1 'cd ~/arm && python3 main.py'
 | `grasp(detection)` or `grasp("cup", box=(x0, y0, x1, y1))` | armd's grasp action; `.holding` in the result |
 | `state()` | latest observation (`positions`, `safety_state`, `is_torqued`, `fault`, ...) |
 | `poses()`, `save_pose(name)`, `delete_pose(name)`, `move_to_pose(name, speed_scale=1.0)` | named poses stored in armd |
+| `place(pose=None, position=None, rpy=None, approach_height_m=0.08, release=True, retreat=True, speed_scale=1.0)` | put the held object down: lift, approach, descend, open, retreat (capability `place`) |
 | `stop()`, `e_stop()` | stop and hold; latched emergency stop |
 | `recover(max_attempts=1)` | clear a fault that armd marks recoverable, then torque on |
 | `guard(timeout_s)`, `feed()` | release control when the main loop stops calling `feed()` |
 
+Starting points: `examples/templates/sort_by_label.py` (YOLO detection, grasp, place into bins chosen by
+label) and `examples/templates/demo_wave.py` (tour of three taught poses). Building a program with an AI
+assistant: see [AGENTS.md](AGENTS.md) (workflow, API cheat sheet, safety rules, error codes).
+
 Behaviour:
 
+- `Arm` turns SIGTERM into `SystemExit` in the main thread (`handle_sigterm=False` opts out), so the
+  device app runner's stop signal parks the arm and releases control.
 - Errors are `rebot.RebotError` subclasses with `.code` and `.message`, for example
   `IK_BRANCH_FLIP: target (0.9, 0, 0.1) needs the arm to flip its elbow; choose a closer or higher
   target (...)` (this text is from the integration test below).

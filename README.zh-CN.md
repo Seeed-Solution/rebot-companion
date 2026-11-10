@@ -209,7 +209,7 @@ ssh <user>@192.168.42.1 'cd ~/arm && python3 main.py'
 
 | 方法 | 作用 |
 |---|---|
-| `Arm(host=None, port=None, enable=True, park_on_exit=True, force=False, obs_hz=10)` | 连接、获取控制租约、上力矩 |
+| `Arm(host=None, port=None, enable=True, park_on_exit=True, force=False, obs_hz=10, handle_sigterm=True)` | 连接、获取控制租约、上力矩 |
 | `home()`、`park()` | 回零位；回休息位并关闭力矩（下一次运动会重新上力矩） |
 | `move_to(xyz, rpy=None, speed=None)` | 夹爪直线运动到目标；`rpy` 单位为弧度，`speed` 单位为 m/s |
 | `move_relative(dx, dy, dz, frame="base", droll, dpitch, dyaw, speed)` | 在 `base`、`tool` 或 `camera` 坐标系中相对运动 |
@@ -219,12 +219,19 @@ ssh <user>@192.168.42.1 'cd ~/arm && python3 main.py'
 | `grasp(detection)` 或 `grasp("cup", box=(x0, y0, x1, y1))` | armd 的抓取动作；结果中的 `.holding` |
 | `state()` | 最新 observation（`positions`、`safety_state`、`is_torqued`、`fault` 等） |
 | `poses()`、`save_pose(name)`、`delete_pose(name)`、`move_to_pose(name, speed_scale=1.0)` | 保存在 armd 中的命名位姿 |
+| `place(pose=None, position=None, rpy=None, approach_height_m=0.08, release=True, retreat=True, speed_scale=1.0)` | 放下手中物体：抬升、接近、下降、张开、撤离（能力 `place`） |
 | `stop()`、`e_stop()` | 停止并保持；锁存急停 |
 | `recover(max_attempts=1)` | 清除 armd 标记为可恢复的故障，然后上力矩 |
 | `guard(timeout_s)`、`feed()` | 主循环不再调用 `feed()` 时释放控制权 |
 
+起点：`examples/templates/sort_by_label.py`（YOLO 检测、抓取、按标签放入对应料框）和
+`examples/templates/demo_wave.py`（依次访问三个示教位姿）。用 AI 助手构建程序时见
+[AGENTS.md](AGENTS.md)（流程、API 速查、安全规则、错误码；英文）。
+
 行为：
 
+- `Arm` 在主线程把 SIGTERM 转为 `SystemExit`（`handle_sigterm=False` 可关闭），设备上的应用运行器发出
+  停止信号时，机械臂会收纳并释放控制权。
 - 错误都是 `rebot.RebotError` 的子类，带 `.code` 和 `.message`，例如
   `IK_BRANCH_FLIP: target (0.9, 0, 0.1) needs the arm to flip its elbow; choose a closer or higher
   target (...)`（取自下文的集成测试输出）。
