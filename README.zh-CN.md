@@ -53,6 +53,7 @@
 - [MCP 服务器（agent 控制）](#mcp-服务器agent-控制)
 - [手眼标定](#手眼标定)
 - [相机内参](#相机内参)
+- [录制 LeRobot 数据集](#录制-lerobot-数据集)
 - [示例](#示例)
 - [安全](#安全)
 - [开发](#开发)
@@ -130,6 +131,7 @@ cd rebot-companion
 uv sync                      # 仅 SDK
 uv sync --extra agent        # + MCP 服务器：mcp 2.x、av、pillow
 uv sync --extra calib        # + OpenCV，用于 tools/calibrate_intrinsics.py
+uv sync --extra record       # + PyAV、pyarrow，用于 rebot-record
 uv sync --all-extras         # 全部（开发用）
 ```
 
@@ -137,6 +139,7 @@ uv sync --all-extras         # 全部（开发用）
 |---|---|---|
 | `agent` | `mcp>=2.3,<3`、`av>=12`、`pillow>=10` | `rebot-mcp`、PyAV 解码快照、带检测框的快照 |
 | `calib` | `opencv-python-headless>=4.8,<5` | 相机内参工具 |
+| `record` | `av>=12`、`pyarrow>=14` | `rebot-record`（LeRobot 数据集录制） |
 
 测试在 `uv.lock` 锁定的版本上运行（例如 mcp 2.3.0）。
 
@@ -275,6 +278,7 @@ rebot-companion/
 │   ├── arm_client.py           # 重新导出 rebot.client
 │   ├── camera_client.py        # reCamera rebot-vision / aruco-detector 客户端（触发 / 最新结果）
 │   ├── snapshot.py             # 从 H.264 流截取 JPEG 快照 + 检测框叠加
+│   ├── lerobot_recorder.py     # LeRobot v3.0 数据集录制（rebot-record）
 │   ├── mcp_server.py           # stdio MCP 服务器（rebot-mcp）
 │   ├── kinematics.py           # B601-DM FK（完整 URDF 链）与平面 FK/IK（Web 驾驶舱移植）
 │   ├── ik.py                   # IK 适配器：基座系位姿 -> armd 7 关节向量（含夹爪）
@@ -613,6 +617,48 @@ uv run python tools/calibrate_intrinsics.py --images intrinsics_frames/20261109-
 分辨率假设：标定在 1280x720 的 RTSP 流上进行，检测器在同一传感器的 640x360 画面上推理。工具假设两者
 视场相同（无裁剪），按宽高比例缩放 fx、fy、cx、cy（像素中心约定）。这一点未在设备上验证；请用卷尺
 核对一次实测的标记距离。
+
+---
+
+## 录制 LeRobot 数据集
+
+`rebot-record` 在上位机上把遥操作或脚本驱动的 episode 录成
+[LeRobot](https://github.com/huggingface/lerobot) 数据集（格式 `codebase_version` v3.0，与
+`lerobot` 0.6.1 写出的一致；细节见 [`docs/lerobot_dataset.md`](docs/lerobot_dataset.md)）。
+需要 `record` extra（PyAV、pyarrow），不需要安装 lerobot。
+
+```bash
+uv sync --extra record
+uv run rebot-record --armd 192.168.16.1 --camera 192.168.16.1 \
+  --repo-id user/pick_cup --task "pick the cup" --episodes 5 --episode-s 30
+```
+
+每个 episode：回车开始；再按回车提前结束（否则到 `--episode-s` 自动结束）；随后回车保存、`d`
+丢弃、`q` 保存并退出。`--no-prompt` 连续录制（`--reset-s` 设置 episode 间隔）。数据集默认写到
+`~/.cache/huggingface/lerobot/<repo-id>`，可用 `--root` 指定；目录必须是新的。
+
+| 特征 | 来源 |
+|---|---|
+| `observation.state`（7） | armd `positions`（关节 1..6 + 夹爪，rad） |
+| `action`（7） | armd `commanded_positions`（旧版 armd 没有该字段时用 `positions`） |
+| `observation.velocity`、`observation.effort`（7） | `velocities`、`torques`，加 `--extras velocity,effort` |
+| `observation.images.recamera` | reCamera H.264 流，解码后重新编码（PyAV 带 libsvtav1 时用它，否则 h264；`g=2`、`crf=30`） |
+
+录制器不占控制租约：它只读 armd 的观测 WebSocket（`/api/v1/ws?obs_hz=2*fps`），遥操作应用或程序
+可以同时持有租约。对齐用每条消息在主机上的接收时间（`time.monotonic()`）：第 `k` 行的采样时刻是
+`T0 + k/fps`，取该时刻之前收到的最新观测和最新解码帧。armd 自带的时间戳和相机消息尾部的毫秒时间戳
+属于其他时钟，按 episode 写入 `meta/rebot_episodes.jsonl`，同时记录观测和相机样本的延迟。相机链路和
+网络延迟没有补偿。
+
+Python API：`LeRobotRecorder(root, repo_id, fps=30, camera_url=..., armd_host=..., task=...)`，
+方法 `start_episode()`、`stop_episode()`、`save()`、`discard()`；`start_episode(sample=False)` 加
+`add_frame(state, action, image)` 可按固定 `fps` 录制脚本步骤。
+
+已验证（`tests/test_lerobot_recorder.py`，合成观测 + libx264 生成的 Annex-B 帧，经同一条 PyAV 解码路径）：
+文件布局、索引、时间戳、统计量和任务元数据；每行对应一帧 mp4；对 fake armd 的无租约录制；回车控制的
+CLI。`LeRobotDataset(repo_id, root=...)` 能加载结果并读出图像、动作和任务：lerobot 0.6.1（PyAV
+解码）和 0.7.0（torchcodec 解码），Linux aarch64。该测试在 `REBOT_LEROBOT_PYTHON` 指向装有
+`lerobot[dataset]` 的 Python 时运行，否则跳过。尚未在真实 armd 和 reCamera 上运行。
 
 ---
 
