@@ -306,3 +306,13 @@ def test_motion_failure_on_external_session_runs_safe_exit():
     assert res.stage == "motion_execution"
     session.safe_exit.assert_called_once()
     assert res.safe_exit.action == "unloaded" and "safe exit: unloaded" in res.error_message
+
+
+def test_rebot_companion_re_exports_the_core():
+    import rebot.client
+    import rebot_companion
+    import rebot_companion.arm_client as legacy
+
+    assert legacy.ArmSession is rebot.client.ArmSession and legacy.GRIPPER_INDEX == 6
+    assert rebot_companion.ArmdClient is rebot.client.ArmdClient
+    assert rebot_companion.ArmdError is rebot.RebotError

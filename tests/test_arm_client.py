@@ -414,13 +414,3 @@ def test_heartbeats_keep_flowing_through_jog_unload_cycles_with_a_polling_thread
             th.join(1)
     gaps = [b - a for a, b in zip(beats, beats[1:])]
     assert len(beats) > 5 and max(gaps) < armd.lease_timeout / 2, max(gaps)
-
-
-def test_rebot_companion_re_exports_the_core():
-    import rebot.client
-    import rebot_companion
-    import rebot_companion.arm_client as legacy
-
-    assert legacy.ArmSession is rebot.client.ArmSession and legacy.GRIPPER_INDEX == 6
-    assert rebot_companion.ArmdClient is rebot.client.ArmdClient
-    assert rebot_companion.ArmdError is rebot.RebotError
