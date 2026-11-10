@@ -400,6 +400,11 @@ class ArmdClient:
         self.require("collision_guard", "The collision guard")
         return dict(self._get("/api/v1/safety/collision") or {})
 
+    def get_safety_describe(self) -> dict:
+        """``GET /api/v1/safety/describe`` (capability ``safety_describe``): stops, faults, limits, timing, hardware."""
+        self.require("safety_describe", "The safety description")
+        return dict(self._get("/api/v1/safety/describe") or {})
+
     def get_tick_stats(self) -> dict:
         """``GET /api/v1/diagnostics/tick`` (capability ``tick_stats``): control-loop timing."""
         self.require("tick_stats", "Tick statistics")

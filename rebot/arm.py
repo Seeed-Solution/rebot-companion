@@ -499,6 +499,14 @@ class Arm:
 
         return self._run(go)
 
+    def safety(self) -> dict:
+        """What armd can and cannot do for safety (capability ``safety_describe``).
+
+        Keys: ``stops``, ``faults`` (each with ``recoverable``), ``limits`` (``action_speed_max`` and joint
+        limits), ``timing``, ``hardware`` (``physical_estop``, ``notes``), ``device``.
+        """
+        return self._run(self.client.get_safety_describe)
+
     # ---- collision guard (capability collision_guard) ------------------------
 
     def collision_guard(self) -> dict:

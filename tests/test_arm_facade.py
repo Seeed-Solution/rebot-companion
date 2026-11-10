@@ -341,3 +341,21 @@ def test_sigterm_not_installed_off_main_thread(armd):
     t.start()
     t.join()
     assert out == [True]
+
+
+def test_safety_description(armd):
+    from rebot import UnsupportedError
+
+    with Arm(armd.url, transport=armd.transport) as arm:
+        with pytest.raises(UnsupportedError):  # armd without devplat
+            arm.safety()
+    armd.devplat = True
+    with Arm(armd.url, transport=armd.transport) as arm:
+        d = arm.safety()
+    assert d["hardware"]["physical_estop"] is False
+    assert d["limits"]["action_speed_max"]["linear_mps"] == 0.15
+    assert any(f["code"] == "WATCHDOG_TIMEOUT" and f["recoverable"] for f in d["faults"])
+    armd.describe_cap = False
+    with Arm(armd.url, transport=armd.transport) as arm:
+        with pytest.raises(UnsupportedError):
+            arm.safety()
