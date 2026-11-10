@@ -44,15 +44,14 @@ from __future__ import annotations
 
 import itertools
 import json
-import logging
 import os
 import threading
 import time
-import uuid
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Sequence
 
 from . import _http, _ws
+from ._log import _log
 from .errors import (
     ActionFailed,
     ArmCommandRejected,
@@ -67,8 +66,6 @@ from .errors import (
     UnloadFailed,
     UnsupportedError,
 )
-
-log = logging.getLogger(__name__)
 
 SERVO_MAX_STEP = 0.35  # rad; armd drops frames jumping further from its commanded position
 SERVO_MIN_RATE_HZ = 10.0  # armd motion_frame_timeout is 200 ms
@@ -489,7 +486,7 @@ class ArmSession:
         if safe_exit not in SAFE_EXIT_POLICIES:
             raise ValueError(f"safe_exit must be one of {SAFE_EXIT_POLICIES}")
         self.client = client
-        self.client_id = client_id or f"rebot-companion-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+        self.client_id = client_id or f"rebot-companion-{os.getpid()}-{os.urandom(4).hex()}"
         if not 0 < len(self.client_id) <= 128:
             raise ValueError("client_id must be 1..128 characters")
         self.force = force
@@ -569,7 +566,7 @@ class ArmSession:
                 try:
                     self._wait_unload(self._frames, self.safe_exit_timeout)
                 except ArmdError as exc:
-                    log.warning("Unload started with wait=False did not finish before close: %s", exc)
+                    _log.warning("Unload started with wait=False did not finish before close: %s", exc)
             if release and self._generation is not None and self._closed_reason is None:
                 try:
                     self._request(
@@ -606,7 +603,7 @@ class ArmSession:
             if self.safe_exit_policy == "always" or (self.safe_exit_policy == "error" and exc_type is not None):
                 self.safe_exit()
         except BaseException as err:  # never mask the original exception
-            log.warning("safe exit failed: %s", err)
+            _log.warning("safe exit failed: %s", err)
         finally:
             self.close()
 
@@ -622,7 +619,7 @@ class ArmSession:
         """
         outcome = self._safe_exit(self.safe_exit_timeout if timeout is None else timeout)
         self.safe_exit_outcome = outcome
-        (log.info if outcome.ok else log.warning)("safe exit: %s %s", outcome.action, outcome.message)
+        (_log.info if outcome.ok else _log.warning)("safe exit: %s %s", outcome.action, outcome.message)
         return outcome
 
     def _safe_exit(self, timeout: float) -> SafeExitOutcome:

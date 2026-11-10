@@ -6,14 +6,12 @@ Standard library only. :func:`parse_detections` reads the same payload formats a
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 from typing import Any, Sequence
 
 from . import _http
+from ._log import _log
 from .errors import DetectorUnavailable, RebotError
-
-log = logging.getLogger(__name__)
 
 PIXEL_UNIT_THRESHOLD = 1.05  # cx|cy|w|h above this means pixels (cockpit parseDetections)
 PIPELINES = ("yolo", "aruco")
@@ -351,7 +349,7 @@ class DetectionClient:
                 try:
                     self.set_inference(False)
                 except RebotError as exc:
-                    log.warning("could not disable inference again: %s", exc)
+                    _log.warning("could not disable inference again: %s", exc)
         return {
             "frame_id": body.get("frame_id"),
             "ts_ms": body.get("ts_ms"),

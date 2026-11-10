@@ -1,19 +1,17 @@
-"""Small JSON-over-HTTP helper on ``urllib`` (standard library only).
+"""Small JSON-over-HTTP helper using a minimal HTTP/1.1 client over standard library socket.
 
+Zero third-party packages, zero urllib.request / http.client / email imports.
 Every client takes an optional ``transport``: a callable
 ``(method, url, body: bytes | None, headers: dict, timeout: float) -> HttpResponse``.
-Tests pass an in-process fake; the default sends real requests, bypassing proxy
-environment variables (armd is on the local network).
+Tests pass an in-process fake; the default sends real requests over raw sockets.
 """
 
 from __future__ import annotations
 
 import json as _json
 import socket
-import urllib.error
-import urllib.request
 from typing import Any, Callable, Dict, Optional
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 from .errors import ArmConnectionError
 
@@ -71,26 +69,163 @@ class HttpStatusError(HttpError):
 
 Transport = Callable[[str, str, Optional[bytes], Dict[str, str], float], HttpResponse]
 
-_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+def _read_chunked(sock: socket.socket, initial: bytes) -> bytes:
+    buf = bytearray(initial)
+    body = bytearray()
+
+    def read_until(delim: bytes) -> bytes:
+        while delim not in buf:
+            chunk = sock.recv(4096)
+            if not chunk:
+                raise HttpError("connection closed before chunk delimiter")
+            buf.extend(chunk)
+        idx = buf.index(delim)
+        line = bytes(buf[:idx])
+        del buf[: idx + len(delim)]
+        return line
+
+    def read_exact(n: int) -> bytes:
+        while len(buf) < n:
+            chunk = sock.recv(max(4096, n - len(buf)))
+            if not chunk:
+                raise HttpError("connection closed while reading chunk data")
+            buf.extend(chunk)
+        data = bytes(buf[:n])
+        del buf[:n]
+        return data
+
+    while True:
+        line = read_until(b"\r\n").strip()
+        if not line:
+            continue
+        size_str = line.split(b";", 1)[0].strip()
+        try:
+            chunk_size = int(size_str, 16)
+        except ValueError as exc:
+            raise HttpError(f"invalid chunk size: {line!r}") from exc
+        if chunk_size == 0:
+            while True:
+                trailer = read_until(b"\r\n").strip()
+                if not trailer:
+                    break
+            break
+        body.extend(read_exact(chunk_size))
+        crlf = read_exact(2)
+        if crlf != b"\r\n":
+            raise HttpError(f"expected CRLF after chunk data, got {crlf!r}")
+
+    return bytes(body)
 
 
-def urllib_transport(
+def socket_transport(
     method: str, url: str, body: Optional[bytes], headers: Dict[str, str], timeout: float
 ) -> HttpResponse:
-    req = urllib.request.Request(url, data=body, headers=headers, method=method)
+    parts = urlsplit(url)
+    scheme = parts.scheme.lower()
+    if scheme not in ("http", "https"):
+        raise HttpError(f"unsupported URL scheme: {scheme}")
+
+    host = parts.hostname or "127.0.0.1"
+    port = parts.port or (443 if scheme == "https" else 80)
+    path = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
+    host_hdr = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+
+    req_headers = dict(headers)
+    req_headers.setdefault("Host", host_hdr)
+    req_headers.setdefault("Connection", "close")
+    if body is not None and "Content-Length" not in req_headers:
+        req_headers["Content-Length"] = str(len(body))
+
+    req_lines = [f"{method.upper()} {path} HTTP/1.1"]
+    for k, v in req_headers.items():
+        req_lines.append(f"{k}: {v}")
+    payload = "\r\n".join(req_lines).encode("latin-1") + b"\r\n\r\n"
+    if body:
+        payload += body
+
+    sock: Optional[socket.socket] = None
     try:
-        with _opener.open(req, timeout=timeout) as res:
-            return HttpResponse(res.status, res.read(), dict(res.headers.items()))
-    except urllib.error.HTTPError as exc:
-        return HttpResponse(exc.code, exc.read() or b"", dict(exc.headers.items()) if exc.headers else {})
-    except socket.timeout as exc:
+        sock = socket.create_connection((host, port), timeout=timeout)
+        if scheme == "https":
+            import ssl
+
+            sock = ssl.create_default_context().wrap_socket(sock, server_hostname=host)
+        sock.settimeout(timeout)
+        sock.sendall(payload)
+
+        buf = bytearray()
+        while b"\r\n\r\n" not in buf:
+            chunk = sock.recv(4096)
+            if not chunk:
+                raise HttpError("connection closed before response headers were received")
+            buf.extend(chunk)
+            if len(buf) > 65536:
+                raise HttpError("response headers too large")
+
+        header_bytes, rest = buf.split(b"\r\n\r\n", 1)
+        status_line, *header_lines = header_bytes.decode("latin-1").split("\r\n")
+        status_parts = status_line.split(" ", 2)
+        if len(status_parts) < 2:
+            raise HttpError(f"malformed HTTP status line: {status_line}")
+        try:
+            status = int(status_parts[1])
+        except ValueError as exc:
+            raise HttpError(f"malformed HTTP status code: {status_line}") from exc
+
+        res_headers: Dict[str, str] = {}
+        for line in header_lines:
+            if not line:
+                continue
+            hk, sep, hv = line.partition(":")
+            if not sep:
+                continue
+            res_headers[hk.strip()] = hv.strip()
+
+        lower_headers = {k.lower(): v.strip().lower() for k, v in res_headers.items()}
+        transfer_encoding = lower_headers.get("transfer-encoding", "")
+
+        if status in (204, 304) or method.upper() == "HEAD":
+            resp_body = b""
+        elif "chunked" in transfer_encoding:
+            resp_body = _read_chunked(sock, rest)
+        elif "content-length" in lower_headers:
+            try:
+                cl = int(lower_headers["content-length"])
+            except ValueError as exc:
+                raise HttpError(f"invalid Content-Length: {lower_headers['content-length']}") from exc
+            body_buf = bytearray(rest)
+            while len(body_buf) < cl:
+                chunk = sock.recv(min(4096, cl - len(body_buf)))
+                if not chunk:
+                    raise HttpError("connection closed before Content-Length bytes were received")
+                body_buf.extend(chunk)
+            resp_body = bytes(body_buf[:cl])
+        else:
+            body_buf = bytearray(rest)
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                body_buf.extend(chunk)
+            resp_body = bytes(body_buf)
+
+        return HttpResponse(status, resp_body, res_headers)
+
+    except (socket.timeout, TimeoutError) as exc:
         raise HttpTimeout(f"{method} {url} timed out after {timeout:g}s") from exc
-    except urllib.error.URLError as exc:
-        if isinstance(exc.reason, socket.timeout):
-            raise HttpTimeout(f"{method} {url} timed out after {timeout:g}s") from exc
-        raise HttpError(f"cannot reach {url}: {exc.reason}") from exc
     except OSError as exc:
         raise HttpError(f"cannot reach {url}: {exc}") from exc
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
+default_transport = socket_transport
+urllib_transport = socket_transport
 
 
 def request(
@@ -108,4 +243,4 @@ def request(
     if json is not None:
         body = _json.dumps(json).encode("utf-8")
         headers["Content-Type"] = "application/json"
-    return (transport or urllib_transport)(method, url, body, headers, timeout)
+    return (transport or default_transport)(method, url, body, headers, timeout)

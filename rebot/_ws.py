@@ -10,12 +10,11 @@ One thread may call :meth:`WebSocket.recv` while others call :meth:`WebSocket.se
 
 from __future__ import annotations
 
-import base64
+import binascii
 import hashlib
 import os
 import select
 import socket
-import ssl
 import struct
 import threading
 import time
@@ -88,7 +87,7 @@ class WebSocket:
 
     def _fill(self, deadline: Optional[float]) -> None:
         """Read more bytes into the buffer; raise WebSocketTimeout at ``deadline``."""
-        pending = isinstance(self.sock, ssl.SSLSocket) and self.sock.pending() > 0
+        pending = hasattr(self.sock, "pending") and self.sock.pending() > 0
         if not pending:
             remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
             try:
@@ -264,9 +263,11 @@ def connect(
         raise WebSocketError(f"cannot connect to {host}:{port}: {exc}") from exc
     try:
         if secure:
+            import ssl
+
             sock = ssl.create_default_context().wrap_socket(sock, server_hostname=host)
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        key = base64.b64encode(os.urandom(16)).decode()
+        key = binascii.b2a_base64(os.urandom(16), newline=False).decode("ascii")
         lines = [
             f"GET {path} HTTP/1.1",
             f"Host: {host_hdr}",
@@ -299,7 +300,7 @@ def connect(
         for line in header_lines:
             k, _, v = line.partition(":")
             hdrs[k.strip().lower()] = v.strip()
-        expect = base64.b64encode(hashlib.sha1((key + _GUID).encode()).digest()).decode()
+        expect = binascii.b2a_base64(hashlib.sha1((key + _GUID).encode("ascii")).digest(), newline=False).decode("ascii")
         if hdrs.get("sec-websocket-accept") != expect:
             raise WebSocketError("handshake failed: bad Sec-WebSocket-Accept")
         sock.settimeout(send_timeout)  # reads use select(); this bounds blocking sends

@@ -20,11 +20,12 @@ Every method blocks until armd reports the result and raises a :class:`rebot.Reb
 from __future__ import annotations
 
 import atexit
-import logging
 import os
 import threading
 import time
 from typing import Any, Callable, List, Optional, Sequence, Union
+
+from ._log import _log
 
 from .client import ActionResult, ArmdClient, ArmSession, ArmStatus, ObservationSchema
 from .detection import PIPELINES, Detection, DetectionClient, parse_detections
@@ -37,8 +38,6 @@ from .errors import (
     RebotError,
     UnsupportedError,
 )
-
-log = logging.getLogger(__name__)
 
 DEFAULT_PORT = 8765
 DEFAULT_OBS_HZ = 10
@@ -138,10 +137,10 @@ class Arm:
         try:
             if self.park_on_exit and not self._guard_tripped and s.has_lease:
                 self.exit_outcome = self._park_for_exit()
-                (log.info if self.exit_outcome.startswith("parked") else log.warning)("exit: %s", self.exit_outcome)
+                (_log.info if self.exit_outcome.startswith("parked") else _log.warning)("exit: %s", self.exit_outcome)
         except BaseException as exc:  # never mask the program's own exception
             self.exit_outcome = f"failed: {exc}"
-            log.warning("exit: park failed: %s", exc)
+            _log.warning("exit: park failed: %s", exc)
         finally:
             s.close()
 
@@ -189,11 +188,11 @@ class Arm:
                 continue
             if time.monotonic() - self._last_feed > limit:
                 self._guard_tripped = True
-                log.error("guard: no arm.feed() for %.1f s; releasing control", limit)
+                _log.error("guard: no arm.feed() for %.1f s; releasing control", limit)
                 try:
                     self.session.close()
                 except Exception as exc:  # pragma: no cover - defensive
-                    log.warning("guard: close failed: %s", exc)
+                    _log.warning("guard: close failed: %s", exc)
                 return
 
     def _run(self, fn: Callable[[], Any]) -> Any:
