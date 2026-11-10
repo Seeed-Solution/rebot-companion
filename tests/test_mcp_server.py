@@ -41,6 +41,8 @@ TOOLS = {
     "get_keepout",
     "set_keepout",
     "recover",
+    "collision_guard_status",
+    "set_collision_guard",
 }
 
 
@@ -371,3 +373,44 @@ async def test_recover_only_for_recoverable_faults(armd, make_ctrl):
         ok = body(await c.call_tool("recover", {}))
         assert ok["recovered"] is True and ok["cleared"] == "WATCHDOG_TIMEOUT"
         assert armd.state == "Armed"
+
+
+@pytest.mark.asyncio
+async def test_collision_tools_and_state(armd, make_ctrl):
+    armd.devplat = True
+    async with Client(build_server(make_ctrl())) as c:
+        await c.call_tool("enable", {})
+        assert body(await c.call_tool("get_state", {}))["collision"] is None
+        assert body(await c.call_tool("collision_guard_status", {}))["enabled"] is False
+        cfg = body(await c.call_tool("set_collision_guard", {"enabled": True, "sensitivity": "low"}))
+        assert cfg["enabled"] is True and cfg["sensitivity"] == "low"
+        assert body(await c.call_tool("set_collision_guard", {}))["code"] == "INVALID_ARGUMENT"
+        armd.trip_collision(joint=3, residual_nm=6.5, resume_after_s=30)
+        await asyncio.sleep(0.3)
+        col = body(await c.call_tool("get_state", {}))["collision"]
+        assert col["active"] is True and col["joint"] == 3
+        err = body(await c.call_tool("home", {}))
+        assert err["code"] == "COLLISION_HOLD" and "collision.active" in err["hint"]
+
+
+@pytest.mark.asyncio
+async def test_recover_refuses_collision_fault(armd, make_ctrl):
+    armd.devplat = True
+    async with Client(build_server(make_ctrl())) as c:
+        await c.call_tool("enable", {})
+        await c.call_tool("set_collision_guard", {"enabled": True})
+        for _ in range(4):
+            armd.trip_collision(resume_after_s=0.05)
+        await asyncio.sleep(0.3)
+        err = body(await c.call_tool("recover", {}))
+        assert err["code"] == "NOT_RECOVERABLE" and "COLLISION" in err["message"]
+        assert "check the workspace" in err["hint"] and "cockpit" in err["hint"]
+        assert armd.state == "Fault"
+        assert "/api/v1/safety/clear_fault" not in armd.commands
+
+
+@pytest.mark.asyncio
+async def test_collision_tools_need_capability(armd, make_ctrl):
+    async with Client(build_server(make_ctrl())) as c:
+        assert body(await c.call_tool("collision_guard_status", {}))["code"] == "UNSUPPORTED"
+        assert body(await c.call_tool("set_collision_guard", {"enabled": True}))["code"] == "UNSUPPORTED"

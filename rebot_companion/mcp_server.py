@@ -108,6 +108,10 @@ HINTS = {
     "POSE_NOT_FOUND": "call list_poses; teach the pose with save_pose or in the web cockpit",
     "PLACE_TIMEOUT": "the place did not finish; stop was sent; check the scene with snapshot",
     "UNSUPPORTED": "update rebot-armd on the device",
+    "COLLISION": "the arm stopped on contact and resumes by itself; check the workspace, call get_state until "
+    "collision.active is false, then retry once",
+    "COLLISION_HOLD": "the arm is holding after a collision; wait until get_state shows collision.active false, "
+    "then retry",
 }
 
 POSE_NAME = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -117,7 +121,10 @@ Coordinates: metres in the arm base frame (x forward, y left, z up); poses are o
 Use snapshot / snapshot_annotated / detect to look before moving. stop and e_stop always work.
 Named poses (list_poses, save_pose, move_to_pose) and place need a recent armd; save_pose and
 set_keepout change the device's saved configuration, so use them only when the user asks.
-recover clears only faults armd marks recoverable."""
+recover clears only faults armd marks recoverable; a COLLISION fault is never cleared by recover.
+The collision guard (collision_guard_status, set_collision_guard) is off by default and its thresholds
+are uncalibrated placeholders. set_collision_guard changes the device's saved configuration, so use it
+only when the user asks."""
 
 
 def build_instructions(allow_clear_fault: bool, allow_preempt: bool) -> str:
@@ -200,6 +207,12 @@ def map_exception(exc: BaseException) -> ToolFail | None:
     if isinstance(exc, ArmFaultError):
         if exc.status.e_stopped:
             return ToolFail("ESTOP_ACTIVE", str(exc))
+        if exc.code == "COLLISION":
+            return ToolFail(
+                "COLLISION",
+                str(exc),
+                "repeated collisions latched a fault; ask the user to check the workspace and clear it in the web cockpit",
+            )
         return ToolFail("FAULT", str(exc), f"armd fault: {exc.status.fault_reason}; call clear_fault then enable")
     if isinstance(exc, LeaseError):
         if exc.reason == "controller_busy":
@@ -378,6 +391,7 @@ class Controller:
             "action": obs.action.to_dict() if obs.action else None,
             "feedback_valid": obs.feedback_valid,
             "epoch_id": obs.epoch_id,
+            "collision": obs.collision,
         }
 
     @staticmethod
@@ -542,6 +556,12 @@ class Controller:
         if not obs.is_stopped:
             return {"recovered": False, "safety_state": obs.safety_state, "note": "no fault to recover from"}
         human = "ask the user to check the arm and clear the fault in the web cockpit"
+        if obs.fault_code == "COLLISION":
+            raise ToolFail(
+                "NOT_RECOVERABLE",
+                "COLLISION: repeated contact stopped the arm and the fault is latched",
+                "ask the user to check the workspace for what the arm hit, then clear the fault in the web cockpit",
+            )
         if not s.schema().has("fault_codes"):
             raise ToolFail(
                 "NOT_RECOVERABLE", f"armd reports no fault codes, so {obs.safety_state} is not cleared here", human
@@ -556,6 +576,15 @@ class Controller:
         )
         ack = s.torque(True)
         return {"recovered": True, "cleared": code, "safety_state": ack.get("safety_state")}
+
+    def collision_guard_status(self) -> dict:
+        return self.client.get_collision_guard()
+
+    def set_collision_guard(self, enabled: bool | None, sensitivity: str | None) -> dict:
+        if enabled is None and sensitivity is None:
+            raise ToolFail("INVALID_ARGUMENT", "give enabled and/or sensitivity")
+        self.actuator().set_collision_guard(enabled, sensitivity)
+        return self.client.get_collision_guard()
 
     def snapshot(self, max_width: int, quality: int) -> list:
         snap = self.grabber.snapshot(jpeg_quality=quality, max_width=max_width)
@@ -827,6 +856,25 @@ def build_server(ctrl: Controller, allow_clear_fault: bool = False, allow_preemp
     )
     async def recover() -> dict:
         return await motion(ctrl.recover)
+
+    @tool(
+        "Collision guard configuration: {enabled, sensitivity, thresholds_nm}. get_state.collision shows a "
+        "trip in progress (active, joint, residual_nm, resume_in_s). The guard is off by default and its "
+        "thresholds are uncalibrated placeholders. No lease needed. Needs capability 'collision_guard'."
+    )
+    async def collision_guard_status() -> dict:
+        return await run(ctrl.collision_guard_status)
+
+    @tool(
+        "CONFIGURATION CHANGE: switch the collision guard on or off and/or set its sensitivity (low, medium, "
+        "high). Persisted on the device. With the guard on, contact stops the arm; it resumes by itself when "
+        "the contact is gone and latches a COLLISION fault after repeated trips. Thresholds are uncalibrated "
+        "placeholders. Use only when the user asks. Needs capability 'collision_guard'."
+    )
+    async def set_collision_guard(
+        enabled: bool | None = None, sensitivity: Literal["low", "medium", "high"] | None = None
+    ) -> dict:
+        return await motion(ctrl.set_collision_guard, enabled, sensitivity)
 
     @tool("Release the control lease (the web cockpit will acquire it automatically).")
     async def release_control() -> dict:
