@@ -183,11 +183,11 @@ with arm.session() as s:
 ```python
 from rebot import Arm
 
-with Arm() as arm:                         # $REBOT_HOST，未设置时为 127.0.0.1；获取控制权并上力矩
+with Arm() as arm:  # $REBOT_HOST，未设置时为 127.0.0.1；获取控制权并上力矩
     arm.home()
-    for obj in arm.detect("cup"):          # 检测结果按分数从高到低：label、score、box_norm
+    for obj in arm.detect("cup"):  # 检测结果按分数从高到低：label、score、box_norm
         if arm.grasp(obj).holding:
-            arm.move_to((0.25, -0.15, 0.15))   # 米，机械臂基座坐标系（x 向前、y 向左、z 向上）
+            arm.move_to((0.25, -0.15, 0.15))  # 米，机械臂基座坐标系（x 向前、y 向左、z 向上）
             arm.gripper_open()
         break
 # 离开 with 块时停靠机械臂（关闭力矩）并释放控制权，

@@ -189,11 +189,11 @@ so the same script runs on a PC (arm over the network) and on the reCamera (`127
 ```python
 from rebot import Arm
 
-with Arm() as arm:                         # $REBOT_HOST, else 127.0.0.1; takes control, torque on
+with Arm() as arm:  # $REBOT_HOST, else 127.0.0.1; takes control, torque on
     arm.home()
-    for obj in arm.detect("cup"):          # detections, best first: label, score, box_norm
+    for obj in arm.detect("cup"):  # detections, best first: label, score, box_norm
         if arm.grasp(obj).holding:
-            arm.move_to((0.25, -0.15, 0.15))   # metres, arm base frame (x forward, y left, z up)
+            arm.move_to((0.25, -0.15, 0.15))  # metres, arm base frame (x forward, y left, z up)
             arm.gripper_open()
         break
 # Leaving the block parks the arm (torque off) and releases control,
