@@ -26,10 +26,14 @@ Two layers:
 4. **Copy to the device**: `/userdata/rebot-apps/<name>/main.py`, together with the `rebot/` folder
    if the device does not have it installed. The script runs unchanged (without `REBOT_HOST` it uses
    `127.0.0.1`).
-5. **Enable it** in the rebot-teleop app config so it starts as an app. The config format is defined
-   by rebot-teleop, not by this repository: read it on the device before editing. The app runner
-   stops an app with SIGTERM and waits 10 s before SIGKILL; `Arm` turns SIGTERM into `SystemExit`,
-   so the `with` block parks the arm and releases control.
+5. **Enable it** (needs rebot-teleop with the app runner). Either in the reCamera console, rebot-teleop
+   settings, group "Your Program": `enabled` = `on`, `name` = `<name>`; or start it by hand with
+   `/etc/init.d/K92rebot-teleop app-start <name>` (`app-status`, `app-logs 50`, `app-stop`). The
+   setting is stored in `/userdata/local/apps/rebot-teleop.config.json` as
+   `"app": {"enabled": "on", "name": "<name>"}`. The runner restarts a crashed program with backoff
+   (gives up after 10 starts in 5 minutes) and writes `/userdata/rebot-teleop/logs/app-<name>.log`.
+   It stops a program with SIGTERM and waits 10 s before SIGKILL; `Arm` turns SIGTERM into
+   `SystemExit`, so the `with` block parks the arm and releases control.
 
 ## API cheat sheet
 
