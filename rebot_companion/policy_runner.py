@@ -250,7 +250,7 @@ class LeRobotPolicy(Policy):
             raise RunnerError(f"policy inputs {unsupported} are not produced by rebot-policy")
         if visual:
             self.image_key = visual[0]
-            c, h, w = inputs[self.image_key].shape
+            _, h, w = inputs[self.image_key].shape
             self.image_size = (int(h), int(w))
         self.inputs = tuple(inputs)
         try:
@@ -322,10 +322,10 @@ def pretrained_fps(path: str | Path) -> tuple[int, str] | None:
         if fps:
             return fps, f"{cfg_file} {section}.fps"
     dataset = cfg.get("dataset") or {}
-    roots = []
     for key in ("root", "repo_id"):
         if dataset.get(key) is not None and not isinstance(dataset[key], str):
             raise ValueError(f"{cfg_file} dataset.{key} {dataset[key]!r} is not a string")
+    roots = []
     if dataset.get("root"):
         roots.append(Path(dataset["root"]).expanduser())
     if dataset.get("repo_id"):
@@ -343,6 +343,9 @@ def pretrained_fps(path: str | Path) -> tuple[int, str] | None:
         if fps:
             return fps, str(info)
     return None
+
+
+_PREFIX = re.compile(r"[A-Za-z][\w.+-]*:")
 
 
 def parse_policy(spec: str, device: str | None = None, task: str = "") -> Policy:
@@ -372,9 +375,6 @@ def parse_policy(spec: str, device: str | None = None, task: str = "") -> Policy
             "a LeRobot pretrained directory or a Hub repo id"
         )
     return LeRobotPolicy(spec, device=device, task=task)
-
-
-_PREFIX = re.compile(r"[A-Za-z][\w.+-]*:")
 
 
 # --------------------------------------------------------------------------- images
@@ -735,8 +735,6 @@ class PolicyRunner:
         return False
 
     def _camera_image(self, now: float) -> np.ndarray | None:
-        if not self.policy.image_key:
-            return None
         item = self.camera.latest()
         if item is None:
             raise RunnerError("no camera frame")
@@ -891,16 +889,11 @@ class PolicyRunner:
             except KeyboardInterrupt:
                 self._stopping = True
                 self.request_stop("interrupted", "Ctrl-C / SIGTERM")
-            except RunnerError:
-                self._stopping = True
-                if not self._streaming:
-                    raise
-                self.request_stop("error", str(sys.exc_info()[1]))
             except Exception as exc:
                 self._stopping = True
                 if not self._streaming:
                     raise
-                self.request_stop("error", f"{type(exc).__name__}: {exc}")
+                self.request_stop("error", str(exc) if isinstance(exc, RunnerError) else f"{type(exc).__name__}: {exc}")
             finally:
                 self._stopping = True
                 self._stop.set()
@@ -910,7 +903,9 @@ class PolicyRunner:
                     self._finish()
         finally:
             self._stopping = True
-            self._close_worker()
+            w, self._worker = self._worker, None
+            if w is not None and not w.close(timeout=1.0):
+                log.warning("policy inference is still running (abandoned); its thread ends when it returns")
             if self.session is not None:
                 try:
                     self.session.close()
@@ -941,11 +936,6 @@ class PolicyRunner:
             hz = min(hz, (len(rx) - 1) / (rx[-1] - rx[0]))
         self.max_obs_age_s = max(0.1, 3.0 / hz)
         log.info("observations at %.1f Hz; max observation age %.0f ms", hz, self.max_obs_age_s * 1000)
-
-    def _close_worker(self) -> None:
-        w, self._worker = self._worker, None
-        if w is not None and not w.close(timeout=1.0):
-            log.warning("policy inference is still running (abandoned); its thread ends when it returns")
 
     def _infer(self, args: tuple, timeout: float) -> tuple[bool, Any]:
         if self._worker is None:
@@ -991,10 +981,11 @@ class PolicyRunner:
         self._resolve_obs_age()
         self.policy.reset()
         if self.policy.warmup:
-            image = self._camera_image(time.monotonic()) if self.policy.image_key else None
             o = self._observation(obs)
-            if image is not None:
-                o[self.policy.image_key] = image
+            if self.policy.image_key:
+                image = self._camera_image(time.monotonic())
+                if image is not None:
+                    o[self.policy.image_key] = image
             t = time.perf_counter()
             ok, _ = self._infer((o, 0, 0.0), WARMUP_TIMEOUT_S)
             if not ok:
