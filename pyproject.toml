@@ -50,13 +50,11 @@ record = [
     "av>=12",
     "pyarrow>=14",
 ]
-# rebot-policy: av + pyarrow for the camera and scripted replay; torch + lerobot for learned policies
-# (lerobot 0.6.1 / 0.7.0 need Python >= 3.12)
+# rebot-policy: camera decode and scripted replay. Learned policies also need torch + lerobot, installed
+# separately (Python >= 3.12), e.g. `uv run --python 3.12 --with 'lerobot[dataset]' rebot-policy ...`
 policy = [
     "av>=12",
     "pyarrow>=14",
-    "torch>=2.7; python_version >= '3.12'",
-    "lerobot[dataset]>=0.6.1,<0.8; python_version >= '3.12'",
 ]
 
 [build-system]

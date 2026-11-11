@@ -137,7 +137,7 @@ uv sync                      # 仅 SDK
 uv sync --extra agent        # + MCP 服务器：mcp 2.x、av、pillow
 uv sync --extra calib        # + OpenCV，用于 tools/calibrate_intrinsics.py
 uv sync --extra record       # + PyAV、pyarrow，用于 rebot-record
-uv sync --extra policy       # + PyAV、pyarrow、torch、lerobot[dataset]，用于 rebot-policy
+uv sync --extra policy       # + PyAV、pyarrow，用于 rebot-policy（学习策略见“运行学习策略”）
 uv sync --all-extras         # 全部（开发用）
 ```
 
@@ -146,7 +146,7 @@ uv sync --all-extras         # 全部（开发用）
 | `agent` | `mcp>=2.3,<3`、`av>=12`、`pillow>=10` | `rebot-mcp`、PyAV 解码快照、带检测框的快照 |
 | `calib` | `opencv-python-headless>=4.8,<5` | 相机内参工具 |
 | `record` | `av>=12`、`pyarrow>=14` | `rebot-record`（LeRobot 数据集录制） |
-| `policy` | `av>=12`、`pyarrow>=14`、`torch>=2.7`、`lerobot[dataset]>=0.6.1,<0.8`（torch 和 lerobot 仅在 Python >= 3.12 安装） | `rebot-policy`（策略运行器） |
+| `policy` | `av>=12`、`pyarrow>=14` | `rebot-policy`（相机、脚本策略）；torch 和 lerobot 需另行安装 |
 
 测试在 `uv.lock` 锁定的版本上运行（例如 mcp 2.3.0）。
 
@@ -685,14 +685,19 @@ CLI。`LeRobotDataset(repo_id, root=...)` 能加载结果并读出图像、动�
 servo 保护（限速、领先量上限、受阻保持）、碰撞保护和故障处理与其他客户端相同。
 
 ```bash
-uv sync --extra policy
 # 脚本策略，不需要 torch：回放录制的 episode，或在单个关节上做小幅正弦运动
-uv run rebot-policy --armd 127.0.0.1 --policy replay:$HOME/.cache/huggingface/lerobot/user/pick_cup:0
-uv run rebot-policy --armd 127.0.0.1 --policy sine:1:0.05:4 --max-seconds 20
-# LeRobot 策略（lerobot-train 保存的本地目录或 Hub repo id），真实机械臂
-uv run rebot-policy --armd 192.168.16.1 --camera 192.168.16.1 --policy outputs/train/act/checkpoints/last/pretrained_model \
+uv run --extra policy rebot-policy --armd 127.0.0.1 --policy replay:$HOME/.cache/huggingface/lerobot/user/pick_cup:0
+uv run --extra policy rebot-policy --armd 127.0.0.1 --policy sine:1:0.05:4 --max-seconds 20
+# LeRobot 策略（lerobot-train 保存的本地目录或 Hub repo id），真实机械臂；
+# torch + lerobot 仅为本次运行加入，使用 Python 3.12 环境
+uv run --python 3.12 --extra policy --with 'lerobot[dataset]>=0.6.1,<0.8' rebot-policy \
+  --armd 192.168.16.1 --camera 192.168.16.1 --policy outputs/train/act/checkpoints/last/pretrained_model \
   --fps 30 --max-seconds 60 --task "pick the cup" --i-am-at-the-arm --log run.jsonl
 ```
+
+torch 和 lerobot（0.6.1 或 0.7.0，Python >= 3.12，数 GB）不是 rebot-companion 的依赖。可以像上面那样用
+`uv run --with` 按次加入（在本仓库内 `--python 3.12` 会让项目环境改用 Python 3.12），也可以把
+rebot-companion 安装到已装有 lerobot 的 Python 环境（例如训练环境）。运行器只在使用学习策略时导入它们。
 
 | 选项 | 含义 |
 |---|---|
@@ -733,7 +738,7 @@ uv run rebot-policy --armd 192.168.16.1 --camera 192.168.16.1 --policy outputs/t
 servo 被拒、策略停滞、错误动作和策略异常时停止；结束时停靠与 `--no-park`；非 mock follower 的操作员标志；
 回放往返（录制器数据集 -> 通过 fake armd 回放 -> 第二次录制观测到相同轨迹）；通过 HTTP 的 CLI。一个随机
 初始化的 ACT 策略（lerobot 0.7.0，按录制器的合成特征构建：7 关节状态与动作、一个 64x48 相机）以 reCamera
-格式的 H.264 WebSocket 流为图像输入运行 10 步；该测试在 lerobot 可导入（extra `policy`）或
+格式的 H.264 WebSocket 流为图像输入运行 10 步；该测试在 lerobot 可导入或
 `REBOT_LEROBOT_PYTHON` 指向装有 `lerobot[dataset]`、PyAV、pyarrow 和 scipy 的 Python 时运行，否则跳过。
 相同的 lerobot 调用在 0.6.1 中也存在（读过源码，未运行）。尚未在真实 armd、仿真器或训练过的策略上运行。
 

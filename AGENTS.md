@@ -152,7 +152,9 @@ it runs without the assistant. Tools needing a newer armd return `UNSUPPORTED`.
 
 `rebot-policy` (extra `policy`, README "Run a learned policy") streams a LeRobot policy's joint
 targets to armd as servo frames; the scripted policies `replay:<dataset root>:<episode>` and
-`sine:<joint>:<amp>:<period>` need no torch.
+`sine:<joint>:<amp>:<period>` need no torch. torch and lerobot are not project dependencies: add them
+per run (`uv run --python 3.12 --extra policy --with 'lerobot[dataset]>=0.6.1,<0.8' rebot-policy ...`);
+do not add them to `pyproject.toml`.
 
 - Test a new policy or dataset first against `armd --follower mock` (or `sim`), then on the real arm
   with `--max-seconds` 10..20 and the user at the arm.

@@ -144,7 +144,7 @@ uv sync                      # SDK only
 uv sync --extra agent        # + MCP server: mcp 2.x, av, pillow
 uv sync --extra calib        # + OpenCV for tools/calibrate_intrinsics.py
 uv sync --extra record       # + PyAV, pyarrow for rebot-record
-uv sync --extra policy       # + PyAV, pyarrow, torch, lerobot[dataset] for rebot-policy
+uv sync --extra policy       # + PyAV, pyarrow for rebot-policy (learned policies: see Run a learned policy)
 uv sync --all-extras         # everything (development)
 ```
 
@@ -153,7 +153,7 @@ uv sync --all-extras         # everything (development)
 | `agent` | `mcp>=2.3,<3`, `av>=12`, `pillow>=10` | `rebot-mcp`, snapshots with PyAV, annotated snapshots |
 | `calib` | `opencv-python-headless>=4.8,<5` | camera intrinsics tool |
 | `record` | `av>=12`, `pyarrow>=14` | `rebot-record` (LeRobot dataset recorder) |
-| `policy` | `av>=12`, `pyarrow>=14`, `torch>=2.7`, `lerobot[dataset]>=0.6.1,<0.8` (torch and lerobot only on Python >= 3.12) | `rebot-policy` (policy runner) |
+| `policy` | `av>=12`, `pyarrow>=14` | `rebot-policy` (camera, scripted policies); torch and lerobot are installed separately |
 
 The test suite runs against the versions pinned in `uv.lock` (for example mcp 2.3.0).
 
@@ -740,14 +740,21 @@ through armd's servo stream. armd's servo guard (speed cap, lead cap, blocked ho
 guard and faults apply as for any other client.
 
 ```bash
-uv sync --extra policy
 # scripted policies, no torch: replay a recorded episode, or a small sine on one joint
-uv run rebot-policy --armd 127.0.0.1 --policy replay:$HOME/.cache/huggingface/lerobot/user/pick_cup:0
-uv run rebot-policy --armd 127.0.0.1 --policy sine:1:0.05:4 --max-seconds 20
-# a LeRobot policy (local directory saved by lerobot-train, or a Hub repo id), on the real arm
-uv run rebot-policy --armd 192.168.16.1 --camera 192.168.16.1 --policy outputs/train/act/checkpoints/last/pretrained_model \
+uv run --extra policy rebot-policy --armd 127.0.0.1 --policy replay:$HOME/.cache/huggingface/lerobot/user/pick_cup:0
+uv run --extra policy rebot-policy --armd 127.0.0.1 --policy sine:1:0.05:4 --max-seconds 20
+# a LeRobot policy (local directory saved by lerobot-train, or a Hub repo id), on the real arm;
+# torch + lerobot are added for this run only, in a Python 3.12 environment
+uv run --python 3.12 --extra policy --with 'lerobot[dataset]>=0.6.1,<0.8' rebot-policy \
+  --armd 192.168.16.1 --camera 192.168.16.1 --policy outputs/train/act/checkpoints/last/pretrained_model \
   --fps 30 --max-seconds 60 --task "pick the cup" --i-am-at-the-arm --log run.jsonl
 ```
+
+torch and lerobot (0.6.1 or 0.7.0, Python >= 3.12, several GB) are not dependencies of
+rebot-companion. Either add them per run with `uv run --with` as above (inside this repository
+`--python 3.12` makes the project environment use Python 3.12), or install rebot-companion into
+the Python environment where lerobot is already installed (for example the training environment).
+The runner imports them only for a learned policy.
 
 | Option | Meaning |
 |---|---|
@@ -798,7 +805,7 @@ preemption, servo rejection, policy stall, bad action and policy exception; park
 replay through the fake armd -> a second recorder run observes the same trajectory); the CLI over
 HTTP. A randomly initialised ACT policy (lerobot 0.7.0, built for the recorder's synthetic features:
 7-joint state and action, one 64x48 camera) runs 10 steps with images from an H.264 WebSocket
-stream in the reCamera format; that test runs when lerobot imports (extra `policy`) or
+stream in the reCamera format; that test runs when lerobot imports or
 `REBOT_LEROBOT_PYTHON` names a Python with `lerobot[dataset]`, PyAV, pyarrow and scipy, else it is
 skipped. The same lerobot calls exist in 0.6.1 (source read, not run). Not yet run against a real
 armd, the simulator or a trained policy.

@@ -36,7 +36,8 @@ Policies (``--policy``):
   (1..7 or a joint name); ``amp`` <= 0.5 rad.
 * anything else: a LeRobot pretrained policy directory or Hub repo id (``PreTrainedConfig`` /
   ``PreTrainedPolicy.from_pretrained``, the saved pre/post-processors, ``predict_action``).
-  Needs ``torch`` and ``lerobot`` (extra ``policy``; Python >= 3.12); imported only for this case.
+  Needs ``torch`` and ``lerobot`` 0.6.1 / 0.7.0 (Python >= 3.12), which are not dependencies of this package;
+  e.g. ``uv run --python 3.12 --with 'lerobot[dataset]' rebot-policy ...``. Imported only for this case.
 
 A ``scripted:`` prefix on ``replay:`` / ``sine:`` is accepted. When armd's follower is not ``mock``
 or ``sim`` (``GET /api/v1/safety/describe`` ``device.follower``, unknown on armd without
@@ -169,8 +170,8 @@ class LeRobotPolicy(Policy):
             from lerobot.policies.factory import get_policy_class, make_pre_post_processors
         except ImportError as exc:
             raise RunnerError(
-                "learned policies need torch and lerobot (pip install 'rebot-companion[policy]', Python >= 3.12): "
-                f"{exc}"
+                "learned policies need torch and lerobot in this Python (>= 3.12), e.g. "
+                f"uv run --python 3.12 --with 'lerobot[dataset]' rebot-policy ...: {exc}"
             ) from exc
         try:
             from lerobot.common.control_utils import predict_action  # 0.6.1, 0.7.0
