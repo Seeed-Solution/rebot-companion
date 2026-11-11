@@ -254,6 +254,41 @@ def test_interrupt_before_torque_on_only_releases(arm, monkeypatch):
     assert arm.commands == [] and arm.lease is None
 
 
+def test_cli_a_second_signal_during_cleanup_does_not_abort_stop_and_park(http_armd, capfd, monkeypatch):
+    """Ctrl-C mid-run, then Ctrl-C and SIGTERM again during motion/stop and unload: cleanup completes."""
+    import signal
+
+    if threading.current_thread() is not threading.main_thread():
+        pytest.skip("signals are delivered to the main thread")
+    import rebot_companion.policy_runner as pr
+
+    class CtrlC(Policy):
+        def select(self, obs, step, t):
+            if step == 3:
+                os.kill(os.getpid(), signal.SIGINT)
+            return np.array(obs["observation.state"], dtype=float)
+
+    def again(real, *sigs):
+        def wrapper(self, *a, **k):
+            for sig in sigs:
+                os.kill(os.getpid(), sig)  # the handler runs on this (main) thread before the call
+            return real(self, *a, **k)
+
+        return wrapper
+
+    monkeypatch.setattr(pr, "parse_policy", lambda *a, **k: CtrlC())
+    monkeypatch.setattr(ArmSession, "stop", again(ArmSession.stop, signal.SIGINT))
+    monkeypatch.setattr(ArmSession, "unload", again(ArmSession.unload, signal.SIGINT, signal.SIGTERM))
+    before = signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGTERM)
+    assert main(["--armd", http_armd.http_url, "--policy", "x", "--max-seconds", "10"]) == 130
+    out = capfd.readouterr()
+    assert "stopped: interrupted" in out.out and "parked" in out.out, out
+    assert "Traceback" not in out.err and out.err.count("finishing stop and park") == 3, out.err
+    assert http_armd.commands[-2:] == ["/api/v1/motion/stop", "/api/v1/motion/unload"]
+    assert not http_armd.is_torqued and http_armd.lease is None
+    assert (signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGTERM)) == before  # restored
+
+
 def test_cli_ctrl_c_before_the_run_returns_130(http_armd, capsys, monkeypatch):
     def ctrl_c(self):
         raise KeyboardInterrupt

@@ -568,8 +568,19 @@ class PolicyRunner:
         self._last_seq: Any = None
         self._streaming = False
         self._torque_sent = False  # torque-on was sent: the arm may be armed, so cleanup stops and parks
+        self._stopping = False  # stop/cleanup in progress: handle_signal ignores further signals
 
     # ---- stop bookkeeping ----------------------------------------------------
+
+    def handle_signal(self, signum: int, frame: Any = None) -> None:
+        """SIGINT / SIGTERM handler (install on the main thread, which calls :meth:`run`). The first signal
+        while the run is active raises KeyboardInterrupt, which stops the run on its normal path. Once a stop
+        is in progress, later signals are ignored so stop, e-stop and park complete."""
+        if self._stopping or self._stop.is_set():
+            os.write(2, b"rebot-policy: stopping; finishing stop and park\n")  # print() is not reentrant
+            return
+        self._stopping = True
+        raise KeyboardInterrupt
 
     def request_stop(self, reason: str, detail: str = "") -> None:
         """First reason wins. Cancels the stream first; returns after any in-flight frame has been written."""
@@ -812,22 +823,27 @@ class PolicyRunner:
                 t_start = time.monotonic()
                 self._loop()
             except KeyboardInterrupt:
+                self._stopping = True
                 self.request_stop("interrupted", "Ctrl-C / SIGTERM")
             except RunnerError:
+                self._stopping = True
                 if not self._streaming:
                     raise
                 self.request_stop("error", str(sys.exc_info()[1]))
             except Exception as exc:
+                self._stopping = True
                 if not self._streaming:
                     raise
                 self.request_stop("error", f"{type(exc).__name__}: {exc}")
             finally:
+                self._stopping = True
                 self._stop.set()
                 sender_done = self._stop_sender()
                 self.result.duration_s = round(time.monotonic() - t_start, 3)
                 if (self._streaming or self._torque_sent) and sender_done:
                     self._finish()
         finally:
+            self._stopping = True
             if self.session is not None:
                 try:
                     self.session.close()
@@ -1114,10 +1130,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     def _term(*_: Any) -> None:
         raise KeyboardInterrupt
 
+    saved: dict[int, Any] = {}
+
+    def _handle(sig: int, handler: Any) -> None:
+        try:
+            old = signal.signal(sig, handler)
+        except ValueError:  # not the main thread
+            return
+        saved.setdefault(sig, old)
+
+    _handle(signal.SIGTERM, _term)
     try:
-        signal.signal(signal.SIGTERM, _term)
-    except ValueError:  # not the main thread (tests)
-        pass
+        return _main(args, _handle)
+    finally:
+        for sig, old in saved.items():
+            signal.signal(sig, old)
+
+
+def _main(args: argparse.Namespace, handle: Any) -> int:
     camera = None
     try:
         policy = parse_policy(args.policy, device=args.device, task=args.task)
@@ -1147,6 +1177,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             + (f" from {policy.source}" if policy.source else "")
             + (f", camera {policy.image_key} {policy.image_size}" if policy.image_key else "")
         )
+        # from here a second Ctrl-C / SIGTERM during the stop and park is ignored instead of aborting it
+        handle(signal.SIGINT, runner.handle_signal)
+        handle(signal.SIGTERM, runner.handle_signal)
         result = runner.run()
     except (RunnerError, ValueError, ImportError, RebotError, OSError) as exc:
         print(f"rebot-policy: {exc}", file=sys.stderr)
