@@ -350,6 +350,7 @@ class PolicyRunner:
         operator_present: bool = False,
         stall_s: float = 1.0,
         max_frame_age_s: float = 0.5,
+        max_obs_age_s: float = 0.1,
         log_path: str | Path | None = None,
         client_id: str | None = None,
         connect_timeout: float = 5.0,
@@ -365,6 +366,7 @@ class PolicyRunner:
         self.max_seconds = _positive("max_seconds", max_seconds)
         self.stall_s = _positive("stall_s", stall_s)
         self.max_frame_age_s = _positive("max_frame_age_s", max_frame_age_s)
+        self.max_obs_age_s = _positive("max_obs_age_s", max_obs_age_s)
         self.client = client
         self.policy = policy
         self.camera = camera
@@ -420,6 +422,19 @@ class PolicyRunner:
                 self._send_lock.release()
         if first:
             log.warning("stop: %s %s", reason, detail)
+
+    def _check_telemetry(self, timed: tuple[float, ArmStatus] | None, now: float) -> tuple[str, str] | None:
+        """Age and shape of the newest observation (before every servo frame and policy step)."""
+        if timed is None:
+            return "stale_observation", "no observation"
+        rx, obs = timed
+        age = now - rx
+        if age > self.max_obs_age_s:
+            return "stale_observation", f"newest observation is {age * 1000:.0f} ms old"
+        pos = obs.positions
+        if len(pos) != len(JOINT_NAMES) or not all(math.isfinite(p) for p in pos):
+            return "bad_observation", f"positions {pos}"
+        return None
 
     def _check(self, obs: ArmStatus, count: bool = False) -> tuple[str, str] | None:
         if obs.safety_state == "EStop":
@@ -529,6 +544,10 @@ class PolicyRunner:
                     break
                 self._lat["send_lag"].append(max(0.0, now - next_t))
                 timed = s.latest_observation_timed()
+                stop = self._check_telemetry(timed, time.monotonic())
+                if stop:
+                    self.request_stop(*stop)
+                    break
                 obs = timed[1]
                 stop = self._check(obs, count=True)
                 if stop:
@@ -710,7 +729,12 @@ class PolicyRunner:
             if now >= self._deadline:
                 self.request_stop("max_seconds", f"{self.max_seconds:g} s")
                 break
-            rx, obs = s.latest_observation_timed()
+            timed = s.latest_observation_timed()
+            stop = self._check_telemetry(timed, time.monotonic())
+            if stop:
+                self.request_stop(*stop)
+                break
+            rx, obs = timed
             self._lat["obs_age"].append(now - rx)
             stop = self._check(obs)
             if stop:
@@ -830,6 +854,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--no-park", action="store_true", help="hold position at the end instead of parking")
     p.add_argument("--stall-s", type=float, default=1.0, help="stop when the policy gives no target for this long")
     p.add_argument("--max-frame-age", type=float, default=0.5, help="stop when the newest camera frame is older (s)")
+    p.add_argument("--max-obs-age", type=float, default=0.1, help="stop when the newest armd observation is older (s)")
     p.add_argument("--log", help="write per-step JSON lines (latency, action, state) and a summary")
     p.add_argument(
         "--i-am-at-the-arm",
@@ -866,6 +891,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             operator_present=args.i_am_at_the_arm,
             stall_s=args.stall_s,
             max_frame_age_s=args.max_frame_age,
+            max_obs_age_s=args.max_obs_age,
             log_path=args.log,
         )
         print(

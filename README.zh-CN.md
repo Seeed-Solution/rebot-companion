@@ -708,7 +708,7 @@ rebot-companion 安装到已装有 lerobot 的 Python 环境（例如训练环�
 | `--task` | 传给策略的任务文本（语言条件策略） |
 | `--device` | torch 设备（默认有 CUDA 时用 `cuda`，否则 `cpu`） |
 | `--no-park` | 结束时保持位置，不停靠 |
-| `--stall-s`、`--max-frame-age` | 策略超过该时长没有给出目标（默认 1 s），或最新相机帧超过该时长（默认 0.5 s）时停止 |
+| `--stall-s`、`--max-frame-age`、`--max-obs-age` | 策略超过该时长没有给出目标（默认 1 s）、最新相机帧超过该时长（默认 0.5 s），或最新 armd 观测超过该时长（默认 0.1 s；每个 servo 帧和策略步前检查）时停止 |
 | `--log` | 每步一行 JSON（观测延迟、相机延迟、推理 ms、步延迟、动作、状态），最后一行为汇总 |
 | `--i-am-at-the-arm` | armd 的 follower（`GET /api/v1/safety/describe` 的 `device.follower`）不是 `mock` 或 `sim`、或无法读取时必须加 |
 
@@ -727,7 +727,7 @@ rebot-companion 安装到已装有 lerobot 的 Python 环境（例如训练环�
 学习策略在开始发送前先做一次预热推理。`--max-seconds` 是从开始发送算起的绝对截止时间，发送线程在每帧前
 检查，推理变慢不会延长运行。时序参数必须是有限值且 > 0。
 
-停止条件：急停、Fault、碰撞保持、servo `blocked` 保持、力矩关闭、租约丢失、servo 被拒（如
+停止条件：armd 观测过旧或格式错误（不是 7 个有限值位置）、急停、Fault、碰撞保持、servo `blocked` 保持、力矩关闭、租约丢失、servo 被拒（如
 `MOTION_BUSY`）、连接断开、策略停滞、相机帧过旧、动作非有限值或长度不对、策略异常、回放的 episode
 结束、`--max-seconds`、Ctrl+C 或 SIGTERM。之后结束 servo 流，机械臂保持（`motion/stop`）并停靠
 （`unload`），`--no-park` 时不停靠；Fault、急停、碰撞保持或租约丢失后不停靠（汇总写明原因）。请求停止后不再发送 servo 帧；每次 socket 发送最长 1 s。停止 2 s 后发送线程仍未结束时，运行器

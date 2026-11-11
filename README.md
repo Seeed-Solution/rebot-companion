@@ -765,7 +765,7 @@ The runner imports them only for a learned policy.
 | `--task` | task text passed to the policy (language-conditioned policies) |
 | `--device` | torch device (default `cuda` when available, else `cpu`) |
 | `--no-park` | hold position at the end instead of parking |
-| `--stall-s`, `--max-frame-age` | stop when the policy gives no target for this long (default 1 s) or the newest camera frame is older (default 0.5 s) |
+| `--stall-s`, `--max-frame-age`, `--max-obs-age` | stop when the policy gives no target for this long (default 1 s), the newest camera frame is older (default 0.5 s), or the newest armd observation is older (default 0.1 s; checked before every servo frame and policy step) |
 | `--log` | per-step JSON lines (observation age, camera age, inference ms, step lag, action, state) and a summary line |
 | `--i-am-at-the-arm` | required when armd's follower (`GET /api/v1/safety/describe` `device.follower`) is not `mock` or `sim`, or unknown |
 
@@ -790,7 +790,7 @@ Learned policies run one warm-up inference before the stream starts. `--max-seco
 deadline from the start of the stream, checked by the sender before every frame, so slow inference
 does not extend the run. Timing options must be finite and > 0.
 
-Stops: E-stop, Fault, collision hold, servo `blocked` hold, torque off, lease loss, servo rejection
+Stops: stale or malformed armd observation (not 7 finite positions), E-stop, Fault, collision hold, servo `blocked` hold, torque off, lease loss, servo rejection
 (for example `MOTION_BUSY`), connection loss, policy stall, stale camera frame, a non-finite or
 wrong-sized action, policy exception, end of a replayed episode, `--max-seconds`, Ctrl+C or
 SIGTERM. Then the stream ends, the arm holds (`motion/stop`) and parks (`unload`) unless

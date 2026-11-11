@@ -638,3 +638,34 @@ def test_max_seconds_holds_while_inference_blocks(arm):
     assert res.reason == "max_seconds", res
     assert res.frames <= 0.1 * 50 + 2
     assert res.duration_s < 1.0
+
+
+# --------------------------------------------------------------------------- telemetry checks
+
+
+def test_stale_telemetry_stops_the_sender():
+    r = stub_runner()
+    r.session = StubSession(r, age=0.2)  # newest observation received 200 ms ago
+    r._send_loop()
+    assert r.session.sent == [] and r.result.reason == "stale_observation"
+
+
+@pytest.mark.parametrize("positions", [[float("nan")] + HOME[1:], HOME[:6], [float("inf")] * 7])
+def test_malformed_telemetry_stops_the_sender(positions):
+    r = stub_runner()
+    r.session = StubSession(r, obs=obs_status(positions))
+    r._send_loop()
+    assert r.session.sent == [] and r.result.reason == "bad_observation"
+
+
+@pytest.mark.parametrize("value", [float("nan"), 0, -0.1])
+def test_max_obs_age_is_validated(value):
+    with pytest.raises(ValueError, match="max_obs_age_s"):
+        PolicyRunner(None, SinePolicy(0, 0.05, 1.0), max_obs_age_s=value)
+
+
+def test_fresh_telemetry_keeps_streaming():
+    r = stub_runner()
+    r.session = StubSession(r, max_frames=3)
+    r._send_loop()
+    assert len(r.session.sent) == 3 and r.result.reason == "test_done"
