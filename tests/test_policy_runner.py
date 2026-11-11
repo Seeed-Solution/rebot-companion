@@ -488,6 +488,48 @@ def test_pretrained_fps_from_train_config(tmp_path, monkeypatch):
     assert pretrained_fps(model)[0] == FPS
 
 
+@pytest.mark.parametrize(
+    "cfg,match",
+    [
+        ({"env": {"fps": 30.9}}, "whole number"),
+        ({"env": {"fps": float("inf")}}, "whole number"),
+        ({"env": {"fps": float("nan")}}, "whole number"),
+        ({"env": {"fps": 0}}, "whole number"),
+        ({"env": {"fps": "30"}}, "whole number"),
+        ({"env": {"fps": True}}, "whole number"),
+        ({"env": "pusht"}, "not a JSON object"),
+        ({"env": None, "dataset": [1]}, "not a JSON object"),
+        ({"dataset": {"root": 3}}, "not a string"),
+        ([1, 2], "not a JSON object"),
+    ],
+)
+def test_malformed_train_config_fps_is_refused(tmp_path, cfg, match):
+    from rebot_companion.policy_runner import pretrained_fps
+
+    (tmp_path / "train_config.json").write_text(json.dumps(cfg))  # json writes inf/nan as Infinity/NaN
+    with pytest.raises(ValueError, match=match):
+        pretrained_fps(tmp_path)
+
+
+def test_malformed_dataset_info_fps_is_refused(tmp_path):
+    from rebot_companion.policy_runner import pretrained_fps
+
+    (tmp_path / "ds" / "meta").mkdir(parents=True)
+    (tmp_path / "ds" / "meta" / "info.json").write_text(json.dumps({"fps": 29.97}))
+    (tmp_path / "train_config.json").write_text(json.dumps({"dataset": {"root": str(tmp_path / "ds")}}))
+    with pytest.raises(ValueError, match="29.97"):
+        pretrained_fps(tmp_path)
+    assert pretrained_fps(tmp_path / "ds") is None  # no train_config.json at all
+
+
+def test_unknown_policy_fps_names_the_problem():
+    class Unknown(Policy):
+        fps, fps_problem = None, "train_config.json env fps 30.9 is not a whole number > 0"
+
+    with pytest.raises(ValueError, match=r"30.9 .*pass --fps"):
+        PolicyRunner(None, Unknown())
+
+
 def test_unknown_policy_fps_needs_an_explicit_fps():
     class Unknown(Policy):
         fps = None

@@ -115,6 +115,7 @@ class Policy:
     name = "policy"
     source = ""  # where a learned policy was loaded from (local directory / Hugging Face Hub)
     fps: int | None = 30
+    fps_problem = ""  # why fps is None (shown when the runner asks for an explicit fps)
     inputs: tuple[str, ...] = (STATE_KEY,)
     image_key: str | None = None
     image_size: tuple[int, int] | None = None
@@ -249,7 +250,13 @@ class LeRobotPolicy(Policy):
             c, h, w = inputs[self.image_key].shape
             self.image_size = (int(h), int(w))
         self.inputs = tuple(inputs)
-        found = pretrained_fps(path)
+        try:
+            found = pretrained_fps(path)
+        except ValueError as exc:
+            found, self.fps_problem = None, str(exc)
+            log.warning("policy fps unknown: %s", exc)
+        else:
+            self.fps_problem = "" if found else "no fps in its train_config.json or training dataset"
         self.fps = found[0] if found else None
         if found:
             log.info("policy fps %d from %s", *found)
@@ -269,14 +276,26 @@ class LeRobotPolicy(Policy):
         return action.squeeze(0).to("cpu").numpy().astype(np.float64)
 
 
-def _fps_value(value: Any) -> int | None:
-    return int(value) if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0 else None
+def _fps_field(container: Any, where: str) -> int | None:
+    """``container["fps"]`` as a whole number > 0; None when absent. ValueError when ``container`` is not
+    a JSON object or the fps is not a finite, positive, integral number."""
+    if container is None:
+        return None
+    if not isinstance(container, dict):
+        raise ValueError(f"{where} is not a JSON object")
+    v = container.get("fps")
+    if v is None:
+        return None
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v <= 0 or v != int(v):
+        raise ValueError(f"{where} fps {v!r} is not a whole number > 0")
+    return int(v)
 
 
 def pretrained_fps(path: str | Path) -> tuple[int, str] | None:
     """``(fps, where it came from)`` for a LeRobot pretrained directory or Hub repo id, from its
     ``train_config.json``: ``env.fps``, ``dataset.fps``, else the training dataset's ``meta/info.json``
-    (``dataset.root``, else ``$HF_LEROBOT_HOME/<dataset.repo_id>``). None when none of them is available."""
+    (``dataset.root``, else ``$HF_LEROBOT_HOME/<dataset.repo_id>``). None when none of them is available;
+    ValueError when one of them is malformed (not an object, fps not a whole number > 0)."""
     local = Path(path).expanduser()
     cfg_file = local / "train_config.json"
     if not local.is_dir():
@@ -289,26 +308,35 @@ def pretrained_fps(path: str | Path) -> tuple[int, str] | None:
             return None
     try:
         cfg = json.loads(cfg_file.read_text())
-    except (OSError, ValueError) as exc:
-        log.info("no usable train_config.json in %s: %s", path, exc)
+    except FileNotFoundError:
         return None
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"{cfg_file} is not readable JSON: {exc}") from None
+    if not isinstance(cfg, dict):
+        raise ValueError(f"{cfg_file} is not a JSON object")
     for section in ("env", "dataset"):
-        fps = _fps_value((cfg.get(section) or {}).get("fps"))
+        fps = _fps_field(cfg.get(section), f"{cfg_file} {section}")
         if fps:
             return fps, f"{cfg_file} {section}.fps"
     dataset = cfg.get("dataset") or {}
     roots = []
+    for key in ("root", "repo_id"):
+        if dataset.get(key) is not None and not isinstance(dataset[key], str):
+            raise ValueError(f"{cfg_file} dataset.{key} {dataset[key]!r} is not a string")
     if dataset.get("root"):
         roots.append(Path(dataset["root"]).expanduser())
     if dataset.get("repo_id"):
         home = os.environ.get("HF_LEROBOT_HOME") or Path.home() / ".cache" / "huggingface" / "lerobot"
-        roots.append(Path(home) / str(dataset["repo_id"]))
+        roots.append(Path(home) / dataset["repo_id"])
     for root in roots:
         info = root / "meta" / "info.json"
         try:
-            fps = _fps_value(json.loads(info.read_text()).get("fps"))
-        except (OSError, ValueError):
+            meta = json.loads(info.read_text())
+        except FileNotFoundError:
             continue
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"{info} is not readable JSON: {exc}") from None
+        fps = _fps_field(meta, str(info))
         if fps:
             return fps, str(info)
     return None
@@ -496,9 +524,7 @@ class PolicyRunner:
         sender_join_s: float = 2 * SEND_TIMEOUT_S,
     ) -> None:
         if fps is None and policy.fps is None:
-            raise ValueError(
-                f"fps of {policy.name} is unknown (no fps in its train_config.json or training dataset): pass --fps"
-            )
+            raise ValueError(f"fps of {policy.name} is unknown ({policy.fps_problem or 'not given'}): pass --fps")
         if fps is not None and policy.fps is not None and fps != policy.fps:
             log.warning("fps %s differs from the %d fps %s was made for", fps, policy.fps, policy.name)
         fps_v = _positive("fps", policy.fps if fps is None else fps)
