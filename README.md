@@ -54,6 +54,7 @@ Python SDK and stdio [MCP](https://modelcontextprotocol.io) server bridging **Se
 - [Hand-eye calibration](#hand-eye-calibration)
 - [Camera intrinsics](#camera-intrinsics)
 - [Record a LeRobot dataset](#record-a-lerobot-dataset)
+- [Run a learned policy](#run-a-learned-policy)
 - [Examples](#examples)
 - [Safety](#safety)
 - [Development](#development)
@@ -143,6 +144,7 @@ uv sync                      # SDK only
 uv sync --extra agent        # + MCP server: mcp 2.x, av, pillow
 uv sync --extra calib        # + OpenCV for tools/calibrate_intrinsics.py
 uv sync --extra record       # + PyAV, pyarrow for rebot-record
+uv sync --extra policy       # + PyAV, pyarrow, torch, lerobot[dataset] for rebot-policy
 uv sync --all-extras         # everything (development)
 ```
 
@@ -151,6 +153,7 @@ uv sync --all-extras         # everything (development)
 | `agent` | `mcp>=2.3,<3`, `av>=12`, `pillow>=10` | `rebot-mcp`, snapshots with PyAV, annotated snapshots |
 | `calib` | `opencv-python-headless>=4.8,<5` | camera intrinsics tool |
 | `record` | `av>=12`, `pyarrow>=14` | `rebot-record` (LeRobot dataset recorder) |
+| `policy` | `av>=12`, `pyarrow>=14`, `torch>=2.7`, `lerobot[dataset]>=0.6.1,<0.8` (torch and lerobot only on Python >= 3.12) | `rebot-policy` (policy runner) |
 
 The test suite runs against the versions pinned in `uv.lock` (for example mcp 2.3.0).
 
@@ -299,6 +302,7 @@ rebot-companion/
 │   ├── camera_client.py        # reCamera rebot-vision / aruco-detector client (trigger / latest result)
 │   ├── snapshot.py             # JPEG snapshots from the H.264 stream + detection overlay
 │   ├── lerobot_recorder.py     # LeRobot v3.0 dataset recorder (rebot-record)
+│   ├── policy_runner.py        # LeRobot / scripted policy -> armd servo stream (rebot-policy)
 │   ├── mcp_server.py           # stdio MCP server (rebot-mcp)
 │   ├── kinematics.py           # B601-DM FK (full URDF chain) and planar FK/IK (port of the Web cockpit)
 │   ├── ik.py                   # IK adapter: base-frame pose -> armd 7-joint vector (incl. gripper)
@@ -726,6 +730,78 @@ metadata; one mp4 frame per row; a lease-free run against the fake armd; the Ent
 lerobot 0.6.1 (PyAV decoder) and 0.7.0 (torchcodec decoder) on Linux aarch64; this test runs
 when `REBOT_LEROBOT_PYTHON` names a Python with `lerobot[dataset]` installed, else it is skipped.
 Not yet run against a real armd and reCamera.
+
+---
+
+## Run a learned policy
+
+`rebot-policy` runs a policy on the host PC (GPU host for learned policies) and drives the arm
+through armd's servo stream. armd's servo guard (speed cap, lead cap, blocked hold), collision
+guard and faults apply as for any other client.
+
+```bash
+uv sync --extra policy
+# scripted policies, no torch: replay a recorded episode, or a small sine on one joint
+uv run rebot-policy --armd 127.0.0.1 --policy replay:$HOME/.cache/huggingface/lerobot/user/pick_cup:0
+uv run rebot-policy --armd 127.0.0.1 --policy sine:1:0.05:4 --max-seconds 20
+# a LeRobot policy (local directory saved by lerobot-train, or a Hub repo id), on the real arm
+uv run rebot-policy --armd 192.168.16.1 --camera 192.168.16.1 --policy outputs/train/act/checkpoints/last/pretrained_model \
+  --fps 30 --max-seconds 60 --task "pick the cup" --i-am-at-the-arm --log run.jsonl
+```
+
+| Option | Meaning |
+|---|---|
+| `--policy` | LeRobot pretrained directory or Hub repo id; `replay:<dataset root>:<episode>` (the episode's `action` column); `sine:<joint>:<amp rad>:<period s>` (joint 1..7 or a name, amp <= 0.5 rad); a `scripted:` prefix is accepted |
+| `--fps` | policy steps per second (default: the dataset fps for `replay`, else 30); use the fps of the training dataset |
+| `--servo-hz` | servo frame rate (default 50, armd's control rate) |
+| `--max-seconds` | run length (default 60) |
+| `--task` | task text passed to the policy (language-conditioned policies) |
+| `--device` | torch device (default `cuda` when available, else `cpu`) |
+| `--no-park` | hold position at the end instead of parking |
+| `--stall-s`, `--max-frame-age` | stop when the policy gives no target for this long (default 1 s) or the newest camera frame is older (default 0.5 s) |
+| `--log` | per-step JSON lines (observation age, camera age, inference ms, step lag, action, state) and a summary line |
+| `--i-am-at-the-arm` | required when armd's follower (`GET /api/v1/safety/describe` `device.follower`) is not `mock` or `sim`, or unknown |
+
+Observation, built like a `rebot-record` row: `observation.state` = armd `positions` (7, float32);
+`observation.velocity` / `observation.effort` = `velocities` / `torques` when the policy has these
+inputs; the policy's single image input (for example `observation.images.recamera`) = the newest
+decoded reCamera frame, RGB uint8, resized with PyAV to the policy's input height and width (the
+recorder resizes with the same PyAV call before encoding). The action (7) is the joint target, the
+recorder's `commanded_positions`. Learned policies are loaded with lerobot's
+`PreTrainedConfig.from_pretrained`, `get_policy_class(type).from_pretrained` and the saved
+pre/post-processors (`make_pre_post_processors`), and stepped with `predict_action` (one action per
+step; ACT-style policies return the next action of their chunk). Policies with more than one camera
+or other inputs are refused.
+
+Timing: policy steps run at `--fps` on the main thread. A sender thread streams servo frames at
+`--servo-hz`: each new target is reached by linear interpolation from the last sent frame over one
+policy period, then held. Every frame is clipped to the joint limits and, for joints 1..6, to
+measured position ± 0.95 × `servo_max_lead_rad` (armd schema, default 0.2 rad); the summary counts
+clipped frames per joint and the `observation.motion_limit` reasons armd reported. A step that is
+more than one period late is counted and the schedule restarts from it (no burst of catch-up steps).
+Learned policies run one warm-up inference before the stream starts.
+
+Stops: E-stop, Fault, collision hold, servo `blocked` hold, torque off, lease loss, servo rejection
+(for example `MOTION_BUSY`), connection loss, policy stall, stale camera frame, a non-finite or
+wrong-sized action, policy exception, end of a replayed episode, `--max-seconds`, Ctrl+C or
+SIGTERM. Then the stream ends, the arm holds (`motion/stop`) and parks (`unload`) unless
+`--no-park`; no park after a Fault, E-stop, collision hold or lease loss (the summary says why).
+The runner never clears a fault. Exit code 0 after `max_seconds` or the end of a replay, 130 after
+Ctrl+C, else 1. Python API: `PolicyRunner(ArmdClient(url), parse_policy(spec), camera).run()`
+returns a `RunResult`.
+
+Verified (`tests/test_policy_runner.py`, fake armd): servo frames arrive in order at ~50 Hz without
+dropped frames; interpolation between policy steps; lead clip (frames within the lead of the
+measured position) and joint-limit clip; stop on fault, E-stop, collision hold, blocked hold, lease
+preemption, servo rejection, policy stall, bad action and policy exception; park at the end and
+`--no-park`; the operator flag for a non-mock follower; a replay round trip (recorder dataset ->
+replay through the fake armd -> a second recorder run observes the same trajectory); the CLI over
+HTTP. A randomly initialised ACT policy (lerobot 0.7.0, built for the recorder's synthetic features:
+7-joint state and action, one 64x48 camera) runs 10 steps with images from an H.264 WebSocket
+stream in the reCamera format; that test runs when lerobot imports (extra `policy`) or
+`REBOT_LEROBOT_PYTHON` names a Python with `lerobot[dataset]`, PyAV, pyarrow and scipy, else it is
+skipped. The same lerobot calls exist in 0.6.1 (source read, not run). Not yet run against a real
+armd, the simulator or a trained policy.
 
 ---
 
