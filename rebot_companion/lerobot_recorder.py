@@ -669,11 +669,13 @@ class LeRobotRecorder:
     def stop_episode(self) -> EpisodeSummary:
         """End the active episode; it waits for :meth:`save` or :meth:`discard`."""
         ep = self._require_recording()
-        self._recording = False
+        # Stop and join the sampler before leaving the recording state: a sampler tick that is
+        # already inside add_frame() must still find the episode active.
         if self._sampler is not None:
             self._stop_sampling.set()
             self._sampler.join()
             self._sampler = None
+        self._recording = False
         if ep.video is not None:
             ep.video.close()
         if self._sampler_error is not None:
