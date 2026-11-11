@@ -1087,6 +1087,40 @@ def test_inference_that_never_returns_still_stops_parks_and_releases(arm, kw, re
     assert "/api/v1/motion/unload" in arm.commands and arm.lease is None
 
 
+def test_the_inference_thread_ends_with_the_run_and_a_runner_runs_once(arm):
+    policy = SinePolicy(0, 0.05, 1.0)
+    r = runner(arm, policy, max_steps=3, park=False)
+    assert r.run().reason == "max_steps"
+    t = policy._inference_thread
+    assert t is not None and not t.is_alive()  # joined: the thread no longer holds the policy
+    with pytest.raises(RunnerError, match="runs once"):
+        r.run()
+    assert runner(arm, policy, max_steps=3, park=False).run().reason == "max_steps"  # a new runner may reuse it
+
+
+def test_a_policy_with_an_abandoned_inference_is_not_reused(arm):
+    never = threading.Event()
+
+    class Forever(Policy):
+        def select(self, obs, step, t):
+            if step == 2:
+                never.wait(10)
+            return np.array(obs["observation.state"], dtype=float)
+
+    policy = Forever()
+    try:
+        assert runner(arm, policy, max_seconds=10, stall_s=0.3).run().reason == "policy_stall"
+        t = policy._inference_thread
+        assert t.is_alive()  # still inside select
+        with pytest.raises(RunnerError, match="abandoned"):
+            runner(arm, policy, max_seconds=0.2).run()
+    finally:
+        never.set()
+    t.join(5)
+    assert not t.is_alive()  # the queued sentinel ends it once select returns
+    assert runner(arm, policy, max_seconds=0.2, park=False).run().reason == "max_seconds"
+
+
 @pytest.mark.parametrize("join", [0.5, 1.0, 1.49, float("nan")])
 def test_sender_join_must_exceed_the_send_timeout(join):
     with pytest.raises(ValueError, match="sender_join_s"):

@@ -738,7 +738,7 @@ schema 没有给出 7 个有限且 min < max 的关节限位时，运行器在�
 （`unload`），`--no-park` 时不停靠；Fault、急停、碰撞保持或租约丢失后不停靠（汇总写明原因）。请求停止后不再发送 servo 帧；每次 socket 发送最长 1 s。停止 2 s 后（`sender_join_s`，至少为发送超时的 1.5 倍）发送线程仍未结束时，运行器
 发送无需租约的 REST 急停且不停靠。准备阶段（上力矩、预热）在已发送上力矩命令后按 Ctrl+C，同样停止并停靠；在此之前只释放租约。停止开始后，再次 Ctrl+C / SIGTERM 会被忽略（输出提示），直到停止、急停和停靠完成。运行器不会
 清除故障。退出码：`max_seconds`、`max_steps` 或回放结束为 0，Ctrl+C 为 130，其余为 1。Python API：
-`PolicyRunner(ArmdClient(url), parse_policy(spec), camera).run()` 返回 `RunResult`。
+`PolicyRunner(ArmdClient(url), parse_policy(spec), camera).run()` 返回 `RunResult`；一个运行器只能运行一次，上一次运行因停滞或截止时间放弃的推理尚未返回时，该策略对象会被拒绝。
 
 已验证（`tests/test_policy_runner.py`，fake armd）：servo 帧按顺序以约 50 Hz 到达且无丢帧；策略步之间的插值；
 领先量裁剪（帧与实测位置的距离在领先量内）和关节限位裁剪；故障、急停、碰撞保持、受阻保持、租约被抢占、

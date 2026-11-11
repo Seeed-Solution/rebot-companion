@@ -120,6 +120,9 @@ class Policy:
     image_key: str | None = None
     image_size: tuple[int, int] | None = None
     warmup = False  # run one inference before the stream starts (first-call latency)
+    # set by the runner: the inference thread of the last run. While it is alive (a call abandoned after
+    # a stall or the deadline is still inside select) the policy cannot be used by another run.
+    _inference_thread: threading.Thread | None = None
 
     def reset(self) -> None:
         pass
@@ -441,7 +444,8 @@ class RunResult:
 
 class _InferenceWorker:
     """Runs ``policy.select`` on a daemon thread so the main loop can wait with a bound. A call that does
-    not return in time is abandoned (the thread stays blocked; the runner stops and cleans up)."""
+    not return in time is abandoned (the thread stays blocked; the runner stops and cleans up).
+    :meth:`close` ends the thread: at once when idle, else when the abandoned call returns."""
 
     def __init__(self, policy: Policy, wake: threading.Event) -> None:
         self.policy, self.wake = policy, wake
@@ -449,11 +453,24 @@ class _InferenceWorker:
         self._done = threading.Event()
         self._out: tuple[Any, BaseException | None] = (None, None)
         self.busy = False
-        threading.Thread(target=self._run, name="policy-inference", daemon=True).start()
+        self.thread = threading.Thread(target=self._run, name="policy-inference", daemon=True)
+        policy._inference_thread = self.thread
+        self.thread.start()
+
+    def close(self, timeout: float) -> bool:
+        """Stop the thread (sentinel) and wait up to ``timeout``; True when it has ended. An abandoned
+        call is not waited for: the thread ends when it returns."""
+        self._req.put(None)
+        if not self.busy:
+            self.thread.join(timeout)
+        self._out = (None, None)
+        return not self.thread.is_alive()
 
     def _run(self) -> None:
         while True:
             args = self._req.get()
+            if args is None:
+                return
             try:
                 self._out = (self.policy.select(*args), None)
             except BaseException as exc:
@@ -571,6 +588,7 @@ class PolicyRunner:
         self._stop = threading.Event()
         self._wake = threading.Event()  # set by request_stop and by a finished inference
         self._worker: _InferenceWorker | None = None
+        self._ran = False  # a runner runs once
         # _lock guards the segment and the last committed frame; it is never held across I/O.
         self._lock = threading.RLock()
         # _send_lock is held across "stop requested?" + the servo send only. request_stop takes it with a
@@ -833,7 +851,17 @@ class PolicyRunner:
     # ---- run -----------------------------------------------------------------
 
     def run(self) -> RunResult:
-        """Blocks until a stop condition; returns the result (``result.reason`` says why it stopped)."""
+        """Blocks until a stop condition; returns the result (``result.reason`` says why it stopped).
+        A runner runs once; a policy whose inference from an earlier run is still blocked is refused."""
+        if self._ran:
+            raise RunnerError("a PolicyRunner runs once; create a new one")
+        self._ran = True
+        t = self.policy._inference_thread
+        if t is not None and t.is_alive():
+            raise RunnerError(
+                f"policy {self.policy.name} is still inside an inference abandoned by an earlier run; "
+                "wait for it or create a new policy"
+            )
         self._read_arm()
         self.result.lead_clips_per_joint = [0] * len(JOINT_NAMES)
         if self.log_path:
@@ -882,6 +910,7 @@ class PolicyRunner:
                     self._finish()
         finally:
             self._stopping = True
+            self._close_worker()
             if self.session is not None:
                 try:
                     self.session.close()
@@ -912,6 +941,11 @@ class PolicyRunner:
             hz = min(hz, (len(rx) - 1) / (rx[-1] - rx[0]))
         self.max_obs_age_s = max(0.1, 3.0 / hz)
         log.info("observations at %.1f Hz; max observation age %.0f ms", hz, self.max_obs_age_s * 1000)
+
+    def _close_worker(self) -> None:
+        w, self._worker = self._worker, None
+        if w is not None and not w.close(timeout=1.0):
+            log.warning("policy inference is still running (abandoned); its thread ends when it returns")
 
     def _infer(self, args: tuple, timeout: float) -> tuple[bool, Any]:
         if self._worker is None:

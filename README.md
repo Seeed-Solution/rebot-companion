@@ -812,7 +812,8 @@ not park. Ctrl+C during setup after torque-on was sent (arming, warm-up) also st
 arm; before that the lease is only released. Once a stop is in progress, further Ctrl+C / SIGTERM
 are ignored (a note is printed) until stop, e-stop and park have finished. The runner never clears a fault. Exit code 0 after `max_seconds`, `max_steps` or the end of a replay, 130 after
 Ctrl+C, else 1. Python API: `PolicyRunner(ArmdClient(url), parse_policy(spec), camera).run()`
-returns a `RunResult`.
+returns a `RunResult`; a runner runs once, and a policy whose inference was abandoned by an earlier run
+(stall or deadline) is refused until that call returns.
 
 Verified (`tests/test_policy_runner.py`, fake armd): servo frames arrive in order at ~50 Hz without
 dropped frames; interpolation between policy steps; lead clip (frames within the lead of the
