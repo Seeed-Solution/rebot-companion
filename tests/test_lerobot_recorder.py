@@ -285,6 +285,31 @@ def test_overdue_ticks_never_use_samples_received_after_their_due_time(tmp_path)
     assert summary.obs_age_ms_mean >= 0
 
 
+def test_stop_episode_while_the_sampler_is_inside_add_frame(tmp_path):
+    src = FakeObservations()
+    rec = LeRobotRecorder(tmp_path / "race", "test/race", fps=FPS, task="t", obs_source=src, camera_url=None)
+    stopping = threading.Event()
+    real_add, real_stop = rec.add_frame, rec.stop_episode
+
+    def slow_add(*a, **kw):
+        if stopping.is_set() or len(rec._ep.state) >= 3:
+            stopping.wait(2)  # hold this tick until stop_episode() has begun
+            time.sleep(0.05)
+        return real_add(*a, **kw)
+
+    def stop():
+        stopping.set()
+        return real_stop()
+
+    rec.add_frame = slow_add
+    with rec:
+        rec.start_episode()
+        time.sleep(0.3)
+        summary = stop()
+        rec.save()
+    assert summary.frames >= 3
+
+
 def test_latest_only_source_updating_before_the_first_read_does_not_stop_the_sampler(tmp_path):
     class AlwaysFresh:
         """latest()-only source whose newest item always arrived just now, i.e. after any due time
