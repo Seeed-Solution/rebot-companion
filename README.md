@@ -769,6 +769,9 @@ The runner imports them only for a learned policy.
 | `--log` | per-step JSON lines (observation age, camera age, inference ms, step lag, action, state) and a summary line |
 | `--i-am-at-the-arm` | required when armd's follower (`GET /api/v1/safety/describe` `device.follower`) is not `mock` or `sim`, or unknown |
 
+The run is refused before taking the lease when the schema does not give 7 finite joint limits with
+min < max.
+
 Observation, built like a `rebot-record` row: `observation.state` = armd `positions` (7, float32);
 `observation.velocity` / `observation.effort` = `velocities` / `torques` when the policy has these
 inputs; the policy's single image input (for example `observation.images.recamera`) = the newest
@@ -782,7 +785,8 @@ or other inputs are refused.
 
 Timing: policy steps run at `--fps` on the main thread. A sender thread streams servo frames at
 `--servo-hz`: each new target is reached by linear interpolation from the last sent frame (after clipping;
-the measured position before the first frame) over one policy period, then held. Every frame is clipped to the joint limits and, for joints 1..6, to
+the measured position before the first frame) over one policy period, then held.
+Every frame is clipped per joint to the intersection of the joint limits and, for joints 1..6,
 measured position ± 0.95 × `servo_max_lead_rad` (armd schema, default 0.2 rad); the summary counts
 clipped frames per joint and the `observation.motion_limit` reasons armd reported. A step that is
 more than one period late is counted and the schedule restarts from it (no burst of catch-up steps).
@@ -790,7 +794,8 @@ Learned policies run one warm-up inference before the stream starts. `--max-seco
 deadline from the start of the stream, checked by the sender before every frame, so slow inference
 does not extend the run. Timing options must be finite and > 0.
 
-Stops: stale or malformed armd observation (not 7 finite positions), E-stop, Fault, collision hold, servo `blocked` hold, torque off, lease loss, servo rejection
+Stops: a joint measured so far beyond its limit that the intersection is empty, stale or malformed
+armd observation (not 7 finite positions), E-stop, Fault, collision hold, servo `blocked` hold, torque off, lease loss, servo rejection
 (for example `MOTION_BUSY`), connection loss, policy stall, stale camera frame, a non-finite or
 wrong-sized action, policy exception, end of a replayed episode, `--max-seconds`, Ctrl+C or
 SIGTERM. Then the stream ends, the arm holds (`motion/stop`) and parks (`unload`) unless

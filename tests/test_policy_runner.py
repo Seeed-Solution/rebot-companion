@@ -703,3 +703,47 @@ def test_the_first_segment_starts_from_the_measured_position(arm):
     r.run()
     first = arm.servo_log[0][1]
     assert first[0] == pytest.approx(0.05, abs=0.02)
+
+
+# --------------------------------------------------------------------------- limits and lead together
+
+
+def test_lead_clip_cannot_push_a_frame_past_the_joint_limit():
+    """Measured J1 beyond its limit by more than the lead: [limit] and [measured +- lead] do not overlap,
+    so no frame is sent (the old order clipped to the limit, then the lead clip moved it back out)."""
+    r = stub_runner()
+    pos = list(HOME)
+    pos[0] = LIMITS[0][1] + 0.3
+    r.session = StubSession(r, obs=obs_status(pos))
+    r._send_loop()
+    assert r.session.sent == []
+    assert r.result.reason == "outside_limits"
+
+
+def test_frames_stay_in_the_intersection_of_limit_and_lead():
+    r = stub_runner()
+    pos = list(HOME)
+    pos[0] = LIMITS[0][1] + 0.1  # beyond the limit, but within the lead of it
+    r.session = StubSession(r, obs=obs_status(pos), max_frames=2)
+    r._send_loop()
+    lead = r.lead * 0.95
+    for f in r.session.sent:
+        assert pos[0] - lead - 1e-9 <= f[0] <= LIMITS[0][1]
+
+
+@pytest.mark.parametrize(
+    "limits",
+    [
+        LIMITS[:6],
+        [(float("nan"), 1.0)] + LIMITS[1:],
+        [(1.0, -1.0)] + LIMITS[1:],
+        [(-1.0, float("inf"))] + LIMITS[1:],
+    ],
+)
+def test_bad_schema_limits_are_refused_before_torque(arm, monkeypatch, limits):
+    import fake_armd
+
+    monkeypatch.setattr(fake_armd, "LIMITS", limits)
+    with pytest.raises(RunnerError, match="limits"):
+        runner(arm, SinePolicy(0, 0.05, 1.0)).run()
+    assert arm.commands == [] and arm.acquires == []

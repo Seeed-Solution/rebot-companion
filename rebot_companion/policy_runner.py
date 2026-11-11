@@ -476,10 +476,18 @@ class PolicyRunner:
         schema = res.json()
         lead = schema.get("servo_max_lead_rad")
         self.lead = float(lead) if isinstance(lead, (int, float)) and lead > 0 else DEFAULT_LEAD_RAD
-        self.limits = [(float(lim["min_position"]), float(lim["max_position"])) for lim in schema.get("limits") or []]
-        dof = int(schema.get("dof") or len(self.limits))
+        dof = int(schema.get("dof") or 0)
         if dof != len(JOINT_NAMES):
             raise RunnerError(f"armd reports {dof} joints; rebot-policy drives the 7-DOF B601-DM")
+        try:
+            limits = [(float(lim["min_position"]), float(lim["max_position"])) for lim in schema.get("limits") or []]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RunnerError(f"armd schema joint limits are malformed: {exc}") from exc
+        if len(limits) != dof or not all(
+            math.isfinite(lo) and math.isfinite(hi) and hi - lo > 2 * LIMIT_MARGIN for lo, hi in limits
+        ):
+            raise RunnerError(f"armd schema joint limits are unusable (need {dof} finite min < max): {limits}")
+        self.limits = limits
 
     def _observation(self, obs: ArmStatus) -> dict[str, np.ndarray]:
         out = {STATE_KEY: np.asarray(obs.positions, dtype=np.float32)}
@@ -508,29 +516,31 @@ class PolicyRunner:
 
     # ---- servo sender --------------------------------------------------------
 
-    def _shape(self, frame: np.ndarray, measured: Sequence[float]) -> np.ndarray:
-        out = frame.copy()
-        if self.limits:
-            lo = np.array([a for a, _ in self.limits]) + LIMIT_MARGIN
-            hi = np.array([b for _, b in self.limits]) - LIMIT_MARGIN
-            clipped = np.clip(out, lo, hi)
-            if np.any(clipped != out):
-                self.result.limit_clipped_frames += 1
-            out = clipped
+    def _shape(self, frame: np.ndarray, measured: Sequence[float]) -> tuple[np.ndarray | None, str]:
+        """Clip ``frame`` per joint to [limit] intersected with [measured +- lead] (gripper: limit only).
+        Returns ``(frame, "")``, or ``(None, detail)`` when a joint's interval is empty."""
+        out = np.array(frame, dtype=np.float64)
         lead = self.lead * LEAD_FRACTION
-        any_clip = False
-        for j in range(min(len(out), len(measured))):
-            if j == GRIPPER_INDEX:
-                continue  # armd exempts the gripper from the lead cap
-            m = measured[j]
-            v = min(max(out[j], m - lead), m + lead)
-            if v != out[j]:
-                out[j] = v
+        limit_clip = lead_clip = False
+        for j in range(len(out)):
+            lim_lo, lim_hi = self.limits[j][0] + LIMIT_MARGIN, self.limits[j][1] - LIMIT_MARGIN
+            lo, hi = lim_lo, lim_hi
+            if j != GRIPPER_INDEX:  # armd exempts the gripper from the lead cap
+                m = measured[j]
+                lo, hi = max(lo, m - lead), min(hi, m + lead)
+                if lo > hi:
+                    return None, f"joint {j + 1} measured {m:.3f} rad, limits [{lim_lo:.3f}, {lim_hi:.3f}]"
+            x = out[j]
+            v = min(max(x, lo), hi)
+            if not lim_lo <= x <= lim_hi:
+                limit_clip = True
+            if v != min(max(x, lim_lo), lim_hi):
                 self.result.lead_clips_per_joint[j] += 1
-                any_clip = True
-        if any_clip:
-            self.result.lead_clipped_frames += 1
-        return out
+                lead_clip = True
+            out[j] = v
+        self.result.limit_clipped_frames += limit_clip
+        self.result.lead_clipped_frames += lead_clip
+        return out, ""
 
     def _send_loop(self) -> None:
         period = 1.0 / self.servo_hz
@@ -563,7 +573,10 @@ class PolicyRunner:
                 with self._send_lock, self._lock:
                     if self._stop.is_set() or time.monotonic() >= self._deadline:
                         break
-                    frame = self._shape(self._segment.at(now), obs.positions)
+                    frame, problem = self._shape(self._segment.at(now), obs.positions)
+                    if frame is None:
+                        self.request_stop("outside_limits", problem)
+                        break
                     s.servo(frame.tolist())
                     self._last_sent = frame
                 self.result.frames += 1
