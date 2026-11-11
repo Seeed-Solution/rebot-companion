@@ -10,8 +10,9 @@ import pytest
 from fake_armd import DOF, HOME, q
 from websockets.sync.client import connect as ws_connect
 
-from rebot_companion.arm_client import (
+from rebot.client import (
     ArmCommandRejected,
+    ArmConnectionError,
     ArmFaultError,
     ArmStatus,
     LeaseError,
@@ -136,6 +137,7 @@ def test_epoch_change_invalidates_commands_and_clear_fault_recovers(armd):
         with pytest.raises(ArmCommandRejected) as exc:
             s.move_to(q(0.1), duration=0.1)
         assert exc.value.code in ("EPOCH_MISMATCH", "ESTOP_ACTIVE")
+        assert s.wait_for_observation().e_stopped  # clear_fault is bound to the observed epoch
         ack = s.clear_fault()
         assert ack["epoch_id"] == 3 and ack["safety_state"] == "Idle"
         with pytest.raises(ArmCommandRejected) as exc:  # clear_fault leaves the arm needing re-arm
@@ -414,3 +416,229 @@ def test_heartbeats_keep_flowing_through_jog_unload_cycles_with_a_polling_thread
             th.join(1)
     gaps = [b - a for a, b in zip(beats, beats[1:])]
     assert len(beats) > 5 and max(gaps) < armd.lease_timeout / 2, max(gaps)
+
+
+def test_reader_failure_stops_heartbeats_and_closes_the_socket(armd):
+    s = armd.client.session(client_id="dies", safe_exit="off").open()
+    try:
+        assert s.has_lease
+        with armd.lock:
+            conn = next(iter(armd.conns))
+            # malformed observation: epoch_id is not an int, ArmStatus.from_dict raises in the reader thread
+            bad = dict(armd.observation(), epoch_id="x")
+        armd.send(conn, json.dumps(bad))
+        deadline = time.monotonic() + 2.0
+        while s.closed_reason is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert s.closed_reason and "reader failed" in s.closed_reason
+        time.sleep(0.2)
+        beats = armd.heartbeats
+        time.sleep(armd.lease_timeout * 1.5)
+        assert armd.heartbeats == beats  # no heartbeat renews the lease after the reader died
+        assert not armd.conns and armd.lease is None  # socket closed: armd's watchdog owns the arm
+    finally:
+        s.close()
+
+
+def test_http_timeout_bounds_the_whole_request_not_each_read():
+    import socket
+
+    from rebot import _http
+
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+
+    def trickle():
+        conn, _ = srv.accept()
+        try:
+            conn.recv(4096)
+            for b in b"HTTP/1.1 200 OK\r\nX-Slow: " + b"a" * 40:  # one byte every 0.1 s, never finishes
+                conn.sendall(bytes([b]))
+                time.sleep(0.1)
+        except OSError:
+            pass
+        finally:
+            conn.close()
+            srv.close()
+
+    threading.Thread(target=trickle, daemon=True).start()
+    t0 = time.monotonic()
+    with pytest.raises(_http.HttpTimeout):
+        _http.request("GET", f"http://127.0.0.1:{port}/x", timeout=0.5)
+    assert time.monotonic() - t0 < 1.5
+
+
+def test_concurrent_commands_reach_armd_with_increasing_request_ids(armd):
+    with armd.client.session(client_id="race", safe_exit="off") as s:
+        s.torque(True)
+        real_send = s._send
+        first = threading.Event()
+
+        def slow_send(message):
+            if message.get("type") == "command" and not first.is_set():
+                first.set()
+                time.sleep(0.3)  # the first command stalls between taking its id and sending
+            real_send(message)
+
+        s._send = slow_send
+        results = {}
+
+        def motion():
+            try:
+                results["a"] = s.command("/api/v1/motion/stop")
+            except Exception as exc:
+                results["a"] = exc
+
+        t = threading.Thread(target=motion)
+        t.start()
+        assert first.wait(1.0)
+        results["b"] = s.stop()  # e.g. MCP stop while a motion tool runs
+        t.join(2.0)
+        assert all(isinstance(r, dict) and r["type"] == "command_ack" for r in results.values()), results
+
+
+def test_observations_raise_once_the_connection_closed(armd):
+    s = armd.client.session(client_id="gone", safe_exit="off").open()
+    try:
+        assert s.wait_for_observation() is not None
+        with armd.lock:
+            server_ws, _ = next(iter(armd.conns.values()))
+        server_ws.close()
+        deadline = time.monotonic() + 2.0
+        while s.closed_reason is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert s.closed_reason
+        with pytest.raises(ArmConnectionError):
+            s.latest_observation()
+        with pytest.raises(ArmConnectionError):
+            s.wait_for_observation(timeout=0.2)
+    finally:
+        s.close()
+
+
+def test_http_deadline_covers_name_resolution(monkeypatch):
+    import socket
+
+    from rebot import _http
+
+    real = socket.getaddrinfo
+
+    def slow_dns(host, port, *a, **kw):
+        if host == "slow.invalid":
+            if len(a) >= 4 and a[3] & socket.AI_NUMERICHOST:
+                raise socket.gaierror("not numeric")
+            time.sleep(2.0)
+            return real("127.0.0.1", port, socket.AF_INET, socket.SOCK_STREAM)
+        return real(host, port, *a, **kw)
+
+    monkeypatch.setattr(socket, "getaddrinfo", slow_dns)
+    t0 = time.monotonic()
+    with pytest.raises(_http.HttpTimeout):
+        _http.request("GET", "http://slow.invalid:9/x", timeout=0.3)
+    assert time.monotonic() - t0 < 1.0
+
+
+def test_http_deadline_covers_connecting_to_several_addresses(monkeypatch):
+    import socket
+
+    from rebot import _http
+
+    addrs = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 9))] * 3
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *a, **kw: addrs)
+
+    class Blackhole(socket.socket):
+        def connect(self, addr):  # an address that never answers: waits out its timeout
+            time.sleep(self.gettimeout() or 5.0)
+            raise socket.timeout("timed out")  # noqa: UP041 (Python 3.8)
+
+    monkeypatch.setattr(socket, "socket", Blackhole)
+    t0 = time.monotonic()
+    with pytest.raises(_http.HttpTimeout):
+        _http.request("GET", "http://multi.example:9/x", timeout=0.4)
+    assert time.monotonic() - t0 < 0.8
+
+
+def test_timed_out_lookups_do_not_pile_up_resolver_threads(monkeypatch):
+    import socket
+
+    from rebot import _http
+
+    real = socket.getaddrinfo
+    gate = threading.Event()
+    lookups = []
+
+    def stuck_dns(host, port, *a, **kw):
+        if host == "stuck.invalid":
+            if len(a) >= 4 and a[3] & socket.AI_NUMERICHOST:
+                raise socket.gaierror("not numeric")
+            lookups.append(host)
+            gate.wait(5.0)
+            raise socket.gaierror("gave up")
+        return real(host, port, *a, **kw)
+
+    monkeypatch.setattr(socket, "getaddrinfo", stuck_dns)
+    try:
+        for _ in range(5):
+            t0 = time.monotonic()
+            with pytest.raises(_http.HttpTimeout):
+                _http.request("GET", "http://stuck.invalid:9/x", timeout=0.1)
+            assert time.monotonic() - t0 < 0.5
+        assert len(lookups) <= 2  # later requests time out without starting another thread
+        with pytest.raises(_http.HttpError):  # an IP literal resolves inline, no resolver slot needed
+            _http.request("GET", "http://127.0.0.1:9/x", timeout=0.5)
+        assert len(lookups) <= 2
+    finally:
+        gate.set()
+
+
+def test_a_delayed_ack_never_lowers_the_epoch(armd):
+    armd.devplat = True
+    armd.ack_delays["/api/v1/poses/save"] = 0.4
+    with armd.client.session(client_id="persist", safe_exit="off") as s:
+        s.torque(True)
+        n = s.epoch_id
+        saver = threading.Thread(target=s.save_pose, args=("scan",))
+        saver.start()
+        time.sleep(0.1)  # armd processed the save at epoch N; its ack is still on the way
+        with armd.lock:
+            armd.epoch += 1  # e.g. a fault cleared elsewhere: telemetry now carries N + 1
+        deadline = time.monotonic() + 2.0
+        while s.epoch_id != n + 1 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert s.epoch_id == n + 1
+        saver.join(2.0)  # the ack with epoch N arrives now
+        assert s.epoch_id == n + 1
+        assert s.stop()["type"] == "command_ack"  # sent with N + 1, not rejected as EPOCH_MISMATCH
+
+
+def test_acks_arriving_out_of_request_order_are_matched(armd):
+    armd.devplat = True
+    armd.ack_delays["/api/v1/poses/save"] = 0.4
+    with armd.client.session(client_id="order", safe_exit="off") as s:
+        s.torque(True)
+        replies = {}
+
+        def save():
+            replies["save"] = s.command("/api/v1/poses/save", {"name": "bin_a"})
+
+        saver = threading.Thread(target=save)
+        saver.start()
+        time.sleep(0.1)
+        replies["stop"] = s.command("/api/v1/motion/stop")  # later request, answered first
+        assert "save" not in replies
+        saver.join(2.0)
+        assert replies["save"]["type"] == replies["stop"]["type"] == "command_ack"
+        assert replies["save"]["request_id"] < replies["stop"]["request_id"]
+        assert armd.poses["bin_a"]["name"] == "bin_a"
+
+
+def test_an_older_lease_grant_never_replaces_the_generation(armd):
+    with armd.client.session(client_id="gen", safe_exit="off") as s:
+        current = s.generation
+        stale = {"type": "lease_granted", "generation": current - 1, "seq": 99}
+        s._request = lambda *a, **kw: stale
+        with pytest.raises(LeaseError):
+            s._acquire_lease()
+        assert s.generation == current

@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import io
 
-import httpx
 import pytest
+from http_mock import MockTransport, Request, Response
 
 from rebot_companion.snapshot import (
     Detection,
@@ -103,18 +103,18 @@ def test_annotate_draws_in_pixel_coordinates():
 def _proxy(routes):
     calls = []
 
-    def handler(req: httpx.Request) -> httpx.Response:
+    def handler(req: Request) -> Response:
         calls.append((req.method, req.url.path, dict(req.url.params)))
         fn = routes.get((req.method, req.url.path))
-        return fn(req) if fn else httpx.Response(404)
+        return fn(req) if fn else Response(404)
 
-    return calls, httpx.MockTransport(handler)
+    return calls, MockTransport(handler)
 
 
 def test_detect_once_uses_trigger():
     calls, t = _proxy(
         {
-            ("POST", "/api/v1/detection/trigger"): lambda r: httpx.Response(
+            ("POST", "/api/v1/detection/trigger"): lambda r: Response(
                 200, json={"success": True, "frame_id": 9, "ts_ms": 5, "count": 0, "markers": []}
             )
         }
@@ -132,14 +132,14 @@ def test_detect_once_falls_back_and_disables_only_if_enabled_here():
         import json
 
         state["enabled"] = json.loads(r.content)["enabled"]
-        return httpx.Response(200, json=state)
+        return Response(200, json=state)
 
     calls, t = _proxy(
         {
-            ("GET", "/api/v1/detection/latest"): lambda r: httpx.Response(
+            ("GET", "/api/v1/detection/latest"): lambda r: Response(
                 200, json={"enabled": state["enabled"], "frame_id": 11 if r.url.params.get("after") else 10}
             ),
-            ("GET", "/api/v1/detection/inference"): lambda r: httpx.Response(200, json=state),
+            ("GET", "/api/v1/detection/inference"): lambda r: Response(200, json=state),
             ("POST", "/api/v1/detection/inference"): set_inf,
         }
     )
@@ -155,7 +155,7 @@ def test_detect_once_falls_back_and_disables_only_if_enabled_here():
 
 
 def test_detector_502_maps_to_unavailable():
-    _, t = _proxy({("GET", "/api/v1/detection/latest"): lambda r: httpx.Response(502, json={"error": "x"})})
+    _, t = _proxy({("GET", "/api/v1/detection/latest"): lambda r: Response(502, json={"error": "x"})})
     with pytest.raises(DetectorUnavailable):
         DetectionClient("http://armd", transport=t).latest()
 
@@ -168,15 +168,13 @@ def _v2_routes(seen_bodies, per_request=True):
         seen_bodies.append(body)
         p = (body or {}).get("pipelines", ["yolo"])
         ran = {k: {"ran": k in p} for k in ("yolo", "aruco")}
-        return httpx.Response(
-            200, json={"api_version": 2, "success": True, "frame_id": 12, "ts_ms": 7, "pipelines": ran}
-        )
+        return Response(200, json={"api_version": 2, "success": True, "frame_id": 12, "ts_ms": 7, "pipelines": ran})
 
     mode = {"api_version": 2 if per_request else 1, "mode": "off"}
     if per_request:
         mode["per_request_pipelines"] = True
     return {
-        ("GET", "/api/v1/vision/mode"): lambda r: httpx.Response(200, json=mode),
+        ("GET", "/api/v1/vision/mode"): lambda r: Response(200, json=mode),
         ("POST", "/api/v1/detection/trigger"): trigger,
     }
 
@@ -205,7 +203,7 @@ def test_detect_once_keeps_the_old_trigger_for_api1_and_older_providers():
 
         def trigger(req, bodies=bodies):
             bodies.append(req.content)
-            return httpx.Response(200, json={"success": True, "frame_id": 3, "ts_ms": 1})
+            return Response(200, json={"success": True, "frame_id": 3, "ts_ms": 1})
 
         _, t = _proxy({**routes, ("POST", "/api/v1/detection/trigger"): trigger})
         client = DetectionClient("http://armd", transport=t)

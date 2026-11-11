@@ -34,3 +34,18 @@ jobs:
           uv run --locked --all-extras ruff format --check
       - name: Test
         run: uv run --locked --all-extras pytest -q -rs
+
+  stdlib-core:
+    # rebot/ runs on the reCamera's python3 (no numpy/httpx/websockets): Python 3.8, standard library only
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Import without third-party packages
+        run: uv run --python 3.8 --no-project python -c "import sys; sys.path.insert(0, '.'); import rebot; print(rebot.__name__)"
+      - name: Test rebot on Python 3.8
+        # pytest and websockets (test servers) are test-only; nothing else is installed
+        run: >-
+          uv run --python 3.8 --no-project --with pytest --with "websockets>=12"
+          python -m pytest -q -p no:cacheprovider
+          tests/test_ws.py tests/test_arm_facade.py tests/test_arm_client.py tests/test_arm_actions.py

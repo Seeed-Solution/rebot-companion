@@ -30,6 +30,10 @@ High-level actions follow the contract in rebot-armd
   watchdog), lease released / preempted -> cancelled LEASE_LOST, stop -> cancelled STOPPED, a new
   jog / preset / action -> cancelled SUPERSEDED. Park: done when Idle with torque off, else failed
   UNLOAD_FAILED.
+* Developer platform (armd capabilities version 6, ``devplat = True``): ``?obs_hz=`` decimation,
+  ``fault{code,message,recoverable}``, ``previous_action``, named poses + ``move_to_pose``.
+  ``/api/v1/action/grasp`` closes the gripper on ``gripper_contact`` and reports ``holding``.
+  The detector proxy answers ``trigger`` with ``detections`` (perception API 2).
 * Scripted knobs: ``action_duration``, ``action_failure = (code, message)`` (fails at half the
   path), ``action_reject = (status, code)`` (rejects the command), ``gripper_contact`` (jaw angle
   where an object stops a close, None = empty), ``actions_supported = False`` (pre-action armd).
@@ -38,15 +42,17 @@ High-level actions follow the contract in rebot-armd
 from __future__ import annotations
 
 import json
+import pathlib
 import threading
 import time
 
-import httpx
 import pytest
+from http_mock import MockTransport, Request, Response
 from websockets.exceptions import ConnectionClosed
 from websockets.sync.server import serve
 
-from rebot_companion.arm_client import ArmdClient
+from rebot import Arm
+from rebot.client import ArmdClient
 
 DOF = 7
 HOME = [0.0, 0.0, 0.0, 0.0, 0.0, 1.5707963, 0.0]
@@ -104,6 +110,27 @@ class FakeArmd:
         self.ack_extra: dict = {}
         self.cancel_reason = "STOPPED"
         self.acquires: list[tuple[str, bool]] = []  # (client_id, force) per acquire_lease
+        # developer platform (capabilities version 6)
+        self.devplat = False
+        self.place_cap = True
+        self.keepout: list[dict] = []
+        self.poses: dict[str, dict] = {}
+        self.prev_action: dict | None = None
+        self.prev_action_at = 0.0
+        self.conn_hz: dict[int, tuple[int, float]] = {}  # conn -> (obs_hz, last sent)
+        self.ws_paths: list[str] = []
+        self.detections: list = []
+        # collision guard (capability collision_guard, armd contract §11)
+        self.collision_cap = True
+        self.describe_cap = True  # capability safety_describe (armd contract §12)
+        self.collision_cfg = {"enabled": False, "sensitivity": "medium"}
+        self.collision_state: dict | None = None  # active trip: joint, residual_nm, since, resume_at
+        self.collision_trips: list[float] = []
+        self.collision_max_auto_resumes = 3
+        self.collision_bodies: list[dict] = []
+        self.collision_next_actions = 0  # trip halfway through each of the next N actions (resume after 0.2 s)
+        self.trigger_bodies: list = []
+        self.ack_delays: dict[str, float] = {}  # command path -> seconds the ack is held (persisted commands)
         self._stop = threading.Event()
         self._next_conn = 1
 
@@ -127,8 +154,80 @@ class FakeArmd:
             "disable_pending": False,
             "feedback_valid": True,
             "commanded_positions": list(self.positions),
-            "action": dict(self.action) if self.action else None,
+            "action": self._public(self.action),
+            **(self.devplat_fields() if self.devplat else {}),
         }
+
+    @staticmethod
+    def _public(action: dict | None) -> dict | None:
+        return {k: v for k, v in action.items() if not k.startswith("_")} if action else None
+
+    def devplat_fields(self) -> dict:
+        fault = None
+        if self.state == "EStop":
+            fault = {"code": "ESTOP", "message": "E-stop latched", "recoverable": False}
+        elif self.state == "Fault":
+            code = {
+                "WatchdogTimeout": "WATCHDOG_TIMEOUT",
+                "FollowingError": "FOLLOWING_ERROR",
+                "Collision": "COLLISION",
+            }.get(self.fault, "OTHER")
+            fault = {"code": code, "message": str(self.fault), "recoverable": code == "WATCHDOG_TIMEOUT"}
+        prev = self.prev_action if time.monotonic() - self.prev_action_at <= 2.0 else None
+        return {
+            "fault": fault,
+            "previous_action": self._public(prev),
+            "residual_torques": [0.0] * 6,
+            "collision": self.collision_field(),
+        }
+
+    def collision_field(self) -> dict | None:
+        if not (self.collision_cap and self.collision_cfg["enabled"]):
+            return None
+        trip = self.collision_state
+        now = time.monotonic()
+        return {
+            "active": trip is not None,
+            "joint": trip["joint"] if trip else None,
+            "residual_nm": trip["residual_nm"] if trip else None,
+            "threshold_nm": 6.0 if trip else None,
+            "since_s": round(now - trip["since"], 2) if trip else None,
+            "resume_in_s": round(max(0.0, trip["resume_at"] - now), 2) if trip else None,
+            "trips_in_window": len(self.collision_trips),
+            "enabled": True,
+            "sensitivity": self.collision_cfg["sensitivity"],
+        }
+
+    def trip_collision(self, joint: int = 2, residual_nm: float = 7.1, resume_after_s: float = 0.3) -> None:
+        """Test hook: a protective stop. Cancels the running action (code COLLISION), holds, resumes by itself
+        after ``resume_after_s``; the (max_auto_resumes+1)-th trip escalates to a Fault with code COLLISION."""
+        with self.lock:
+            now = time.monotonic()
+            self.collision_trips = [t for t in self.collision_trips if now - t < 60.0] + [now]
+            if self.action_running():
+                self.finish_action("failed", "COLLISION", f"joint J{joint} blocked ({residual_nm:.1f} N·m)")
+            self.stop_motion()
+            if len(self.collision_trips) > self.collision_max_auto_resumes:
+                self.collision_state = None
+                self.trigger_fault("Collision")
+                return
+            if self.state == "Moving":
+                self.state = "Armed"
+            self.collision_state = {
+                "joint": joint,
+                "residual_nm": residual_nm,
+                "since": now,
+                "resume_at": now + resume_after_s,
+            }
+
+    def capabilities(self) -> dict:
+        caps = {"version": 5, "cartesian": True, "gripper": True, "grasp": True}
+        if self.devplat:
+            caps.update(version=6, obs_rate=True, fault_codes=True, poses=True, keepout=True)
+            caps.update(place=self.place_cap, collision_guard=self.collision_cap)
+            caps.update(safety_describe=self.describe_cap)
+            caps.update(speed_cap=False, residual_torques=True, tick_stats=False)
+        return caps
 
     def trigger_fault(self, reason: str) -> None:
         self.state, self.fault = "Fault", reason
@@ -145,6 +244,8 @@ class FakeArmd:
                 and now - self.last_heartbeat > self.lease_timeout
             ):
                 self.trigger_fault("WatchdogTimeout")
+            if self.collision_state and now >= self.collision_state["resume_at"]:
+                self.collision_state = None
             if self.traj and not self.freeze_motion:
                 start, end, t0, dur = self.traj
                 a = min(1.0, (now - t0) / dur)
@@ -155,6 +256,9 @@ class FakeArmd:
                     self.finish_action("failed", code, message)
                     self.stop_motion()
                     self.state = "Armed"
+                elif running and self.collision_next_actions > 0 and a >= 0.5 and self.action["kind"] != "park":
+                    self.collision_next_actions -= 1
+                    self.trip_collision(resume_after_s=0.2)
                 elif a >= 1.0:
                     self.traj = None
                     if self.state == "Moving":
@@ -181,6 +285,11 @@ class FakeArmd:
             self.reconcile_action()
             text = json.dumps(self.observation())
         for conn_id in list(self.conns):
+            hz, last = self.conn_hz.get(conn_id, (0, 0.0))
+            if hz:
+                if now - last < 1.0 / hz:
+                    continue
+                self.conn_hz[conn_id] = (hz, now)
             self.send(conn_id, text)
 
     def resting_violation(self) -> bool:
@@ -203,7 +312,7 @@ class FakeArmd:
                 self.finish_action("done")
             else:
                 self.finish_action("failed", "UNLOAD_FAILED", "torque cut failed after unload")
-        elif kind == "gripper" and self.action.get("_grasp"):
+        elif kind in ("gripper", "grasp") and self.action.get("_grasp"):
             contact = self.gripper_contact
             gap = GRIP_CLOSED - self.positions[6]
             holding = contact is not None and gap >= 0.30
@@ -232,6 +341,8 @@ class FakeArmd:
     def start_action(self, kind: str, target: list[float], duration: float, tag=None, grasp=False) -> None:
         if self.action_running():
             self.finish_action("cancelled", "SUPERSEDED", "replaced by a new motion")
+        if self.action is not None:
+            self.prev_action, self.prev_action_at = dict(self.action), time.monotonic()
         aid = self.next_action_id
         self.next_action_id += 1
         self.action = {
@@ -272,6 +383,22 @@ class FakeArmd:
         elif kind == "move_relative":
             if body.get("frame") not in ("base", "tool", "camera") or len(body.get("d") or []) != 3:
                 return 400, "INVALID_COMMAND"
+        elif kind == "move_to_pose":
+            if not self.devplat:
+                return 400, "INVALID_COMMAND"
+            pose = self.poses.get(body.get("name"))
+            if pose is None:
+                return 404, "POSE_NOT_FOUND"
+        elif kind == "place":
+            if not (self.devplat and self.place_cap):
+                return 400, "INVALID_COMMAND"
+            if (body.get("pose") is None) == (body.get("position") is None):
+                return 400, "INVALID_COMMAND"
+            if body.get("pose") is not None and body["pose"] not in self.poses:
+                return 404, "POSE_NOT_FOUND"
+        elif kind == "grasp":
+            if not isinstance(body.get("label"), str) or len(body.get("box_norm") or []) != 4:
+                return 400, "INVALID_COMMAND"
         elif kind == "gripper":
             if "width_m" in body:
                 return 422, "UNSUPPORTED"
@@ -284,7 +411,17 @@ class FakeArmd:
             return self.action_reject
         target = list(self.positions)
         grasp = False
-        if kind == "gripper":
+        if kind == "move_to_pose":
+            target = list(pose["positions"])
+            if not body.get("include_gripper"):
+                target[6] = self.positions[6]
+        elif kind == "place":
+            target[6] = GRIP_OPEN if body.get("release", True) else self.positions[6]
+        elif kind == "grasp":
+            grasp = True
+            contact = self.gripper_contact
+            target[6] = contact + 0.15 if contact is not None else -0.05
+        elif kind == "gripper":
             if cmd == "open":
                 target[6] = GRIP_OPEN
             elif cmd == "move":
@@ -333,6 +470,10 @@ class FakeArmd:
             conn = self._next_conn
             self._next_conn += 1
             self.conns[conn] = (ws, threading.Lock())
+            path = ws.request.path
+            self.ws_paths.append(path)
+            if "obs_hz=" in path:
+                self.conn_hz[conn] = (int(path.split("obs_hz=")[1].split("&")[0]), 0.0)
         local_gen = 0
         label: str | None = None
         last_seq: int | None = None
@@ -345,7 +486,12 @@ class FakeArmd:
                     reply, local_gen, label, last_seq, last_req = self.handle(
                         conn, msg, kind, local_gen, label, last_seq, last_req
                     )
-                if reply is not None:
+                delay = self.ack_delays.get(msg.get("path", "")) if kind == "command" else None
+                if reply is not None and delay:
+                    # armd acks persisted commands after the disk write: the ack (with the epoch at
+                    # processing time) can arrive after newer telemetry and after later requests' acks
+                    threading.Timer(delay, self.send, (conn, json.dumps(reply))).start()
+                elif reply is not None:
                     self.send(conn, json.dumps(reply))
         except ConnectionClosed:
             pass
@@ -558,6 +704,8 @@ class FakeArmd:
         return None, local_gen, label, last_seq, last_req
 
     def motion_gate(self, targets, servo=False):
+        if self.collision_state and self.state in ("Armed", "Moving"):
+            return 409, "COLLISION_HOLD"
         if self.state == "EStop":
             return 409, "ESTOP_ACTIVE"
         if self.state == "Fault":
@@ -602,8 +750,18 @@ class FakeArmd:
         if path == "/api/v1/safety/clear_fault":
             if self.state in ("EStop", "Fault"):
                 self.state, self.fault = "Idle", None
+                self.collision_state, self.collision_trips = None, []
                 self.epoch += 1
                 self.pending_rearm = True
+            return None
+        if path == "/api/v1/safety/collision":
+            if not (self.devplat and self.collision_cap):
+                return 400, "INVALID_COMMAND"
+            self.collision_bodies.append(dict(body))
+            if "enabled" in body:
+                self.collision_cfg["enabled"] = bool(body["enabled"])
+            if body.get("sensitivity") in ("low", "medium", "high"):
+                self.collision_cfg["sensitivity"] = body["sensitivity"]
             return None
         if path.startswith("/api/v1/action/"):
             return self.execute_action(path, body)
@@ -625,6 +783,25 @@ class FakeArmd:
             self.start_motion("park", self.home, 0.3)
             self.pending_unload = True
             return None
+        if path in ("/api/v1/poses/save", "/api/v1/poses/delete"):
+            if not self.devplat:
+                return 400, "INVALID_COMMAND"
+            name = body.get("name")
+            if not isinstance(name, str) or not name:
+                return 400, "INVALID_COMMAND"
+            if path.endswith("delete"):
+                return None if self.poses.pop(name, None) else (404, "POSE_NOT_FOUND")
+            positions = list(body.get("positions") or self.positions)
+            if len(positions) != DOF:
+                return 400, "INVALID_COMMAND"
+            self.poses[name] = {"name": name, "positions": positions, "tcp": None, "saved_at_ms": 1}
+            return None
+        if path == "/api/v1/workspace/keepout":
+            boxes = body.get("boxes")
+            if not self.devplat or not isinstance(boxes, list) or len(boxes) > 16:
+                return 400, "INVALID_COMMAND"
+            self.keepout = [dict(b) for b in boxes]
+            return None
         if path == "/api/v1/motion/stop":
             self.cancel_reason = "STOPPED"
             self.stop_motion()
@@ -638,19 +815,20 @@ class FakeArmd:
         self.epoch += 1
         self.stop_motion()
 
-    # ---- REST (served through httpx.MockTransport) -------------------------
-    def rest(self, request: httpx.Request) -> httpx.Response:
+    # ---- REST (served through MockTransport) -------------------------
+    def rest(self, request: Request) -> Response:
         path, method = request.url.path, request.method
         with self.lock:
             if method == "GET" and path == "/api/v1/observation":
-                return httpx.Response(200, json=self.observation())
+                return Response(200, json=self.observation())
             if method == "GET" and path == "/api/v1/observation/schema":
-                return httpx.Response(
+                return Response(
                     200,
                     json={
                         "dof": DOF,
                         "joint_names": [f"joint_{i + 1}" for i in range(DOF)],
                         "fields": [],
+                        "capabilities": self.capabilities(),
                         "limits": [
                             {
                                 "name": f"joint_{i + 1}",
@@ -663,16 +841,52 @@ class FakeArmd:
                         ],
                     },
                 )
+            if method == "GET" and path == "/api/v1/poses" and self.devplat:
+                return Response(200, json={"poses": list(self.poses.values())})
+            if method == "GET" and path == "/api/v1/safety/collision" and self.devplat and self.collision_cap:
+                scale = {"low": 1.5, "medium": 1.0, "high": 0.7}[self.collision_cfg["sensitivity"]]
+                return Response(
+                    200,
+                    json={
+                        **self.collision_cfg,
+                        "thresholds_nm": [round(x * scale, 2) for x in [6, 6, 6, 2.5, 2.5, 2.5]],
+                    },
+                )
+            if method == "GET" and path == "/api/v1/safety/describe" and self.devplat and self.describe_cap:
+                return Response(
+                    200,
+                    json=json.loads((pathlib.Path(__file__).parent / "fixtures" / "safety_describe.json").read_text()),
+                )
+            if method == "GET" and path == "/api/v1/workspace/keepout" and self.devplat:
+                return Response(200, json={"boxes": self.keepout, "source": "runtime" if self.keepout else "profile"})
+            if method == "GET" and path == "/api/v1/vision/mode":
+                return Response(200, json={"api_version": 2, "mode": "off", "per_request_pipelines": True})
+            if method == "POST" and path == "/api/v1/detection/trigger":
+                self.trigger_bodies.append(json.loads(request.content) if request.content else None)
+                return Response(
+                    200,
+                    json={
+                        "api_version": 2,
+                        "success": True,
+                        "frame_id": 7,
+                        "ts_ms": 1000,
+                        "detections": self.detections,
+                    },
+                )
             if method == "POST" and path == "/api/v1/safety/e_stop":
                 self.do_estop()
-                return httpx.Response(200, json={"safety_state": self.state, "epoch_id": self.epoch})
+                return Response(200, json={"safety_state": self.state, "epoch_id": self.epoch})
             if method == "POST":
                 code = "LEASE_ACTIVE" if self.lease else "LEASE_REQUIRED"
-                return httpx.Response(409, json={"error": code, "code": code, "message": "Use the WebSocket lease"})
-        return httpx.Response(404)
+                return Response(409, json={"error": code, "code": code, "message": "Use the WebSocket lease"})
+        return Response(404)
 
     def stop(self) -> None:
         self._stop.set()
+
+
+def open_arm(armd, **kw) -> Arm:
+    return Arm(armd.url, transport=armd.transport, **kw)
 
 
 @pytest.fixture
@@ -683,7 +897,8 @@ def armd():
     threading.Thread(target=server.serve_forever, daemon=True).start()
     threading.Thread(target=fake.run_ticker, daemon=True).start()
     fake.url = f"http://127.0.0.1:{port}"
-    fake.client = ArmdClient(fake.url, transport=httpx.MockTransport(fake.rest))
+    fake.transport = MockTransport(fake.rest)
+    fake.client = ArmdClient(fake.url, transport=fake.transport)
     yield fake
     fake.stop()
     server.shutdown()

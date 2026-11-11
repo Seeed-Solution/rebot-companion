@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
-import httpx
+from rebot import _http
 
 from .transforms import Transform
 
@@ -16,10 +16,10 @@ class CameraError(Exception):
     """reCamera API error other than a trigger timeout."""
 
 
-def _check(res: httpx.Response) -> None:
+def _check(res: _http.HttpResponse, what: str) -> None:
     if res.status_code == 415:
         raise CameraError(
-            f"{res.request.method} {res.request.url.path} rejected with 415 Unsupported Media Type: the "
+            f"{what} rejected with 415 Unsupported Media Type: the "
             "aruco-detector (>= 0.1.3) requires 'Content-Type: application/json' on POST"
         )
     res.raise_for_status()
@@ -72,25 +72,28 @@ class ReCameraClient:
         base_url: str = "http://192.168.42.1:8090",
         snapshot_url: str | None = None,
         timeout_sec: float = 5.0,
+        transport: _http.Transport | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
+        self._transport = transport
         # No default: a JPEG snapshot endpoint has not been verified on the device firmware.
         self.snapshot_url = snapshot_url.rstrip("/") if snapshot_url else None
         self.timeout_sec = timeout_sec
 
+    def _req(self, method: str, url: str, timeout: float, **kw) -> _http.HttpResponse:
+        return _http.request(method, url, timeout=timeout, transport=self._transport, **kw)
+
     def get_inference_state(self) -> dict:
         """Query current inference state and FPS."""
-        with httpx.Client(timeout=self.timeout_sec) as client:
-            res = client.get(f"{self.base_url}/api/inference")
-            res.raise_for_status()
-            return res.json()
+        res = self._req("GET", f"{self.base_url}/api/inference", self.timeout_sec)
+        res.raise_for_status()
+        return res.json()
 
     def set_inference(self, enabled: bool) -> dict:
         """Toggle inference on or off (controls camera idle throttling)."""
-        with httpx.Client(timeout=self.timeout_sec) as client:
-            res = client.post(f"{self.base_url}/api/inference", json={"enabled": enabled})
-            _check(res)
-            return res.json()
+        res = self._req("POST", f"{self.base_url}/api/inference", self.timeout_sec, json={"enabled": enabled})
+        _check(res, "POST /api/inference")
+        return res.json()
 
     def trigger(self, wait_ms: int = 2500) -> list[MarkerDetection]:
         """Atomic one-shot trigger: activates detector, grabs one fresh frame, returns to standby.
@@ -99,12 +102,12 @@ class ReCameraClient:
         marker). Raises :class:`CameraTriggerTimeout` when no result arrived in time.
         """
         try:
-            with httpx.Client(timeout=float(wait_ms) / 1000.0 + 2.0) as client:
-                # aruco-detector >= 0.1.3 answers 415 to a POST without a JSON content type.
-                res = client.post(f"{self.base_url}/api/trigger?wait_ms={wait_ms}", json={})
-                _check(res)
-                data = res.json()
-        except httpx.TimeoutException as exc:
+            # aruco-detector >= 0.1.3 answers 415 to a POST without a JSON content type.
+            url = f"{self.base_url}/api/trigger?wait_ms={wait_ms}"
+            res = self._req("POST", url, float(wait_ms) / 1000.0 + 2.0, json={})
+            _check(res, "POST /api/trigger")
+            data = res.json()
+        except _http.HttpTimeout as exc:
             raise CameraTriggerTimeout(f"reCamera trigger timed out: {exc}") from exc
         if not data.get("success", False):
             detail = data.get("error") or data.get("message") or "success=false"
@@ -113,11 +116,10 @@ class ReCameraClient:
 
     def get_latest_result(self, after_frame: int = 0, wait_ms: int = 1000) -> list[MarkerDetection]:
         """Long poll the latest detection result."""
-        with httpx.Client(timeout=float(wait_ms) / 1000.0 + 2.0) as client:
-            res = client.get(f"{self.base_url}/api/results/latest?after={after_frame}&wait_ms={wait_ms}")
-            res.raise_for_status()
-            data = res.json()
-            return _parse_markers(data.get("markers", []))
+        url = f"{self.base_url}/api/results/latest?after={after_frame}&wait_ms={wait_ms}"
+        res = self._req("GET", url, float(wait_ms) / 1000.0 + 2.0)
+        res.raise_for_status()
+        return _parse_markers(res.json().get("markers", []))
 
     def get_snapshot(self) -> bytes:
         """Fetch raw JPEG snapshot for VLM / multimodal reasoning.
@@ -130,10 +132,9 @@ class ReCameraClient:
                 "serves a JPEG (no snapshot endpoint is verified on the reCamera firmware; RTSP "
                 "rtsp://<host>:8554/live0 is available for frame grabs)"
             )
-        with httpx.Client(timeout=self.timeout_sec) as client:
-            res = client.get(self.snapshot_url)
-            res.raise_for_status()
-            return res.content
+        res = self._req("GET", self.snapshot_url, self.timeout_sec)
+        res.raise_for_status()
+        return res.body
 
 
 def _parse_markers(markers: list) -> list[MarkerDetection]:

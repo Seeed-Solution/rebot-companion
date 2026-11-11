@@ -8,7 +8,7 @@ import time
 import pytest
 from fake_armd import HOME, q
 
-from rebot_companion.arm_client import (
+from rebot.client import (
     ActionFailed,
     ArmCommandRejected,
     ArmdError,

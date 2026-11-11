@@ -23,16 +23,17 @@
 
 用于 **reBot B601-DM** 机械臂的 Python SDK 和 stdio [MCP](https://modelcontextprotocol.io) 服务器。机械臂由运行在 **Seeed reCamera** 上的 [rebot-armd](https://github.com/Seeed-Solution/rebot-armd) 驱动；本项目同时提供相机快照、目标检测、ArUco 标记位姿和手眼标定。
 
-- `rebot_companion`（SDK）：rebot-armd 客户端（REST 读取、WebSocket 控制租约、关节与笛卡尔动作）、reCamera ArUco 触发客户端、从相机 H.264 流截取 JPEG 快照、B601-DM 运动学、手眼标定、确定性抓放流水线。
+- `rebot`（机械臂控制核心）：只依赖 Python 标准库，Python >= 3.8。`Arm` 类用于编写不经修改即可在电脑和 reCamera 上运行的短程序（设备上尚未运行过）（见[编写自己的程序](#编写自己的程序)），底层是 armd 协议客户端和检测接口。
+- `rebot_companion`（SDK）：rebot-armd 客户端（从 `rebot` 重新导出）（REST 读取、WebSocket 控制租约、关节与笛卡尔动作）、reCamera ArUco 触发客户端、从相机 H.264 流截取 JPEG 快照、B601-DM 运动学、手眼标定、确定性抓放流水线。
 - `rebot-mcp`：stdio [MCP](https://modelcontextprotocol.io) 服务器，把机械臂、快照和检测作为工具提供给各类 AI Agent。
 
 ## 核心特性
 
-- **面向 AI Agent 的 stdio MCP 服务器（`rebot-mcp`）**：默认提供 14 个工具（状态、快照、检测、运动、夹爪、停止）。可用于支持 stdio 服务器的 MCP 客户端；端到端测试使用 Python `mcp` 客户端连接真机。清除故障和从驾驶舱接管默认关闭，需启动时显式开启（见 [MCP 服务器](#mcp-服务器agent-控制)）。
+- **面向 AI Agent 的 stdio MCP 服务器（`rebot-mcp`）**：默认提供 24 个工具（状态、快照、检测、运动、夹爪、停止、命名位姿、放置、禁入区、故障恢复、碰撞保护、安全说明）。可用于支持 stdio 服务器的 MCP 客户端；端到端测试使用 Python `mcp` 客户端连接真机。清除故障和从驾驶舱接管默认关闭，需启动时显式开启（见 [MCP 服务器](#mcp-服务器agent-控制)）。
 - **手眼标定**：眼在手外（闭式 Horn 点配准）与眼在手上（Park & Martin $AX=XB$），测试中与 OpenCV `CALIB_HAND_EYE_PARK` 交叉对比。精度仅在合成数据上验证，尚未在真机上实测。
 - **两阶段**：阶段 1 由 Agent 编排工具；阶段 2 为不依赖大模型的本地确定性抓放流水线。
 - **运动学**：完整 URDF 正运动学（测试中与独立 URDF 解析器相差 0.1 mm 以内）及 B601-DM 平面解析逆运动学。
-- **reCamera 接入**：本项目不在相机上运行任何代码。支持按需触发检测（ArUco 标记 6-DoF 位姿、YOLO 2D 框），以及在主机端从相机 H.264 流解码 JPEG 快照。
+- **reCamera 接入**：`rebot_companion` 和 MCP 服务器在主机上运行；仅依赖标准库的 `rebot` 包也用于在相机上运行（尚未在设备上运行过）。支持按需触发检测（ArUco 标记 6-DoF 位姿、YOLO 2D 框），以及在主机端从相机 H.264 流解码 JPEG 快照。
 
 > 本软件会驱动真实的机械臂。运行任何会动的代码之前，先阅读[安全](#安全)。
 
@@ -45,12 +46,14 @@
 - [硬件与软件要求](#硬件与软件要求)
 - [安装](#安装)
 - [快速上手](#快速上手)
+- [编写自己的程序](#编写自己的程序)
 - [项目结构](#项目结构)
 - [拓扑](#拓扑)
 - [机械臂控制](#机械臂控制)
 - [MCP 服务器（agent 控制）](#mcp-服务器agent-控制)
 - [手眼标定](#手眼标定)
 - [相机内参](#相机内参)
+- [录制 LeRobot 数据集](#录制-lerobot-数据集)
 - [示例](#示例)
 - [安全](#安全)
 - [开发](#开发)
@@ -110,10 +113,15 @@ SDK 不在相机上运行。相机和 armd 提供单一用途的接口：
 - reCamera 上的 `rebot-vision`，用于标记触发（包含在 `rebot-teleop` 安装包内，与 rebot-armd 一起安装，无需另装相机应用）。相机自带的 aruco-detector 也可使用：触发请求需要 JSON body（aruco-detector >= 0.1.3
   否则返回 `415`；SDK 会发送 JSON body），畸变参数需要 aruco-detector >= 0.1.1。
 - SenseCraft 方案 `rebot_agent_arm` 安装 `rebot-teleop`、本 MCP 服务器并运行标定验证步骤。
+- reCamera 上的 `rebot`（该包在设备上以 Python 3.8 为目标）不从本项目的 wheel 安装（wheel 要求
+  Python >= 3.10）。用 `REBOT_SDK_DIR=<rebot-companion 检出目录>` 构建的 rebot-teleop deb 把 `rebot/`
+  目录装到 `/usr/share/rebot-teleop/python`，其程序运行器把该目录加入 `PYTHONPATH`。没有该目录时，
+  把 `rebot/` 目录复制到程序的 `main.py` 旁边。
 
 上位机：
 
-- Python >= 3.10 和 [uv](https://docs.astral.sh/uv/)。
+- `rebot_companion` 与 MCP 服务器需要 Python >= 3.10 和 [uv](https://docs.astral.sh/uv/)。
+  单独使用 `rebot` 包只需 Python >= 3.8，不需要第三方包。
 - 快照：PyAV（在 `agent` extra 中）或 `PATH` 上的 `ffmpeg`。
 - 可选：Node.js，仅用于重新生成测试用的 JS 参考值。
 
@@ -127,6 +135,7 @@ cd rebot-companion
 uv sync                      # 仅 SDK
 uv sync --extra agent        # + MCP 服务器：mcp 2.x、av、pillow
 uv sync --extra calib        # + OpenCV，用于 tools/calibrate_intrinsics.py
+uv sync --extra record       # + PyAV、pyarrow，用于 rebot-record
 uv sync --all-extras         # 全部（开发用）
 ```
 
@@ -134,6 +143,7 @@ uv sync --all-extras         # 全部（开发用）
 |---|---|---|
 | `agent` | `mcp>=2.3,<3`、`av>=12`、`pillow>=10` | `rebot-mcp`、PyAV 解码快照、带检测框的快照 |
 | `calib` | `opencv-python-headless>=4.8,<5` | 相机内参工具 |
+| `record` | `av>=12`、`pyarrow>=14` | `rebot-record`（LeRobot 数据集录制） |
 
 测试在 `uv.lock` 锁定的版本上运行（例如 mcp 2.3.0）。
 
@@ -172,15 +182,110 @@ with arm.session() as s:
 
 ---
 
+## 编写自己的程序
+
+`rebot` 是 SDK 中供用户脚本使用的部分，只导入 Python 标准库，因此同一份脚本可以在电脑上
+（通过网络控制机械臂）和 reCamera 上（`127.0.0.1`）运行。
+
+```python
+from rebot import Arm
+
+with Arm() as arm:  # $REBOT_HOST，未设置时为 127.0.0.1；获取控制权并上力矩
+    arm.home()
+    for obj in arm.detect("cup"):  # 检测结果按分数从高到低：label、score、box_norm
+        if arm.grasp(obj).holding:
+            arm.move_to((0.25, -0.15, 0.15))  # 米，机械臂基座坐标系（x 向前、y 向左、z 向上）
+            arm.gripper_open()
+        break
+# 离开 with 块时停靠机械臂（关闭力矩）并释放控制权，
+# 出错或 Ctrl+C 时也一样。
+```
+
+在电脑上运行（`rebot/` 文件夹与脚本放在同一目录，或用 `uv sync` 安装本包）：
+
+```bash
+REBOT_HOST=192.168.42.1 python3 main.py
+```
+
+在 reCamera 上运行：把 `rebot/` 文件夹和脚本复制到设备上，用设备的 `python3` 运行：
+
+```bash
+scp -r rebot main.py <user>@192.168.42.1:~/arm/
+ssh <user>@192.168.42.1 'cd ~/arm && python3 main.py'
+```
+
+| 方法 | 作用 |
+|---|---|
+| `Arm(host=None, port=None, enable=True, park_on_exit=True, force=False, obs_hz=10, handle_sigterm=True)` | 连接、获取控制租约、上力矩 |
+| `home()`、`park()` | 回零位；回休息位并关闭力矩（下一次运动会重新上力矩） |
+| `move_to(xyz, rpy=None, speed=None)` | 夹爪直线运动到目标；`rpy` 单位为弧度，`speed` 单位为 m/s |
+| `move_relative(dx, dy, dz, frame="base", droll, dpitch, dyaw, speed)` | 在 `base`、`tool` 或 `camera` 坐标系中相对运动 |
+| `move_joints(positions, duration=None)` | 关节空间运动（7 个值，弧度） |
+| `gripper_open()`、`gripper_close()`、`gripper_move(fraction)` | 夹爪；`gripper_close().holding` 表示是否夹住物体 |
+| `detect(label=None, pipelines=("yolo",), min_score=0.3)` | 经 armd 运行一次检测，返回检测列表 |
+| `grasp(detection)` 或 `grasp("cup", box=(x0, y0, x1, y1))` | armd 的抓取动作；结果中的 `.holding` |
+| `state()` | 最新 observation（`positions`、`safety_state`、`is_torqued`、`fault` 等） |
+| `poses()`、`save_pose(name)`、`delete_pose(name)`、`move_to_pose(name, speed_scale=1.0)` | 保存在 armd 中的命名位姿 |
+| `place(pose=None, position=None, rpy=None, approach_height_m=0.08, release=True, retreat=True, speed_scale=1.0)` | 放下手中物体：抬升、接近、下降、张开、撤离（能力 `place`） |
+| `stop()`、`e_stop()` | 停止并保持；锁存急停 |
+| `wait_until_clear(timeout_s=10)` | 动作因 `COLLISION` 失败后：阻塞到机械臂自行恢复（能力 `collision_guard`） |
+| `set_collision_guard(enabled=None, sensitivity=None)`、`collision_guard()` | 开关碰撞保护、设置 `"low"`/`"medium"`/`"high"`、读取配置（能力 `collision_guard`） |
+| `recover(max_attempts=1)` | 清除 armd 标记为可恢复的故障，然后上力矩 |
+| `guard(timeout_s)`、`feed()` | 主循环不再调用 `feed()` 时释放控制权 |
+
+起点：`examples/templates/sort_by_label.py`（YOLO 检测、抓取、按标签放入对应料框）和
+`examples/templates/demo_wave.py`（依次访问三个示教位姿）。用 AI 助手构建程序时见
+[AGENTS.md](AGENTS.md)（流程、API 速查、安全规则、错误码；英文）。
+
+行为：
+
+- `Arm` 在主线程把 SIGTERM 转为 `SystemExit`（`handle_sigterm=False` 可关闭），设备上的应用运行器发出
+  停止信号时，机械臂会收纳并释放控制权。
+- 错误都是 `rebot.RebotError` 的子类，带 `.code` 和 `.message`，例如
+  `IK_BRANCH_FLIP: target (0.9, 0, 0.1) needs the arm to flip its elbow; choose a closer or higher
+  target (...)`（取自下文的集成测试输出）。
+- `recover()` 只清除 observation 中 `fault.recoverable` 为 true 的故障（看门狗超时、控制周期超时、
+  交接未稳定）。急停、其他故障，以及不报告故障码的 armd 上的所有故障，都抛出 `ArmFaultError`；
+  这些故障需要检查机械臂后在 Web 驾驶舱中清除。离开 `with` 块时也不会清除它们。
+- `guard(timeout_s)`：后台线程在 `timeout_s` 秒内没有调用 `feed()` 时释放租约（在 `Arm` 方法内部的
+  时间算作已调用，上限为该调用自身的超时加 15 秒：运动用 `timeout` 或 60 秒，其他调用 30 秒），
+  之后由 armd 的租约看门狗处理机械臂，后续调用都抛出 `GuardTimeout`。
+- 命名位姿、`move_to_pose`、`obs_hz` 和故障码需要报告 capabilities 版本 6（`poses`、`obs_rate`、
+  `fault_codes`）的 armd。旧版 armd 上位姿相关方法抛出 `UnsupportedError`（`code == "UNSUPPORTED"`），
+  不发送 `obs_hz`（armd 按每个控制周期推送），`recover()` 不清除故障。
+
+验证情况：
+
+- `import rebot` 不加载任何第三方模块（`numpy`、`httpx`、`websockets` 不出现在 `sys.modules` 中）。
+  `rebot` 的单元测试（WebSocket 客户端、`Arm`、协议）在 CPython 3.8.20 和 3.13 上对进程内 fake armd
+  通过；CI 在 3.8 上运行它们（任务 `stdlib-core`）。未检查 reCamera 上 `python3` 的版本，需为 3.8 或更高。
+- `tests/test_integration_armd.py` 用从 rebot-armd `ad923df` 编译的 armd（`--follower mock`，B601-DM
+  profile）驱动 `Arm`：连接、上力矩、`move_to`、`home`、`park`、释放、退出时停靠、错误信息。该 armd
+  报告 capabilities 版本 5，因此版本 6 的功能只在 fake armd 上验证过。未在硬件上运行。
+
+```bash
+ARMD_BIN=/path/to/armd ARMD_PROFILE=/path/to/rebot-b601dm.json uv run pytest tests/test_integration_armd.py -s
+```
+
+---
+
 ## 项目结构
 
 ```text
 rebot-companion/
 ├── pyproject.toml              # uv 项目；extras：[agent] = MCP 服务器，[calib] = OpenCV
-├── rebot_companion/            # SDK
-│   ├── arm_client.py           # rebot-armd 客户端（REST 读取 + WebSocket 租约会话 + 动作）
+├── rebot/                      # 机械臂控制核心，仅标准库（Python >= 3.8）
+│   ├── arm.py                  # 用户程序使用的 Arm 类
+│   ├── client.py               # rebot-armd 客户端（REST 读取 + WebSocket 租约会话 + 动作）
+│   ├── detection.py            # 经 armd 检测代理获取检测结果
+│   ├── errors.py               # RebotError 及其子类
+│   ├── _ws.py                  # 最小 RFC 6455 WebSocket 客户端
+│   └── _http.py                # 基于 urllib 的 JSON 请求
+├── rebot_companion/            # SDK（numpy / scipy）
+│   ├── arm_client.py           # 重新导出 rebot.client
 │   ├── camera_client.py        # reCamera rebot-vision / aruco-detector 客户端（触发 / 最新结果）
 │   ├── snapshot.py             # 从 H.264 流截取 JPEG 快照 + 检测框叠加
+│   ├── lerobot_recorder.py     # LeRobot v3.0 数据集录制（rebot-record）
 │   ├── mcp_server.py           # stdio MCP 服务器（rebot-mcp）
 │   ├── kinematics.py           # B601-DM FK（完整 URDF 链）与平面 FK/IK（Web 驾驶舱移植）
 │   ├── ik.py                   # IK 适配器：基座系位姿 -> armd 7 关节向量（含夹爪）
@@ -345,9 +450,26 @@ claude mcp add rebot -- uv run --directory /path/to/rebot-companion --extra agen
 | `stop` | — | `{state}`；在其他工具运动时也可执行 |
 | `e_stop` | — | `{safety_state, epoch_id}`；不需要租约 |
 | `enable` | — | 开启力矩 |
+| `list_poses` | — | `{count, poses[{name, positions, tcp}]}`；不需要租约。需要 armd 能力 `poses` |
+| `save_pose` | `name`（字母、数字、`_`、`-`；最长 64） | 以 `name` 保存当前关节位置，同名位姿被替换。会修改设备上保存的位姿。能力 `poses` |
+| `move_to_pose` | `name`、`speed_scale`（0.1..1.0，默认 0.5） | 动作结果；关节空间运动。能力 `poses` |
+| `place` | `pose` 或 `x, y, z`；`rpy_deg`、`approach_height_m`（0.08，0.02..0.30）、`release`、`retreat`、`speed_scale`（0.5）、`timeout_s` | 动作结果；抬升、接近、下降、张开、撤离。能力 `place` |
+| `get_keepout` | — | `{boxes[{name, min_m, max_m}], source}`；不需要租约。能力 `keepout` |
+| `set_keepout` | `boxes`（最多 16 个） | 替换运行时禁入区（`[]` 为清空）。会修改设备配置。能力 `keepout` |
+| `recover` | — | 清除 armd 标为可恢复的故障（`WATCHDOG_TIMEOUT`、`CONTROL_DEADLINE`、`HANDOVER_UNSETTLED`）并重新开启力矩；其他故障和急停返回 `NOT_RECOVERABLE` 并保持锁定。能力 `fault_codes` |
+| `collision_guard_status` | — | `{enabled, sensitivity, thresholds_nm}`；不需要租约。`get_state.collision` 显示进行中的碰撞停止。能力 `collision_guard` |
+| `describe_safety` | — | 停止方式、故障（含 `recoverable`）、速度和关节限位、时序、`hardware.physical_estop`，以及一行 `summary`；不需要租约。能力 `safety_describe` |
+| `set_collision_guard` | `enabled`、`sensitivity`（`low`/`medium`/`high`） | 开关碰撞保护和/或设置灵敏度。会修改设备配置。能力 `collision_guard` |
 | `clear_fault` | — | 清除 EStop 或 Fault；仅在 `--allow-clear-fault` 时列出 |
 | `take_control` | `force`（仅在 `--allow-preempt` 时） | 获取空闲租约；带 `--allow-preempt` 时，`force=true` 从 Web 驾驶舱抢占控制 |
 | `release_control` | — | 释放租约；机械臂带力矩时，armd 看门狗会将其收纳 |
+
+`save_pose` 和 `set_keepout` 会写入设备（位姿和禁入区文件），默认已注册。
+需要能力的工具在 armd 版本较旧时返回 `UNSUPPORTED`，提示 "Update rebot-armd"。
+`recover` 不会清除急停或 armd 标为不可恢复的故障（包括 `COLLISION` 故障），因此不需要 `--allow-clear-fault`。
+`save_pose`、`set_keepout` 和 `set_collision_guard` 会写入设备，用户提出时才使用。
+
+碰撞保护：开启后，接触会使 armd 停住机械臂并保持位置。运行中的动作以 `COLLISION` 失败，期间运动指令被 `COLLISION_HOLD` 拒绝，接触消失后机械臂自行恢复。一分钟内多次触发后，armd 锁定 `COLLISION` 故障，需要人在驾驶舱中清除。保护默认关闭，阈值是未标定的占位值（未在真机上实测）。两个示例模板用 `wait_until_clear()` 等待后重试该步骤一次。
 
 表中的限制（速度 ≤ 0.15 m/s、步长 ≤ 0.30 m、旋转 ≤ 90 deg）由服务器的输入 schema 在调用到达 armd
 之前检查；armd 另有自己的限制。
@@ -511,6 +633,48 @@ uv run python tools/calibrate_intrinsics.py --images intrinsics_frames/20261109-
 
 ---
 
+## 录制 LeRobot 数据集
+
+`rebot-record` 在上位机上把遥操作或脚本驱动的 episode 录成
+[LeRobot](https://github.com/huggingface/lerobot) 数据集（格式 `codebase_version` v3.0，与
+`lerobot` 0.6.1 写出的一致；细节见 [`docs/lerobot_dataset.md`](docs/lerobot_dataset.md)）。
+需要 `record` extra（PyAV、pyarrow），不需要安装 lerobot。
+
+```bash
+uv sync --extra record
+uv run rebot-record --armd 192.168.16.1 --camera 192.168.16.1 \
+  --repo-id user/pick_cup --task "pick the cup" --episodes 5 --episode-s 30
+```
+
+每个 episode：回车开始；再按回车提前结束（否则到 `--episode-s` 自动结束）；随后回车保存、`d`
+丢弃、`q` 保存并退出。`--no-prompt` 连续录制（`--reset-s` 设置 episode 间隔）。数据集默认写到
+`~/.cache/huggingface/lerobot/<repo-id>`，可用 `--root` 指定；目录必须是新的。
+
+| 特征 | 来源 |
+|---|---|
+| `observation.state`（7） | armd `positions`（关节 1..6 + 夹爪，rad） |
+| `action`（7） | armd `commanded_positions`（旧版 armd 没有该字段时用 `positions`） |
+| `observation.velocity`、`observation.effort`（7） | `velocities`、`torques`，加 `--extras velocity,effort` |
+| `observation.images.recamera` | reCamera H.264 流，解码后重新编码（PyAV 带 libsvtav1 时用它，否则 h264；`g=2`、`crf=30`） |
+
+录制器不占控制租约：它只读 armd 的观测 WebSocket（`/api/v1/ws?obs_hz=2*fps`），遥操作应用或程序
+可以同时持有租约。对齐用每条消息在主机上的接收时间（`time.monotonic()`）：第 `k` 行的采样时刻是
+`T0 + k/fps`，取该时刻之前收到的最新观测和最新解码帧。armd 自带的时间戳和相机消息尾部的毫秒时间戳
+属于其他时钟，按 episode 写入 `meta/rebot_episodes.jsonl`，同时记录观测和相机样本的延迟。相机链路和
+网络延迟没有补偿。
+
+Python API：`LeRobotRecorder(root, repo_id, fps=30, camera_url=..., armd_host=..., task=...)`，
+方法 `start_episode()`、`stop_episode()`、`save()`、`discard()`；`start_episode(sample=False)` 加
+`add_frame(state, action, image)` 可按固定 `fps` 录制脚本步骤。
+
+已验证（`tests/test_lerobot_recorder.py`，合成观测 + libx264 生成的 Annex-B 帧，经同一条 PyAV 解码路径）：
+文件布局、索引、时间戳、统计量和任务元数据；每行对应一帧 mp4；对 fake armd 的无租约录制；回车控制的
+CLI。`LeRobotDataset(repo_id, root=...)` 能加载结果并读出图像、动作和任务：lerobot 0.6.1（PyAV
+解码）和 0.7.0（torchcodec 解码），Linux aarch64。该测试在 `REBOT_LEROBOT_PYTHON` 指向装有
+`lerobot[dataset]` 的 Python 时运行，否则跳过。尚未在真实 armd 和 reCamera 上运行。
+
+---
+
 ## 示例
 
 | 脚本 | 内容 | 是否驱动机械臂 |
@@ -569,7 +733,9 @@ node tools/gen_web_fixtures.mjs ../rebot-armd/src/api/index.html   # 重新生�
 ```
 
 测试使用进程内的模拟对象（armd：`tests/fake_armd.py`）和录制的数据，不需要硬件。CI
-（`.github/workflows/ci.yml`）在 Python 3.10、3.11、3.12 和 3.13 上安装全部 extras 运行 ruff 和 pytest。
+（`.github/workflows/ci.yml`）在 Python 3.10、3.11、3.12 和 3.13 上安装全部 extras 运行 ruff 和 pytest，
+并在 Python 3.8 上只安装 pytest 和 websockets 运行 `rebot` 的测试。`tests/test_integration_armd.py`
+仅在 `ARMD_BIN` 指向 armd 可执行文件时运行。
 另见 [CONTRIBUTING.md](./CONTRIBUTING.md) 和 [SECURITY.md](./SECURITY.md)（英文）。
 
 ---

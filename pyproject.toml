@@ -23,8 +23,6 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Image Recognition",
 ]
 dependencies = [
-    "httpx>=0.27.0",
-    "websockets>=12.0",
     "numpy>=1.24.0",
     "scipy>=1.10.0",
 ]
@@ -36,6 +34,7 @@ Issues = "https://github.com/Seeed-Solution/rebot-companion/issues"
 
 [project.scripts]
 rebot-mcp = "rebot_companion.mcp_server:main"
+rebot-record = "rebot_companion.lerobot_recorder:main"
 
 [project.optional-dependencies]
 calib = [
@@ -46,10 +45,17 @@ agent = [
     "mcp>=2.3,<3",  # 2.x API: mcp.server.mcpserver.MCPServer (FastMCP was renamed)
     "pillow>=10",
 ]
+record = [
+    "av>=12",
+    "pyarrow>=14",
+]
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["rebot", "rebot_companion"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -61,6 +67,9 @@ dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
     "ruff>=0.6",
+    "websockets>=12.0",
+    "av>=12",
+    "pyarrow>=14",
 ]
 
 [tool.ruff]
@@ -70,3 +79,7 @@ target-version = "py310"
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP"]
 ignore = ["B905"]  # zip(strict=) would change runtime behaviour
+
+[tool.ruff.lint.per-file-ignores]
+# rebot/ runs on Python 3.8 (reCamera): keep typing.Optional/Union in runtime positions
+"rebot/**" = ["UP"]

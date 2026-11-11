@@ -23,16 +23,17 @@ English | [中文](./README.zh-CN.md)
 
 Python SDK and stdio [MCP](https://modelcontextprotocol.io) server bridging **Seeed reCamera (SG2002 RISC-V edge vision)** and **[rebot-armd](https://github.com/Seeed-Solution/rebot-armd) (Rust arm daemon)**.
 
-- `rebot_companion` (SDK): rebot-armd client (REST reads, WebSocket control lease, joint and Cartesian actions), reCamera ArUco trigger client, JPEG snapshots from the camera H.264 stream, B601-DM kinematics, hand-eye calibration, and a deterministic pick-and-place pipeline.
+- `rebot` (arm-control core): standard library only, Python >= 3.8. The `Arm` class for short programs meant to run unchanged on a PC and on the reCamera (see [Write your own program](#write-your-own-program)), plus the armd protocol client and detection access underneath it.
+- `rebot_companion` (SDK): rebot-armd client (re-exported from `rebot`) (REST reads, WebSocket control lease, joint and Cartesian actions), reCamera ArUco trigger client, JPEG snapshots from the camera H.264 stream, B601-DM kinematics, hand-eye calibration, and a deterministic pick-and-place pipeline.
 - `rebot-mcp`: a stdio [MCP](https://modelcontextprotocol.io) server that exposes the arm, snapshots and detections as tools to AI agents.
 
 ## Key Features
 
-- **Stdio MCP server for AI agents (`rebot-mcp`)**: 14 tools by default (state, snapshots, detection, motion, gripper, stop). Works with MCP clients that support stdio servers; end-to-end tests used the Python `mcp` client against a real arm. Fault clearing and cockpit takeover are off unless enabled at launch (see [MCP server](#mcp-server-agent-control)).
+- **Stdio MCP server for AI agents (`rebot-mcp`)**: 24 tools by default (state, snapshots, detection, motion, gripper, stop, named poses, place, keep-out boxes, fault recovery, collision guard, safety description). Works with MCP clients that support stdio servers; end-to-end tests used the Python `mcp` client against a real arm. Fault clearing and cockpit takeover are off unless enabled at launch (see [MCP server](#mcp-server-agent-control)).
 - **Hand-eye calibration**: eye-to-hand (closed-form Horn point registration) and eye-in-hand (Park & Martin $AX=XB$), cross-checked against OpenCV `CALIB_HAND_EYE_PARK` in the tests. Accuracy is verified on synthetic data only; it has not been measured on a real arm yet.
 - **Two stages**: Stage 1, an agent orchestrates the tools; Stage 2, a deterministic local pick-and-place pipeline that needs no LLM.
 - **Kinematics**: full URDF forward kinematics (within 0.1 mm of an independent URDF parser in the tests) and an analytic planar inverse kinematics solver for the B601-DM.
-- **reCamera integration**: nothing from this package runs on the camera. On-demand detection triggers (6-DoF ArUco marker poses, YOLO 2D boxes) and JPEG snapshots decoded on the host from the camera's H.264 stream.
+- **reCamera integration**: `rebot_companion` and the MCP server run on a host; the `rebot` package (standard library only) is meant to run on the camera as well (not yet run on the device). On-demand detection triggers (6-DoF ArUco marker poses, YOLO 2D boxes) and JPEG snapshots decoded on the host from the camera's H.264 stream.
 
 > This software moves a real arm. Read [Safety](#safety) before running anything that moves.
 
@@ -45,12 +46,14 @@ Python SDK and stdio [MCP](https://modelcontextprotocol.io) server bridging **Se
 - [Requirements](#requirements)
 - [Install](#install)
 - [Quickstart](#quickstart)
+- [Write your own program](#write-your-own-program)
 - [Project layout](#project-layout)
 - [Topology](#topology)
 - [Arm control](#arm-control)
 - [MCP server (agent control)](#mcp-server-agent-control)
 - [Hand-eye calibration](#hand-eye-calibration)
 - [Camera intrinsics](#camera-intrinsics)
+- [Record a LeRobot dataset](#record-a-lerobot-dataset)
 - [Examples](#examples)
 - [Safety](#safety)
 - [Development](#development)
@@ -116,10 +119,16 @@ Software on the devices:
   the SDK sends one) and distortion keys need aruco-detector >= 0.1.1.
 - The SenseCraft solution `rebot_agent_arm` installs `rebot-teleop`, this MCP server and the
   calibration verify step.
+- `rebot` on the reCamera (the package targets Python 3.8 there) does not come from this project's
+  wheel, which requires Python >= 3.10. A rebot-teleop deb built with
+  `REBOT_SDK_DIR=<rebot-companion checkout>` carries the `rebot/` folder in
+  `/usr/share/rebot-teleop/python`, and its app runner puts that directory on `PYTHONPATH`.
+  Without it, copy the `rebot/` folder next to the program's `main.py`.
 
 Host:
 
-- Python >= 3.10 and [uv](https://docs.astral.sh/uv/).
+- Python >= 3.10 and [uv](https://docs.astral.sh/uv/) for `rebot_companion` and the MCP server.
+  The `rebot` package alone needs Python >= 3.8 and no third-party packages.
 - Snapshots: PyAV (in the `agent` extra) or the `ffmpeg` binary on `PATH`.
 - Optional: Node.js, only to regenerate the JS reference values for the tests.
 
@@ -133,6 +142,7 @@ cd rebot-companion
 uv sync                      # SDK only
 uv sync --extra agent        # + MCP server: mcp 2.x, av, pillow
 uv sync --extra calib        # + OpenCV for tools/calibrate_intrinsics.py
+uv sync --extra record       # + PyAV, pyarrow for rebot-record
 uv sync --all-extras         # everything (development)
 ```
 
@@ -140,6 +150,7 @@ uv sync --all-extras         # everything (development)
 |---|---|---|
 | `agent` | `mcp>=2.3,<3`, `av>=12`, `pillow>=10` | `rebot-mcp`, snapshots with PyAV, annotated snapshots |
 | `calib` | `opencv-python-headless>=4.8,<5` | camera intrinsics tool |
+| `record` | `av>=12`, `pyarrow>=14` | `rebot-record` (LeRobot dataset recorder) |
 
 The test suite runs against the versions pinned in `uv.lock` (for example mcp 2.3.0).
 
@@ -178,15 +189,116 @@ The arm part of this sequence is checked against the fake armd used by the tests
 
 ---
 
+## Write your own program
+
+`rebot` is the part of the SDK for your own scripts. It imports only the Python standard library,
+so the same script runs on a PC (arm over the network) and on the reCamera (`127.0.0.1`).
+
+```python
+from rebot import Arm
+
+with Arm() as arm:  # $REBOT_HOST, else 127.0.0.1; takes control, torque on
+    arm.home()
+    for obj in arm.detect("cup"):  # detections, best first: label, score, box_norm
+        if arm.grasp(obj).holding:
+            arm.move_to((0.25, -0.15, 0.15))  # metres, arm base frame (x forward, y left, z up)
+            arm.gripper_open()
+        break
+# Leaving the block parks the arm (torque off) and releases control,
+# also after an error or Ctrl+C.
+```
+
+Run on a PC (the `rebot/` folder next to the script, or the package installed with `uv sync`):
+
+```bash
+REBOT_HOST=192.168.42.1 python3 main.py
+```
+
+Run on the reCamera: copy the `rebot/` folder and the script to the device, then run it with the
+device's `python3`:
+
+```bash
+scp -r rebot main.py <user>@192.168.42.1:~/arm/
+ssh <user>@192.168.42.1 'cd ~/arm && python3 main.py'
+```
+
+| Method | What it does |
+|---|---|
+| `Arm(host=None, port=None, enable=True, park_on_exit=True, force=False, obs_hz=10, handle_sigterm=True)` | connect, take the control lease, turn torque on |
+| `home()`, `park()` | move home; move to the resting pose and turn torque off (the next motion turns torque on again) |
+| `move_to(xyz, rpy=None, speed=None)` | straight-line move of the gripper; `rpy` in radians, `speed` in m/s |
+| `move_relative(dx, dy, dz, frame="base", droll, dpitch, dyaw, speed)` | relative move in the `base`, `tool` or `camera` frame |
+| `move_joints(positions, duration=None)` | joint-space move (7 values, radians) |
+| `gripper_open()`, `gripper_close()`, `gripper_move(fraction)` | gripper; `gripper_close().holding` reports a held object |
+| `detect(label=None, pipelines=("yolo",), min_score=0.3)` | one detector run through armd; list of detections |
+| `grasp(detection)` or `grasp("cup", box=(x0, y0, x1, y1))` | armd's grasp action; `.holding` in the result |
+| `state()` | latest observation (`positions`, `safety_state`, `is_torqued`, `fault`, ...) |
+| `poses()`, `save_pose(name)`, `delete_pose(name)`, `move_to_pose(name, speed_scale=1.0)` | named poses stored in armd |
+| `place(pose=None, position=None, rpy=None, approach_height_m=0.08, release=True, retreat=True, speed_scale=1.0)` | put the held object down: lift, approach, descend, open, retreat (capability `place`) |
+| `stop()`, `e_stop()` | stop and hold; latched emergency stop |
+| `wait_until_clear(timeout_s=10)` | after a `COLLISION` action failure: block until the arm has resumed (capability `collision_guard`) |
+| `set_collision_guard(enabled=None, sensitivity=None)`, `collision_guard()` | switch the collision guard, set `"low"`/`"medium"`/`"high"`, read its configuration (capability `collision_guard`) |
+| `recover(max_attempts=1)` | clear a fault that armd marks recoverable, then torque on |
+| `guard(timeout_s)`, `feed()` | release control when the main loop stops calling `feed()` |
+
+Starting points: `examples/templates/sort_by_label.py` (YOLO detection, grasp, place into bins chosen by
+label) and `examples/templates/demo_wave.py` (tour of three taught poses). Building a program with an AI
+assistant: see [AGENTS.md](AGENTS.md) (workflow, API cheat sheet, safety rules, error codes).
+
+Behaviour:
+
+- `Arm` turns SIGTERM into `SystemExit` in the main thread (`handle_sigterm=False` opts out), so the
+  device app runner's stop signal parks the arm and releases control.
+- Errors are `rebot.RebotError` subclasses with `.code` and `.message`, for example
+  `IK_BRANCH_FLIP: target (0.9, 0, 0.1) needs the arm to flip its elbow; choose a closer or higher
+  target (...)` (this text is from the integration test below).
+- `recover()` clears only faults whose observation `fault.recoverable` is true (watchdog timeout,
+  control deadline, unsettled handover). E-stops, other faults, and every fault on an armd without
+  fault codes raise `ArmFaultError`; clear those in the web cockpit after checking the arm. Leaving
+  the `with` block does not clear them either.
+- `guard(timeout_s)`: a background thread releases the lease when `feed()` has not been called
+  for `timeout_s` seconds (time inside an `Arm` method counts as fed, up to that call's own timeout
+  plus 15 s: motions `timeout` or 60 s, other calls 30 s); armd's lease watchdog then handles the
+  arm, and every later call raises `GuardTimeout`.
+- Named poses, `move_to_pose`, `obs_hz` and fault codes need an armd that reports capabilities
+  version 6 (`poses`, `obs_rate`, `fault_codes`). Against older armd the pose methods raise
+  `UnsupportedError` (`code == "UNSUPPORTED"`), `obs_hz` is not sent (armd then sends every
+  control tick), and `recover()` does not clear faults.
+
+What was checked:
+
+- `import rebot` loads no third-party module (`numpy`, `httpx`, `websockets` stay out of
+  `sys.modules`). The `rebot` unit tests (WebSocket client, facade, protocol) pass on CPython 3.8.20
+  and 3.13 against the in-process fake armd; CI runs them on 3.8 (job `stdlib-core`). The
+  reCamera's `python3` version was not checked; it has to be 3.8 or newer.
+- `tests/test_integration_armd.py` drives `Arm` against an armd binary built from rebot-armd
+  `ad923df` with `--follower mock` and the B601-DM profile: connect, enable, `move_to`, `home`,
+  `park`, release, park on exit, readable errors. That armd reports capabilities version 5, so the
+  version 6 features were checked only against the fake armd. Not run on hardware.
+
+```bash
+ARMD_BIN=/path/to/armd ARMD_PROFILE=/path/to/rebot-b601dm.json uv run pytest tests/test_integration_armd.py -s
+```
+
+---
+
 ## Project layout
 
 ```text
 rebot-companion/
 ├── pyproject.toml              # uv project; extras: [agent] = MCP server, [calib] = OpenCV
-├── rebot_companion/            # SDK
-│   ├── arm_client.py           # rebot-armd client (REST reads + WebSocket lease session + actions)
+├── rebot/                      # arm-control core, standard library only (Python >= 3.8)
+│   ├── arm.py                  # Arm facade for user programs
+│   ├── client.py               # rebot-armd client (REST reads + WebSocket lease session + actions)
+│   ├── detection.py            # detections through armd's detector proxy
+│   ├── errors.py               # RebotError and subclasses
+│   ├── _ws.py                  # minimal RFC 6455 WebSocket client
+│   └── _http.py                # JSON over urllib
+├── rebot_companion/            # SDK (numpy / scipy)
+│   ├── arm_client.py           # re-export of rebot.client
 │   ├── camera_client.py        # reCamera rebot-vision / aruco-detector client (trigger / latest result)
 │   ├── snapshot.py             # JPEG snapshots from the H.264 stream + detection overlay
+│   ├── lerobot_recorder.py     # LeRobot v3.0 dataset recorder (rebot-record)
 │   ├── mcp_server.py           # stdio MCP server (rebot-mcp)
 │   ├── kinematics.py           # B601-DM FK (full URDF chain) and planar FK/IK (port of the Web cockpit)
 │   ├── ik.py                   # IK adapter: base-frame pose -> armd 7-joint vector (incl. gripper)
@@ -360,9 +472,26 @@ Tools:
 | `stop` | — | `{state}`; runs while another tool is moving |
 | `e_stop` | — | `{safety_state, epoch_id}`; no lease needed |
 | `enable` | — | torque on |
+| `list_poses` | — | `{count, poses[{name, positions, tcp}]}`; no lease needed. Needs armd capability `poses` |
+| `save_pose` | `name` (letters, digits, `_`, `-`; max 64) | saves the current joint positions under `name`, replacing a pose of that name. Changes the device's saved poses. Capability `poses` |
+| `move_to_pose` | `name`, `speed_scale` (0.1..1.0, default 0.5) | action result; joint-space move. Capability `poses` |
+| `place` | `pose` or `x, y, z`; `rpy_deg`, `approach_height_m` (0.08, 0.02..0.30), `release`, `retreat`, `speed_scale` (0.5), `timeout_s` | action result; lift, approach, descend, open, retreat. Capability `place` |
+| `get_keepout` | — | `{boxes[{name, min_m, max_m}], source}`; no lease needed. Capability `keepout` |
+| `set_keepout` | `boxes` (max 16) | replaces the runtime keep-out boxes (`[]` removes them). Changes the device configuration. Capability `keepout` |
+| `recover` | — | clears a fault armd marks recoverable (`WATCHDOG_TIMEOUT`, `CONTROL_DEADLINE`, `HANDOVER_UNSETTLED`) and re-enables torque; any other fault or E-stop returns `NOT_RECOVERABLE` and stays latched. Capability `fault_codes` |
+| `collision_guard_status` | — | `{enabled, sensitivity, thresholds_nm}`; no lease needed. `get_state.collision` shows a stop in progress. Capability `collision_guard` |
+| `describe_safety` | — | stops, faults (with `recoverable`), speed and joint limits, timing, `hardware.physical_estop`, plus a one-line `summary`; no lease needed. Capability `safety_describe` |
+| `set_collision_guard` | `enabled`, `sensitivity` (`low`/`medium`/`high`) | switches the collision guard and/or sets its sensitivity. Changes the device configuration. Capability `collision_guard` |
 | `clear_fault` | — | clear EStop or Fault; listed only with `--allow-clear-fault` |
 | `take_control` | `force` (only with `--allow-preempt`) | acquire a free lease; with `--allow-preempt`, `force=true` takes control from the web cockpit |
 | `release_control` | — | release the lease; if the arm is torqued, armd's watchdog parks it |
+
+`save_pose` and `set_keepout` write to the device (poses and keep-out files) and are registered by default.
+Tools that need a capability return `UNSUPPORTED` with the message "Update rebot-armd" when armd is older.
+`recover` never clears an E-stop or a fault armd marks not recoverable (including a `COLLISION` fault), so it does not need `--allow-clear-fault`.
+`save_pose`, `set_keepout` and `set_collision_guard` write to the device; use them when the user asks.
+
+Collision guard: with the guard on, contact makes armd stop the arm and hold it. Running actions fail with `COLLISION`, motion commands are refused with `COLLISION_HOLD`, and the arm resumes by itself when the contact is gone. After repeated trips within a minute armd latches a `COLLISION` fault that a person clears in the cockpit. The guard is off by default and its thresholds are uncalibrated placeholders (not measured on a real arm). Both example templates wait with `wait_until_clear()` and retry the step once.
 
 The limits in the table (speed ≤ 0.15 m/s, step ≤ 0.30 m, rotation ≤ 90 deg) are checked by
 the server's input schema before a call reaches armd; armd applies its own limits as well.
@@ -553,6 +682,53 @@ the device; check a measured marker distance against a tape measure.
 
 ---
 
+## Record a LeRobot dataset
+
+`rebot-record` records teleoperation or scripted episodes from the host PC into a
+[LeRobot](https://github.com/huggingface/lerobot) dataset (format `codebase_version` v3.0, as
+written by `lerobot` 0.6.1; details in [`docs/lerobot_dataset.md`](docs/lerobot_dataset.md)).
+It needs the `record` extra (PyAV, pyarrow), not lerobot.
+
+```bash
+uv sync --extra record
+uv run rebot-record --armd 192.168.16.1 --camera 192.168.16.1 \
+  --repo-id user/pick_cup --task "pick the cup" --episodes 5 --episode-s 30
+```
+
+Each episode: Enter starts it; Enter stops it early (otherwise it stops after `--episode-s`);
+then Enter saves it, `d` discards it, `q` saves and quits. `--no-prompt` records back to back
+(`--reset-s` pause between episodes). The dataset goes to
+`~/.cache/huggingface/lerobot/<repo-id>` unless `--root` is given; the directory must be new.
+
+| Feature | Source |
+|---|---|
+| `observation.state` (7) | armd `positions` (joints 1..6, gripper; rad) |
+| `action` (7) | armd `commanded_positions` (falls back to `positions` on older armd) |
+| `observation.velocity`, `observation.effort` (7) | `velocities`, `torques`, with `--extras velocity,effort` |
+| `observation.images.recamera` | reCamera H.264 stream, decoded and re-encoded (libsvtav1 if PyAV has it, else h264; `g=2`, `crf=30`) |
+
+The recorder does not take the control lease: it reads the armd observation WebSocket
+(`/api/v1/ws?obs_hz=2*fps`) while a teleop app or program holds the lease. Alignment uses the
+host receive time of every message (`time.monotonic()`): row `k` is due at `T0 + k/fps` and takes
+the newest observation and the newest decoded camera frame received by then. armd's own
+timestamp and the camera's ms tail are other clocks; they are stored per episode in
+`meta/rebot_episodes.jsonl` with the observation and camera sample ages. Camera pipeline and
+network delay are not compensated.
+
+Python API: `LeRobotRecorder(root, repo_id, fps=30, camera_url=..., armd_host=..., task=...)`
+with `start_episode()`, `stop_episode()`, `save()`, `discard()`; `start_episode(sample=False)`
+plus `add_frame(state, action, image)` records scripted steps at a fixed `fps`.
+
+Verified (`tests/test_lerobot_recorder.py`, synthetic observations and libx264 Annex-B frames
+fed through the same PyAV decode path): file layout, indices, timestamps, stats and task
+metadata; one mp4 frame per row; a lease-free run against the fake armd; the Enter-driven CLI.
+`LeRobotDataset(repo_id, root=...)` loads the result and returns frames, actions and the task with
+lerobot 0.6.1 (PyAV decoder) and 0.7.0 (torchcodec decoder) on Linux aarch64; this test runs
+when `REBOT_LEROBOT_PYTHON` names a Python with `lerobot[dataset]` installed, else it is skipped.
+Not yet run against a real armd and reCamera.
+
+---
+
 ## Examples
 
 | Script | What it does | Moves the arm |
@@ -620,7 +796,8 @@ node tools/gen_web_fixtures.mjs ../rebot-armd/src/api/index.html   # regenerate 
 
 The tests use in-process fakes (armd: `tests/fake_armd.py`) and recorded fixtures; they need no
 hardware. CI (`.github/workflows/ci.yml`) runs ruff and pytest with all extras on Python 3.10,
-3.11, 3.12 and 3.13. See [CONTRIBUTING.md](./CONTRIBUTING.md) and [SECURITY.md](./SECURITY.md).
+3.11, 3.12 and 3.13, and the `rebot` tests on Python 3.8 with only pytest and websockets
+installed. `tests/test_integration_armd.py` runs only when `ARMD_BIN` points to an armd binary. See [CONTRIBUTING.md](./CONTRIBUTING.md) and [SECURITY.md](./SECURITY.md).
 
 ---
 
