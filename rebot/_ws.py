@@ -3,7 +3,9 @@
 Covers what armd and the camera stream use: the opening handshake (with an ``Origin`` header,
 which armd's same-origin check compares with ``Host``), masked client frames, text and binary
 messages, fragmentation, ping -> pong, close, and receive timeouts. No extensions
-(no permessage-deflate), no subprotocols.
+(no permessage-deflate), no subprotocols. Frames RFC 6455 forbids (reserved bits, masked server
+frames, fragmented or oversized control frames, bad close payloads, invalid UTF-8) close the
+connection with 1002 (1007 for UTF-8, 1009 for max_size) and raise :class:`WebSocketProtocolError`.
 
 One thread may call :meth:`WebSocket.recv` while others call :meth:`WebSocket.send`.
 """
@@ -36,6 +38,18 @@ class WebSocketClosed(WebSocketError):
         self.code = code
         self.reason = reason
         super().__init__(f"closed (code {code}{', ' + reason if reason else ''})")
+
+
+class WebSocketProtocolError(WebSocketError):
+    """The server sent a frame RFC 6455 forbids; the connection was closed with ``close_code``."""
+
+    def __init__(self, message: str, close_code: int = 1002) -> None:
+        self.close_code = close_code
+        super().__init__(message)
+
+
+def _valid_close_code(code: int) -> bool:
+    return code in (1000, 1001, 1002, 1003, 1007, 1008, 1009, 1010, 1011) or 3000 <= code <= 4999
 
 
 class WebSocketTimeout(TimeoutError):
@@ -110,7 +124,15 @@ class WebSocket:
         if len(buf) < 2:
             return None
         b0, b1 = buf[0], buf[1]
-        n = b1 & 0x7F
+        op, n = b0 & 0x0F, b1 & 0x7F
+        if b0 & 0x70:
+            raise WebSocketProtocolError("reserved bits set without a negotiated extension")
+        if b1 & 0x80:
+            raise WebSocketProtocolError("server frames must not be masked")
+        if op not in (OP_CONT, OP_TEXT, OP_BINARY, OP_CLOSE, OP_PING, OP_PONG):
+            raise WebSocketProtocolError(f"unknown opcode {op}")
+        if op >= 0x8 and (not b0 & 0x80 or n > 125):
+            raise WebSocketProtocolError("control frames must not be fragmented or exceed 125 bytes")
         pos = 2
         if n == 126:
             if len(buf) < 4:
@@ -123,20 +145,23 @@ class WebSocket:
             n = struct.unpack_from("!Q", buf, 2)[0]
             pos = 10
         if self.max_size is not None and n > self.max_size:
-            raise WebSocketError(f"frame of {n} bytes exceeds max_size {self.max_size}")
-        mask = None
-        if b1 & 0x80:  # servers must not mask, but accept it
-            if len(buf) < pos + 4:
-                return None
-            mask = bytes(buf[pos : pos + 4])
-            pos += 4
+            raise WebSocketProtocolError(f"frame of {n} bytes exceeds max_size {self.max_size}", 1009)
         if len(buf) < pos + n:
             return None
         payload = bytes(buf[pos : pos + n])
         del buf[: pos + n]
-        if mask is not None:
-            payload = _mask(payload, mask)
-        return bool(b0 & 0x80), b0 & 0x0F, payload
+        return bool(b0 & 0x80), op, payload
+
+    def _fail(self, exc: WebSocketProtocolError) -> None:
+        """Close with ``exc.close_code`` (best effort) and remember the failure for later calls."""
+        if not self._close_sent:
+            self._close_sent = True
+            try:
+                self._send_frame(OP_CLOSE, struct.pack("!H", exc.close_code))
+            except WebSocketClosed:
+                pass
+        self._closed = WebSocketClosed(exc.close_code, str(exc))
+        self._shutdown()
 
     def recv(self, timeout: Optional[float] = None) -> Union[str, bytes]:
         """Next message: ``str`` for text, ``bytes`` for binary.
@@ -147,6 +172,13 @@ class WebSocket:
         """
         if self._closed is not None:
             raise self._closed
+        try:
+            return self._recv(timeout)
+        except WebSocketProtocolError as exc:
+            self._fail(exc)
+            raise
+
+    def _recv(self, timeout: Optional[float]) -> Union[str, bytes]:
         deadline = None if timeout is None else time.monotonic() + timeout
         while True:
             frame = self._parse()
@@ -167,8 +199,12 @@ class WebSocket:
             if op == OP_PONG:
                 continue
             if op == OP_CLOSE:
+                if len(payload) == 1:
+                    raise WebSocketProtocolError("close frame with a 1-byte payload")
                 code = struct.unpack("!H", payload[:2])[0] if len(payload) >= 2 else None
-                reason = payload[2:].decode("utf-8", "replace")
+                if code is not None and not _valid_close_code(code):
+                    raise WebSocketProtocolError(f"invalid close code {code}")
+                reason = _utf8(payload[2:])
                 if not self._close_sent:
                     try:
                         self._close_sent = True
@@ -180,22 +216,21 @@ class WebSocket:
                 raise self._closed
             if op in (OP_TEXT, OP_BINARY):
                 if self._fragments:
-                    raise WebSocketError("new message before the previous fragmented one ended")
+                    raise WebSocketProtocolError("new message before the previous fragmented one ended")
                 if fin:
-                    return payload.decode("utf-8") if op == OP_TEXT else payload
+                    return _utf8(payload) if op == OP_TEXT else payload
                 self._frag_op, self._fragments = op, [payload]
                 continue
             if op == OP_CONT:
                 if not self._fragments:
-                    raise WebSocketError("continuation frame without a message")
+                    raise WebSocketProtocolError("continuation frame without a message")
                 self._fragments.append(payload)
                 if self.max_size is not None and sum(len(p) for p in self._fragments) > self.max_size:
-                    raise WebSocketError(f"message exceeds max_size {self.max_size}")
+                    raise WebSocketProtocolError(f"message exceeds max_size {self.max_size}", 1009)
                 if fin:
                     data, self._fragments = b"".join(self._fragments), []
-                    return data.decode("utf-8") if self._frag_op == OP_TEXT else data
+                    return _utf8(data) if self._frag_op == OP_TEXT else data
                 continue
-            raise WebSocketError(f"unknown opcode {op}")
 
     # ---- closing -------------------------------------------------------------
 
@@ -226,6 +261,13 @@ class WebSocket:
 
     def __exit__(self, *exc: object) -> None:
         self.close()
+
+
+def _utf8(data: bytes) -> str:
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise WebSocketProtocolError("text is not valid UTF-8", 1007) from exc
 
 
 def _mask(data: bytes, mask: bytes) -> bytes:

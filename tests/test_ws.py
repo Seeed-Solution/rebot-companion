@@ -189,3 +189,49 @@ def test_mask_roundtrip():
     mask = b"\x01\x02\x03\x04"
     assert _ws._mask(_ws._mask(data, mask), mask) == data
     assert _ws._mask(b"\x00\x00\x00\x00\x00", mask) == b"\x01\x02\x03\x04\x01"
+
+
+@pytest.mark.parametrize(
+    "frame, close_code",
+    [
+        (b"\xc1\x02hi", 1002),  # RSV1 set, no extension negotiated
+        (b"\x81\x82\x00\x00\x00\x00hi", 1002),  # masked server frame
+        (b"\x09\x00", 1002),  # fragmented ping
+        (b"\x89\x7e\x00\x7e" + b"x" * 126, 1002),  # ping payload > 125
+        (b"\x88\x01\x03", 1002),  # close payload of 1 byte
+        (b"\x88\x02\x03\xed", 1002),  # close code 1005 must not be sent
+        (b"\x88\x04\x03\xe8\xff\xfe", 1007),  # close reason not UTF-8
+        (b"\x81\x02\xff\xfe", 1007),  # text not UTF-8
+        (b"\x83\x00", 1002),  # reserved opcode
+    ],
+)
+def test_protocol_violations_close_with_an_error_code(frame, close_code):
+    got: list = []
+    done = threading.Event()
+
+    def script(conn):
+        conn.sendall(frame)
+        conn.settimeout(2)
+        data = b""
+        try:
+            while len(data) < 8:
+                chunk = conn.recv(64)
+                if not chunk:
+                    break
+                data += chunk
+        except OSError:
+            pass
+        got.append(data)
+        done.set()
+
+    ws = _ws.connect(_raw_server(script))
+    with pytest.raises(_ws.WebSocketError) as info:
+        ws.recv(timeout=2)
+    assert not isinstance(info.value, _ws.WebSocketClosed)
+    assert done.wait(3)
+    data = got[0]
+    assert data[0] == 0x88 and data[1] & 0x7F == 2  # masked close frame with a status code
+    code = struct.unpack("!H", _ws._mask(data[6:8], data[2:6]))[0]
+    assert code == close_code
+    with pytest.raises(_ws.WebSocketClosed):  # later calls see the closed connection
+        ws.recv(timeout=0.1)
