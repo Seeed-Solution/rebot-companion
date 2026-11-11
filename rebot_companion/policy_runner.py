@@ -679,12 +679,9 @@ class PolicyRunner:
     def _publish(self, target: np.ndarray) -> None:
         now = time.monotonic()
         with self._lock:
-            # start from what armd last received (after clipping), not from the nominal path
-            if self._last_sent is not None:
-                start = self._last_sent.copy()
-            else:
-                start = self._segment.at(now) if self._segment is not None else target
-            self._segment = _Segment(np.asarray(start, dtype=np.float64), target, now, 1.0 / self.fps)
+            # start from what armd last received (after clipping), not from the nominal path;
+            # _prepare sets _last_sent to the measured position before the first step
+            self._segment = _Segment(self._last_sent.copy(), target, now, 1.0 / self.fps)
             self._last_target_t = now
 
     # ---- run -----------------------------------------------------------------

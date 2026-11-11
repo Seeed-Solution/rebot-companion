@@ -532,6 +532,7 @@ def stub_runner(policy=None, **kw):
     home = np.array(HOME)
     now = time.monotonic()
     r._segment = _Segment(home, home, now, 0.0)
+    r._last_sent = home.copy()
     r._last_target_t = now + 3600  # no stall
     r._deadline = now + 3600
     return r
