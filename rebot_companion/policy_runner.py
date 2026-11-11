@@ -20,7 +20,9 @@ Timing: policy steps run at ``fps`` (default: the dataset's fps for ``replay``, 
 policy's ``train_config.json`` or its training dataset, which is required otherwise; 30 for ``sine``) on the
 main thread. A sender thread streams servo frames at ``servo_hz`` (default 50 Hz, armd's control
 rate): when a policy step publishes a target, the sender interpolates linearly from the frame it
-last sent to the new target over one policy period, then holds the target. Every frame is clipped
+last sent to the new target over one policy period, then holds the target. When the policy ends
+(end of a replay, ``max_steps``) the stream continues until the last segment has reached its target,
+plus one policy period. Every frame is clipped
 to the joint limits and, for joints 1..6, to ``measured +- 0.95 x servo_max_lead_rad`` (schema
 field, default 0.2 rad), so armd's lead cap does not have to act.
 
@@ -969,7 +971,7 @@ class PolicyRunner:
                 break
             self._lat["inference"].append(inf)
             if action is None:
-                self.request_stop("policy_done", f"{k} steps")
+                self._end_of_policy("policy_done", f"{k} steps")
                 break
             action = np.asarray(action, dtype=np.float64).reshape(-1)
             if action.shape[0] != len(JOINT_NAMES) or not np.all(np.isfinite(action)):
@@ -997,8 +999,19 @@ class PolicyRunner:
                 )
             k += 1
             if self.max_steps is not None and k >= self.max_steps:
-                self.request_stop("max_steps", f"{k} steps")
+                self._end_of_policy("max_steps", f"{k} steps")
                 break
+
+    def _end_of_policy(self, reason: str, detail: str) -> None:
+        """No further target: keep streaming until the last segment has reached its target, plus one
+        policy period of hold (bounded by the deadline), then stop. Any stop meanwhile wins."""
+        with self._lock:
+            seg_end = self._segment.t0 + self._segment.duration
+        now = time.monotonic()
+        left = min(max(seg_end - now, 0.0) + 1.0 / self.fps, self._deadline - now)
+        if left > 0:
+            self._stop.wait(left)
+        self.request_stop(reason, detail)
 
     def _finish(self) -> None:
         s = self.session

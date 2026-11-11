@@ -112,6 +112,22 @@ def test_interpolates_between_policy_steps(arm):
     assert j1 == sorted(j1), j1
 
 
+def test_the_last_segment_completes_before_policy_done(arm):
+    """A 5 Hz policy that ends right after one step: the stream reaches that step's target before it stops."""
+
+    class OneStep(Policy):
+        fps = 5
+
+        def select(self, obs, step, t):
+            return np.array(HOME) + np.array([0.05, 0, 0, 0, 0, 0, 0]) if step == 0 else None
+
+    res = runner(arm, OneStep(), max_seconds=5, park=False).run()
+    assert res.reason == "policy_done", res
+    j1 = [t[0] for _, t, _ in arm.servo_log]
+    assert j1[-1] == pytest.approx(HOME[0] + 0.05, abs=1e-9), j1
+    assert sum(abs(v - (HOME[0] + 0.05)) < 1e-9 for v in j1) >= 2, j1  # held at the target
+
+
 def test_no_park_holds(arm):
     res = runner(arm, SinePolicy(0, 0.05, 1.0), park=False).run()
     assert res.reason == "max_seconds"

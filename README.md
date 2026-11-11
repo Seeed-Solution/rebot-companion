@@ -788,7 +788,8 @@ Timing: policy steps run at `--fps`; inference runs on a worker thread and the m
 at most until the deadline or `--stall-s`, then stops, parks and releases the lease (a call that never
 returns is abandoned; the warm-up call may take up to 120 s). A sender thread streams servo frames at
 `--servo-hz`: each new target is reached by linear interpolation from the last sent frame (after clipping;
-the measured position before the first frame) over one policy period, then held.
+the measured position before the first frame) over one policy period, then held. When the policy ends (end of a replay, `--max-steps`) the stream
+continues until the last segment has reached its target, plus one policy period, before the stop.
 Every frame is clipped per joint to the intersection of the joint limits and, for joints 1..6,
 measured position ± 0.95 × `servo_max_lead_rad` (armd schema, default 0.2 rad); the summary counts
 clipped frames per joint and the `observation.motion_limit` reasons armd reported. A step that is
