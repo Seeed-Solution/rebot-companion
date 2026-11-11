@@ -561,13 +561,24 @@ class LeRobotRecorder:
         """Start the sources and wait for the first observation / camera frame."""
         if self._opened:
             return self
-        for src in (self.obs_source, self.frame_source):
-            if src is not None and hasattr(src, "start"):
-                src.start()
+        started = []
+        try:
+            for src in (self.obs_source, self.frame_source):
+                if src is not None and hasattr(src, "start"):
+                    started.append(src)
+                    src.start()
+            for src in (self.obs_source, self.frame_source):
+                if src is not None and hasattr(src, "wait_first"):
+                    src.wait_first(self.connect_timeout)
+        except BaseException:
+            for src in reversed(started):  # roll back: no stream thread or socket outlives a failed open
+                if hasattr(src, "close"):
+                    try:
+                        src.close()
+                    except Exception as exc:
+                        log.warning("closing %s after a failed open: %s", getattr(src, "name", src), exc)
+            raise
         self._opened = True
-        for src in (self.obs_source, self.frame_source):
-            if src is not None and hasattr(src, "wait_first"):
-                src.wait_first(self.connect_timeout)
         return self
 
     def close(self) -> None:

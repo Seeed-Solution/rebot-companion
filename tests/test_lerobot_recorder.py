@@ -283,6 +283,35 @@ def test_overdue_ticks_never_use_samples_received_after_their_due_time(tmp_path)
     assert summary.obs_age_ms_mean >= 0
 
 
+def test_failed_open_closes_the_sources_it_started(tmp_path):
+    class Source:
+        def __init__(self, fail: str = "") -> None:
+            self.fail, self.started, self.closed = fail, False, False
+
+        def start(self) -> None:
+            if self.fail == "start":
+                raise RecorderError("cannot open camera")
+            self.started = True
+
+        def wait_first(self, timeout: float) -> None:
+            if self.fail == "wait":
+                raise RecorderError("no data")
+
+        def close(self) -> None:
+            self.closed = True
+
+    for fail in ("start", "wait"):
+        obs_src, cam = Source(), Source(fail)
+        rec = LeRobotRecorder(
+            tmp_path / fail, "t/x", camera_url=None, obs_source=obs_src, frame_source=cam, with_camera=False
+        )
+        with pytest.raises(RecorderError):
+            with rec:
+                pass
+        assert obs_src.started and obs_src.closed, fail
+        assert cam.closed or not cam.started, fail
+
+
 def test_observation_stream_is_lease_free(armd, tmp_path):
     rec = LeRobotRecorder(tmp_path / "armd", "test/armd", fps=FPS, camera_url=None, armd_host=armd.url, task="t")
     with rec:
