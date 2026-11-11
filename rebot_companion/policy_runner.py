@@ -135,7 +135,7 @@ class ReplayPolicy(Policy):
         row = next((r for r in rows if r["episode_index"] == episode), None)
         if row is None:
             raise RunnerError(f"episode {episode} not in {root} (episodes: {[r['episode_index'] for r in rows]})")
-        path = root / info["data_path"].format(chunk_index=row["data/chunk_index"], file_index=row["data/file_index"])
+        path = self._data_file(root, info, row)
         data = pq.read_table(path, columns=["episode_index", "action"]).to_pydict()
         actions = [a for e, a in zip(data["episode_index"], data["action"]) if e == episode]
         if not actions:
@@ -145,6 +145,22 @@ class ReplayPolicy(Policy):
 
     def select(self, obs: dict[str, np.ndarray], step: int, t: float) -> np.ndarray | None:
         return self.actions[step] if step < len(self.actions) else None
+
+    @staticmethod
+    def _data_file(root: Path, info: dict, row: dict) -> Path:
+        """The episode's data file from ``info.json`` ``data_path``; it must resolve inside the dataset root."""
+        template = info.get("data_path")
+        if not isinstance(template, str) or not template:
+            raise RunnerError(f"{root / 'meta' / 'info.json'} has no data_path")
+        try:
+            rel = template.format(chunk_index=int(row["data/chunk_index"]), file_index=int(row["data/file_index"]))
+        except (KeyError, IndexError, ValueError, TypeError) as exc:
+            raise RunnerError(f"info.json data_path {template!r} cannot be resolved: {exc!r}") from None
+        base = root.resolve()
+        path = (base / rel).resolve()
+        if not path.is_relative_to(base):
+            raise RunnerError(f"info.json data_path {template!r} resolves to {path}, outside the dataset {base}")
+        return path
 
 
 class SinePolicy(Policy):

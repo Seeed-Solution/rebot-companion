@@ -329,6 +329,25 @@ def test_parse_policy(tmp_path):
             parse_policy(bad)
 
 
+@pytest.mark.parametrize(
+    "data_path,match",
+    [
+        ("../outside/file-{file_index:03d}.parquet", "outside the dataset"),
+        ("/etc/{chunk_index}.parquet", "outside the dataset"),
+        ("data/{unknown}.parquet", "cannot be resolved"),
+        (None, "no data_path"),
+    ],
+)
+def test_replay_data_path_stays_inside_the_dataset(tmp_path, data_path, match):
+    home_dataset(tmp_path / "ds", image=False)
+    info_path = tmp_path / "ds" / "meta" / "info.json"
+    info = json.loads(info_path.read_text())
+    info["data_path"] = data_path
+    info_path.write_text(json.dumps(info))
+    with pytest.raises(RunnerError, match=match):
+        ReplayPolicy(tmp_path / "ds", 0)
+
+
 def test_replay_round_trip(arm, tmp_path):
     """Recorder dataset -> replay through armd -> recorder observes the arm -> same trajectory."""
     actions = home_dataset(tmp_path / "a")
