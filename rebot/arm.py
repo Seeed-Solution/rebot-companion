@@ -59,6 +59,7 @@ SENSITIVITIES = ("low", "medium", "high")
 # margin (enable, command round trips). A call stuck past that trips the guard like a hung loop.
 GUARD_BUSY_MARGIN_S = 15.0
 GUARD_CALL_BUDGET_S = 30.0  # calls without their own timeout (state, enable, poses, detect, ...)
+_GUARD_TRIPPED = "control was released because the program stopped calling arm.feed()"
 
 
 def _collision_message(exc: ActionFailed) -> str:
@@ -244,7 +245,7 @@ class Arm:
     def feed(self) -> None:
         """Tell the guard the program is alive."""
         if self._guard_tripped:
-            raise GuardTimeout("control was released because the program stopped calling arm.feed()")
+            raise GuardTimeout(_GUARD_TRIPPED)
         self._last_feed = time.monotonic()
 
     def _guard_loop(self) -> None:
@@ -273,7 +274,7 @@ class Arm:
 
     def _run(self, fn: Callable[[], Any], budget: Optional[float] = None) -> Any:
         if self._guard_tripped:
-            raise GuardTimeout("control was released because the program stopped calling arm.feed()")
+            raise GuardTimeout(_GUARD_TRIPPED)
         exempt = (GUARD_CALL_BUDGET_S if budget is None else budget) + GUARD_BUSY_MARGIN_S
         with self._busy_lock:
             token = next(self._busy_ids)
@@ -282,7 +283,7 @@ class Arm:
             return fn()
         except RebotError:
             if self._guard_tripped:
-                raise GuardTimeout("control was released because the program stopped calling arm.feed()") from None
+                raise GuardTimeout(_GUARD_TRIPPED) from None
             raise
         finally:
             with self._busy_lock:

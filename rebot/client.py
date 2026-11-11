@@ -607,7 +607,7 @@ class ArmSession:
             if t is not threading.current_thread():
                 t.join(timeout=2.0)
         self._threads = []
-        self._fail_pending("session closed")
+        self._fail_pending()
 
     def __enter__(self) -> ArmSession:
         return self.open()
@@ -654,15 +654,13 @@ class ArmSession:
                 self.torque(True)  # re-arm after clear_fault; plans no motion
             self.unload(wait=True, timeout=timeout)
             return SafeExitOutcome("unloaded", "parked at the resting pose, torque off")
-        except ArmCommandRejected as exc:
-            if exc.code == "UNSUPPORTED":
+        except ArmdError as exc:
+            if isinstance(exc, ArmCommandRejected) and exc.code == "UNSUPPORTED":
                 return SafeExitOutcome(
                     "unsupported",
                     "armd has no resting-pose profile for automatic unload; arm left torqued and armd "
                     "will latch Fault(WatchdogTimeout) after the lease is released",
                 )
-            return SafeExitOutcome("failed", str(exc))
-        except ArmdError as exc:
             return SafeExitOutcome("failed", str(exc))
 
     # ---- state ---------------------------------------------------------------
@@ -751,7 +749,7 @@ class ArmSession:
             ws.close()
         except Exception:
             pass
-        self._fail_pending(reason)
+        self._fail_pending()
 
     def _dispatch(self, msg: dict) -> None:
         kind = msg.get("type")
@@ -808,7 +806,7 @@ class ArmSession:
             except ArmdError:
                 return
 
-    def _fail_pending(self, reason: str) -> None:
+    def _fail_pending(self) -> None:
         with self._state:
             pending, self._pending = list(self._pending.values()), {}
         for p in pending:

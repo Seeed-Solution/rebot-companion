@@ -505,8 +505,7 @@ class Controller:
     def save_pose(self, name: str) -> dict:
         if not POSE_NAME.match(name):
             raise ToolFail("INVALID_ARGUMENT", "name must be 1-64 characters: letters, digits, _ and -")
-        s = self.actuator()
-        s.save_pose(name)
+        self.actuator().save_pose(name)
         return {"saved": name, "positions": [_r(v) for v in self.observation().positions]}
 
     def move_to_pose(self, name: str, speed_scale: float) -> dict:

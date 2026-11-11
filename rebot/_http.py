@@ -180,9 +180,7 @@ def socket_transport(
     if body is not None and "Content-Length" not in req_headers:
         req_headers["Content-Length"] = str(len(body))
 
-    req_lines = [f"{method.upper()} {path} HTTP/1.1"]
-    for k, v in req_headers.items():
-        req_lines.append(f"{k}: {v}")
+    req_lines = [f"{method.upper()} {path} HTTP/1.1"] + [f"{k}: {v}" for k, v in req_headers.items()]
     payload = "\r\n".join(req_lines).encode("latin-1") + b"\r\n\r\n"
     if body:
         payload += body
@@ -220,14 +218,11 @@ def socket_transport(
 
         res_headers: Dict[str, str] = {}
         for line in header_lines:
-            if not line:
-                continue
             hk, sep, hv = line.partition(":")
-            if not sep:
-                continue
-            res_headers[hk.strip()] = hv.strip()
+            if sep:
+                res_headers[hk.strip()] = hv.strip()
 
-        lower_headers = {k.lower(): v.strip().lower() for k, v in res_headers.items()}
+        lower_headers = {k.lower(): v.lower() for k, v in res_headers.items()}
         transfer_encoding = lower_headers.get("transfer-encoding", "")
 
         if status in (204, 304) or method.upper() == "HEAD":
