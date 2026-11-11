@@ -203,6 +203,10 @@ def test_mask_roundtrip():
         (b"\x88\x04\x03\xe8\xff\xfe", 1007),  # close reason not UTF-8
         (b"\x81\x02\xff\xfe", 1007),  # text not UTF-8
         (b"\x83\x00", 1002),  # reserved opcode
+        (b"\x82\x7e\x00\x05hello", 1002),  # 16-bit length form for 5 bytes
+        (b"\x82\x7f" + (5).to_bytes(8, "big") + b"hello", 1002),  # 64-bit length form for 5 bytes
+        (b"\x82\x7f" + (65535).to_bytes(8, "big"), 1002),  # 64-bit form below 65536
+        (b"\x82\x7f" + (1 << 63).to_bytes(8, "big"), 1002),  # most significant bit set
     ],
 )
 def test_protocol_violations_close_with_an_error_code(frame, close_code):

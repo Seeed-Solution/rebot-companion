@@ -146,11 +146,17 @@ class WebSocket:
             if len(buf) < 4:
                 return None
             n = struct.unpack_from("!H", buf, 2)[0]
+            if n < 126:
+                raise WebSocketProtocolError("payload length not minimally encoded")
             pos = 4
         elif n == 127:
             if len(buf) < 10:
                 return None
             n = struct.unpack_from("!Q", buf, 2)[0]
+            if n >> 63:
+                raise WebSocketProtocolError("64-bit payload length with the most significant bit set")
+            if n < 1 << 16:
+                raise WebSocketProtocolError("payload length not minimally encoded")
             pos = 10
         if self.max_size is not None and n > self.max_size:
             raise WebSocketProtocolError(f"frame of {n} bytes exceeds max_size {self.max_size}", 1009)
