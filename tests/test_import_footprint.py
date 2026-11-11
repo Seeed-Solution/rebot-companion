@@ -51,16 +51,22 @@ def test_lazy_logging():
         f"sys.path.insert(0, {repo_root!r})\n"
         f"from rebot._log import _log\n"
         f"_log('silent message')\n"
-        f"_log.warning('another silent message')\n"
+        f"_log.debug('silent debug')\n"
+        f"_log.warning('park failed: %s', 'boom')\n"
+        f"_log.error('guard tripped')\n"
         f"print('logging' in sys.modules)\n"
     )
+    env = {k: v for k, v in os.environ.items() if k != "REBOT_DEBUG"}
     res = subprocess.run(
         [sys.executable, "-I", "-c", code],
         capture_output=True,
         text=True,
         check=True,
+        env=env,
     )
     assert res.stdout.strip() == "False"
+    # warnings and errors reach stderr by default; info and debug stay opt-in
+    assert res.stderr.splitlines() == ["rebot: warning: park failed: boom", "rebot: error: guard tripped"]
 
     # With REBOT_DEBUG=1, logging should be imported
     env = os.environ.copy()
