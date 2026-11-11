@@ -765,7 +765,7 @@ The runner imports them only for a learned policy.
 | `--task` | task text passed to the policy (language-conditioned policies) |
 | `--device` | torch device (default `cuda` when available, else `cpu`) |
 | `--no-park` | hold position at the end instead of parking |
-| `--stall-s`, `--max-frame-age`, `--max-obs-age` | stop when the policy gives no target for this long (default 1 s), the newest camera frame is older (default 0.5 s), or the newest armd observation is older (default 0.1 s; checked before every servo frame and policy step) |
+| `--stall-s`, `--max-frame-age`, `--max-obs-age` | stop when the policy gives no target for this long (default 1 s), the newest camera frame is older (default 0.5 s), or the newest armd observation is older (default max(0.1 s, 3 observation periods) at the rate armd sends: min of the requested 50 Hz, `timing.control_hz` and the rate measured at start; checked before every servo frame and policy step) |
 | `--log` | per-step JSON lines (observation age, camera age, inference ms, step lag, action, state) and a summary line |
 | `--i-am-at-the-arm` | required when armd's follower (`GET /api/v1/safety/describe` `device.follower`) is not `mock` or `sim`, or unknown |
 

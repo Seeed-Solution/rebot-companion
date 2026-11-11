@@ -396,7 +396,7 @@ class PolicyRunner:
         operator_present: bool = False,
         stall_s: float = 1.0,
         max_frame_age_s: float = 0.5,
-        max_obs_age_s: float = 0.1,
+        max_obs_age_s: float | None = None,
         log_path: str | Path | None = None,
         client_id: str | None = None,
         connect_timeout: float = 5.0,
@@ -413,7 +413,11 @@ class PolicyRunner:
         self.max_seconds = _positive("max_seconds", max_seconds)
         self.stall_s = _positive("stall_s", stall_s)
         self.max_frame_age_s = _positive("max_frame_age_s", max_frame_age_s)
-        self.max_obs_age_s = _positive("max_obs_age_s", max_obs_age_s)
+        # None: max(0.1 s, 3 observation periods) at the rate armd actually sends, resolved at start
+        self._obs_age_explicit = max_obs_age_s is not None
+        self.max_obs_age_s = _positive("max_obs_age_s", max_obs_age_s) if self._obs_age_explicit else 0.1
+        self.obs_hz = int(max(self.servo_hz, 50))  # requested observation rate
+        self._control_hz: float | None = None
         self.client = client
         self.policy = policy
         self.camera = camera
@@ -522,7 +526,11 @@ class PolicyRunner:
     def _read_arm(self) -> None:
         follower = None
         try:
-            follower = (self.client.get_safety_describe().get("device") or {}).get("follower")
+            describe = self.client.get_safety_describe()
+            follower = (describe.get("device") or {}).get("follower")
+            hz = (describe.get("timing") or {}).get("control_hz")
+            if isinstance(hz, (int, float)) and math.isfinite(hz) and hz > 0:
+                self._control_hz = float(hz)
         except (RebotError, OSError, ValueError) as exc:
             log.info("no safety description (%s); follower unknown", exc)
         self.result.follower = follower
@@ -697,7 +705,7 @@ class PolicyRunner:
                 client_id=self.client_id,
                 safe_exit="off",
                 connect_timeout=self.connect_timeout,
-                obs_hz=int(max(self.servo_hz, 50)),
+                obs_hz=self.obs_hz,
                 send_timeout=self.send_timeout_s,
             ).open()
             try:
@@ -733,6 +741,24 @@ class PolicyRunner:
                 self._log_file.write(json.dumps({"summary": self.result.to_dict()}) + "\n")
                 self._log_file.close()
         return self.result
+
+    def _resolve_obs_age(self) -> None:
+        """Default observation age bound: max(0.1 s, 3 periods) at min(requested obs_hz, armd control_hz,
+        the rate measured over the next 4 observations)."""
+        if self._obs_age_explicit:
+            return
+        hz = float(self.obs_hz)
+        if self._control_hz:
+            hz = min(hz, self._control_hz)
+        s, rx = self.session, []
+        end = time.monotonic() + self.connect_timeout
+        while len(rx) < 4 and time.monotonic() < end:
+            s.wait_for_observation(self.connect_timeout)
+            rx.append(s.latest_observation_timed()[0])
+        if len(rx) >= 2 and rx[-1] > rx[0]:
+            hz = min(hz, (len(rx) - 1) / (rx[-1] - rx[0]))
+        self.max_obs_age_s = max(0.1, 3.0 / hz)
+        log.info("observations at %.1f Hz; max observation age %.0f ms", hz, self.max_obs_age_s * 1000)
 
     def _infer(self, args: tuple, timeout: float) -> tuple[bool, Any]:
         if self._worker is None:
@@ -774,6 +800,7 @@ class PolicyRunner:
                 if time.monotonic() > deadline:
                     raise RunnerError(f"torque on did not arm the arm (state {obs.safety_state})")
                 obs = s.wait_for_observation(self.connect_timeout)
+        self._resolve_obs_age()
         self.policy.reset()
         if self.policy.warmup:
             image = self._camera_image(time.monotonic()) if self.policy.image_key else None
@@ -949,7 +976,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--no-park", action="store_true", help="hold position at the end instead of parking")
     p.add_argument("--stall-s", type=float, default=1.0, help="stop when the policy gives no target for this long")
     p.add_argument("--max-frame-age", type=float, default=0.5, help="stop when the newest camera frame is older (s)")
-    p.add_argument("--max-obs-age", type=float, default=0.1, help="stop when the newest armd observation is older (s)")
+    p.add_argument(
+        "--max-obs-age",
+        type=float,
+        help="stop when the newest armd observation is older (s; default max(0.1, 3 / observation rate))",
+    )
     p.add_argument("--log", help="write per-step JSON lines (latency, action, state) and a summary")
     p.add_argument(
         "--i-am-at-the-arm",

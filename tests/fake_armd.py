@@ -91,6 +91,7 @@ class FakeArmd:
         self.servo_log: list[tuple[int, list[float], list[float]]] = []  # accepted (sequence_id, target, positions)
         self.servo_max_lead_rad: float | None = None  # published in the schema when set
         self.motion_limit: dict | None = None  # observation.motion_limit (devplat)
+        self.obs_hz_cap: int | None = None  # observation rate limit per connection
         self.last_motion_frame = time.monotonic()
         self.last_heartbeat = time.monotonic()
         self.lease: dict | None = None  # {conn, generation, acquired_at}
@@ -478,6 +479,9 @@ class FakeArmd:
             self.ws_paths.append(path)
             if "obs_hz=" in path:
                 self.conn_hz[conn] = (int(path.split("obs_hz=")[1].split("&")[0]), 0.0)
+            if self.obs_hz_cap:  # an armd that sends observations at a lower rate than requested
+                hz = self.conn_hz.get(conn, (0, 0.0))[0] or self.obs_hz_cap
+                self.conn_hz[conn] = (min(hz, self.obs_hz_cap), 0.0)
         local_gen = 0
         label: str | None = None
         last_seq: int | None = None

@@ -708,7 +708,7 @@ rebot-companion 安装到已装有 lerobot 的 Python 环境（例如训练环�
 | `--task` | 传给策略的任务文本（语言条件策略） |
 | `--device` | torch 设备（默认有 CUDA 时用 `cuda`，否则 `cpu`） |
 | `--no-park` | 结束时保持位置，不停靠 |
-| `--stall-s`、`--max-frame-age`、`--max-obs-age` | 策略超过该时长没有给出目标（默认 1 s）、最新相机帧超过该时长（默认 0.5 s），或最新 armd 观测超过该时长（默认 0.1 s；每个 servo 帧和策略步前检查）时停止 |
+| `--stall-s`、`--max-frame-age`、`--max-obs-age` | 策略超过该时长没有给出目标（默认 1 s）、最新相机帧超过该时长（默认 0.5 s），或最新 armd 观测超过该时长（默认 max(0.1 s, 3 个观测周期)，观测频率取请求的 50 Hz、`timing.control_hz` 和启动时实测频率中的最小值；每个 servo 帧和策略步前检查）时停止 |
 | `--log` | 每步一行 JSON（观测延迟、相机延迟、推理 ms、步延迟、动作、状态），最后一行为汇总 |
 | `--i-am-at-the-arm` | armd 的 follower（`GET /api/v1/safety/describe` 的 `device.follower`）不是 `mock` 或 `sim`、或无法读取时必须加 |
 

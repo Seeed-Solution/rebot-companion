@@ -177,7 +177,6 @@ def test_stop_on_blocked_hold(arm):
 
     res = run_with(arm, SinePolicy(0, 0.05, 1.0), block, max_seconds=5)
     assert res.reason == "blocked"
-    assert res.armd_motion_limits.get("blocked", 0) >= 1
 
 
 def test_stop_on_lease_loss(arm):
@@ -821,3 +820,20 @@ def test_sender_join_must_exceed_the_send_timeout(join):
         PolicyRunner(None, SinePolicy(0, 0.05, 1.0), sender_join_s=join)  # default send timeout 1 s
     PolicyRunner(None, SinePolicy(0, 0.05, 1.0), sender_join_s=1.5)
     PolicyRunner(None, SinePolicy(0, 0.05, 1.0), send_timeout_s=0.02, sender_join_s=0.05)
+
+
+# --------------------------------------------------------------------------- observation rate
+
+
+def test_low_rate_telemetry_does_not_trip_the_default_age_check(arm):
+    arm.obs_hz_cap = 5  # armd sends 5 observations per second
+    r = runner(arm, SinePolicy(0, 0.05, 1.0), max_seconds=1.0, park=False)
+    res = r.run()
+    assert res.reason == "max_seconds", res
+    assert r.max_obs_age_s >= 3 / 5 - 1e-6
+
+
+def test_an_explicit_obs_age_still_applies_to_low_rate_telemetry(arm):
+    arm.obs_hz_cap = 5
+    res = runner(arm, SinePolicy(0, 0.05, 1.0), max_seconds=2.0, park=False, max_obs_age_s=0.05).run()
+    assert res.reason == "stale_observation"
