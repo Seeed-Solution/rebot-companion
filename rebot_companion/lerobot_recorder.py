@@ -805,13 +805,13 @@ class LeRobotRecorder:
         # Seed the held items before the clock starts: every seed was received before t0, so the first
         # tick has an item at or before its due time even when a latest()-only source updates between
         # here and the first read.
-        prev_obs = self.obs_source.latest()
-        prev_cam = self.frame_source.latest() if self.frame_source is not None else None
-        t0 = time.monotonic()
-        k = 0
         obs_ages, cam_ages = [], []
         last_seq = None
         try:
+            prev_obs = self.obs_source.latest()
+            prev_cam = self.frame_source.latest() if self.frame_source is not None else None
+            t0 = time.monotonic()
+            k = 0
             while not self._stop_sampling.is_set():
                 due = t0 + k * period
                 now = time.monotonic()

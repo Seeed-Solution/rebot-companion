@@ -303,6 +303,19 @@ def test_latest_only_source_updating_before_the_first_read_does_not_stop_the_sam
     rec.discard()
 
 
+def test_a_failing_seed_read_is_reported_by_stop_episode(tmp_path):
+    class Broken:
+        def latest(self):
+            raise ValueError("observation source broke")
+
+    rec = LeRobotRecorder(tmp_path / "broken", "t/b", fps=FPS, task="t", obs_source=Broken(), camera_url=None)
+    rec.start_episode()
+    time.sleep(0.1)
+    with pytest.raises(RecorderError, match="observation source broke"):
+        rec.stop_episode()
+    rec.discard()
+
+
 def test_failed_open_closes_the_sources_it_started(tmp_path):
     class Source:
         def __init__(self, fail: str = "") -> None:
