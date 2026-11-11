@@ -27,7 +27,7 @@ import time
 from typing import Any, Callable, List, Optional, Sequence, Union
 
 from ._log import _log
-from .client import ActionResult, ArmdClient, ArmSession, ArmStatus, ObservationSchema
+from .client import ACTION_MAX_TIMEOUT_S, ActionResult, ArmdClient, ArmSession, ArmStatus, ObservationSchema
 from .detection import PIPELINES, Detection, DetectionClient, parse_detections
 from .errors import (
     ActionFailed,
@@ -53,6 +53,11 @@ _HINTS = {
 }
 
 SENSITIVITIES = ("low", "medium", "high")
+
+# Loop guard: time inside an Arm method counts as fed only up to the call's own budget plus this
+# margin (enable, command round trips). A call stuck past that trips the guard like a hung loop.
+GUARD_BUSY_MARGIN_S = 15.0
+GUARD_CALL_BUDGET_S = 30.0  # calls without their own timeout (state, enable, poses, detect, ...)
 
 
 def _collision_message(exc: ActionFailed) -> str:
@@ -108,7 +113,8 @@ class Arm:
         self.client = ArmdClient(self.url, timeout_sec=timeout, transport=transport)
         self.detector = DetectionClient(self.url, transport=transport)
         self.exit_outcome: Optional[str] = None
-        self._busy = 0
+        self._busy_until: dict = {}  # call token -> monotonic deadline of its guard exemption
+        self._busy_ids = iter(range(1, 1 << 62))
         self._busy_lock = threading.Lock()
         self._guard_timeout: Optional[float] = None
         self._last_feed = time.monotonic()
@@ -210,8 +216,10 @@ class Arm:
         """Release control if the program stops calling :meth:`feed` for ``timeout_s`` seconds.
 
         Protects against a hung main loop: the SDK's heartbeat thread would otherwise keep the
-        lease alive. Time spent inside an ``Arm`` method counts as fed. After a trip every call
-        raises :class:`GuardTimeout`; armd's lease watchdog handles the arm. ``None`` disables it.
+        lease alive. Time spent inside an ``Arm`` method counts as fed, but only up to that call's
+        own timeout (motions: ``timeout`` or 60 s; other calls: 30 s) plus a 15 s margin; a call
+        stuck longer trips the guard too. After a trip every call raises :class:`GuardTimeout`;
+        armd's lease watchdog handles the arm. ``None`` disables it.
         """
         self._guard_timeout = None if timeout_s is None else float(timeout_s)
         self.feed()
@@ -228,22 +236,34 @@ class Arm:
     def _guard_loop(self) -> None:
         while not self._guard_stop.wait(0.05):
             limit = self._guard_timeout
-            if limit is None or self._busy:
+            if limit is None:
                 continue
-            if time.monotonic() - self._last_feed > limit:
-                self._guard_tripped = True
-                _log.error("guard: no arm.feed() for %.1f s; releasing control", limit)
-                try:
-                    self.session.close()
-                except Exception as exc:  # pragma: no cover - defensive
-                    _log.warning("guard: close failed: %s", exc)
-                return
+            with self._busy_lock:
+                busy_until = max(self._busy_until.values()) if self._busy_until else None
+            now = time.monotonic()
+            if busy_until is not None:
+                if now < busy_until:
+                    continue
+                why = "an arm call ran past its timeout"
+            elif now - self._last_feed > limit:
+                why = f"no arm.feed() for {limit:.1f} s"
+            else:
+                continue
+            self._guard_tripped = True
+            _log.error("guard: %s; releasing control", why)
+            try:
+                self.session.close()
+            except Exception as exc:  # pragma: no cover - defensive
+                _log.warning("guard: close failed: %s", exc)
+            return
 
-    def _run(self, fn: Callable[[], Any]) -> Any:
+    def _run(self, fn: Callable[[], Any], budget: Optional[float] = None) -> Any:
         if self._guard_tripped:
             raise GuardTimeout("control was released because the program stopped calling arm.feed()")
+        exempt = (GUARD_CALL_BUDGET_S if budget is None else budget) + GUARD_BUSY_MARGIN_S
         with self._busy_lock:
-            self._busy += 1
+            token = next(self._busy_ids)
+            self._busy_until[token] = time.monotonic() + exempt
         try:
             return fn()
         except RebotError:
@@ -252,7 +272,7 @@ class Arm:
             raise
         finally:
             with self._busy_lock:
-                self._busy -= 1
+                self._busy_until.pop(token, None)
             self._last_feed = time.monotonic()
 
     # ---- state ---------------------------------------------------------------
@@ -294,7 +314,7 @@ class Arm:
 
     # ---- motion --------------------------------------------------------------
 
-    def _motion(self, fn: Callable[[], ActionResult], what: str) -> ActionResult:
+    def _motion(self, fn: Callable[[], ActionResult], what: str, timeout: Optional[float] = None) -> ActionResult:
         def go() -> ActionResult:
             self._ready()
             try:
@@ -310,15 +330,15 @@ class Arm:
                     raise ActionFailed("COLLISION", _collision_message(exc), exc.status, exc.obs) from None
                 raise
 
-        return self._run(go)
+        return self._run(go, ACTION_MAX_TIMEOUT_S if timeout is None else timeout)
 
     def home(self, timeout: Optional[float] = None) -> ActionResult:
         """Move to armd's home position."""
-        return self._motion(lambda: self.session.home_action(timeout=timeout), "home")
+        return self._motion(lambda: self.session.home_action(timeout=timeout), "home", timeout)
 
     def park(self, timeout: float = 30.0) -> ActionResult:
         """Move to the resting pose and turn torque off. The next motion turns torque on again."""
-        return self._motion(lambda: self.session.park_action(timeout=timeout), "park")
+        return self._motion(lambda: self.session.park_action(timeout=timeout), "park", timeout)
 
     def move_to(
         self,
@@ -335,6 +355,7 @@ class Arm:
         return self._motion(
             lambda: self.session.move_pose(xyz, rpy=rpy, linear_speed=speed, timeout=timeout),
             f"target {_fmt(xyz)}",
+            timeout,
         )
 
     def move_relative(
@@ -355,6 +376,7 @@ class Arm:
                 frame, (dx, dy, dz), dyaw=dyaw, dpitch=dpitch, droll=droll, linear_speed=speed, timeout=timeout
             ),
             f"offset {_fmt((dx, dy, dz))} ({frame} frame)",
+            timeout,
         )
 
     def move_joints(self, positions: Sequence[float], duration: Optional[float] = None) -> ArmStatus:
@@ -364,7 +386,7 @@ class Arm:
             self._ready()
             return self.session.move_to(positions, duration=duration)  # type: ignore[return-value]
 
-        return self._run(go)
+        return self._run(go, ArmSession._timeout_for(duration, None))
 
     def gripper_open(self) -> ActionResult:
         return self._motion(lambda: self.session.gripper("open"), "gripper open")
@@ -403,6 +425,7 @@ class Arm:
         return self._motion(
             lambda: self.session.grasp(label, box_norm, frame_id=frame_id, ts_ms=ts_ms, timeout=timeout),
             f"grasp of '{label}'",
+            timeout,
         )
 
     def place(
@@ -436,6 +459,7 @@ class Arm:
                 timeout=timeout,
             ),
             what,
+            timeout,
         )
 
     def stop(self) -> None:
@@ -465,7 +489,7 @@ class Arm:
     def move_to_pose(self, name: str, speed_scale: float = 1.0, timeout: Optional[float] = None) -> ActionResult:
         """Joint-space move to a saved pose; ``speed_scale`` 0.1..1.0."""
         return self._motion(
-            lambda: self.session.move_to_pose(name, speed_scale=speed_scale, timeout=timeout), f"pose '{name}'"
+            lambda: self.session.move_to_pose(name, speed_scale=speed_scale, timeout=timeout), f"pose '{name}'", timeout
         )
 
     # ---- vision --------------------------------------------------------------
@@ -543,7 +567,8 @@ class Arm:
         return self._run(
             lambda: self.session._wait_until(
                 self.session._frames, clear, timeout_s, "the collision to clear", check_stopped=False
-            )
+            ),
+            timeout_s,
         )
 
     # ---- faults --------------------------------------------------------------
@@ -555,7 +580,7 @@ class Arm:
         E-stops, faults armd marks not recoverable, and faults on an armd without fault codes
         raise :class:`ArmFaultError`: check the arm and clear them in the web cockpit.
         """
-        return self._run(lambda: self._recover(max_attempts))
+        return self._run(lambda: self._recover(max_attempts), 20.0 * max(1, int(max_attempts)))
 
     def _recover(self, max_attempts: int) -> ArmStatus:
         obs = self.session.wait_for_observation(timeout=2.0)

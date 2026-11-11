@@ -252,8 +252,9 @@ Behaviour:
   fault codes raise `ArmFaultError`; clear those in the web cockpit after checking the arm. Leaving
   the `with` block does not clear them either.
 - `guard(timeout_s)`: a background thread releases the lease when `feed()` has not been called
-  for `timeout_s` seconds (time inside an `Arm` method counts as fed); armd's lease watchdog then
-  handles the arm, and every later call raises `GuardTimeout`.
+  for `timeout_s` seconds (time inside an `Arm` method counts as fed, up to that call's own timeout
+  plus 15 s: motions `timeout` or 60 s, other calls 30 s); armd's lease watchdog then handles the
+  arm, and every later call raises `GuardTimeout`.
 - Named poses, `move_to_pose`, `obs_hz` and fault codes need an armd that reports capabilities
   version 6 (`poses`, `obs_rate`, `fault_codes`). Against older armd the pose methods raise
   `UnsupportedError` (`code == "UNSUPPORTED"`), `obs_hz` is not sent (armd then sends every

@@ -4,12 +4,14 @@ Zero third-party packages, zero urllib.request / http.client / email imports.
 Every client takes an optional ``transport``: a callable
 ``(method, url, body: bytes | None, headers: dict, timeout: float) -> HttpResponse``.
 Tests pass an in-process fake; the default sends real requests over raw sockets.
+``timeout`` bounds the whole request (connect, send and the full response), not each read.
 """
 
 from __future__ import annotations
 
 import json as _json
 import socket
+import time
 from typing import Any, Callable, Dict, Optional
 from urllib.parse import urlencode, urlsplit
 
@@ -70,7 +72,29 @@ class HttpStatusError(HttpError):
 Transport = Callable[[str, str, Optional[bytes], Dict[str, str], float], HttpResponse]
 
 
-def _read_chunked(sock: socket.socket, initial: bytes) -> bytes:
+class _DeadlineSocket:
+    """``recv``/``sendall`` on ``sock`` bounded by one monotonic ``deadline`` for the whole request."""
+
+    def __init__(self, sock: socket.socket, deadline: float) -> None:
+        self.sock = sock
+        self.deadline = deadline
+
+    def _arm(self) -> None:
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise socket.timeout("request deadline passed")
+        self.sock.settimeout(remaining)
+
+    def recv(self, n: int) -> bytes:
+        self._arm()
+        return self.sock.recv(n)
+
+    def sendall(self, data: bytes) -> None:
+        self._arm()
+        self.sock.sendall(data)
+
+
+def _read_chunked(sock: _DeadlineSocket, initial: bytes) -> bytes:
     buf = bytearray(initial)
     body = bytearray()
 
@@ -144,14 +168,16 @@ def socket_transport(
     if body:
         payload += body
 
-    sock: Optional[socket.socket] = None
+    deadline = time.monotonic() + timeout
+    raw: Optional[socket.socket] = None
     try:
-        sock = socket.create_connection((host, port), timeout=timeout)
+        raw = socket.create_connection((host, port), timeout=timeout)
         if scheme == "https":
             import ssl
 
-            sock = ssl.create_default_context().wrap_socket(sock, server_hostname=host)
-        sock.settimeout(timeout)
+            raw.settimeout(max(0.001, deadline - time.monotonic()))
+            raw = ssl.create_default_context().wrap_socket(raw, server_hostname=host)
+        sock = _DeadlineSocket(raw, deadline)
         sock.sendall(payload)
 
         buf = bytearray()
@@ -217,9 +243,9 @@ def socket_transport(
     except OSError as exc:
         raise HttpError(f"cannot reach {url}: {exc}") from exc
     finally:
-        if sock is not None:
+        if raw is not None:
             try:
-                sock.close()
+                raw.close()
             except OSError:
                 pass
 

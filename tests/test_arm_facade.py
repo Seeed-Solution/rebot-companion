@@ -169,6 +169,20 @@ def test_guard_does_not_trip_during_a_long_call(armd):
         assert armd.lease is not None
 
 
+def test_guard_exempts_a_busy_call_only_up_to_its_budget(armd, monkeypatch):
+    import rebot.arm as arm_mod
+
+    monkeypatch.setattr(arm_mod, "GUARD_CALL_BUDGET_S", 0.2, raising=False)
+    monkeypatch.setattr(arm_mod, "GUARD_BUSY_MARGIN_S", 0.2, raising=False)
+    with open_arm(armd, park_on_exit=False) as arm:
+        arm.guard(0.3)
+        monkeypatch.setattr(arm.client, "get_poses", lambda: time.sleep(1.5) or [])
+        arm.poses()  # hangs well past its 0.2 s budget + 0.2 s margin
+        assert armd.lease is None
+        with pytest.raises(GuardTimeout):
+            arm.feed()
+
+
 def test_recover_clears_only_recoverable_faults(armd):
     armd.devplat = True
     with open_arm(armd) as arm:

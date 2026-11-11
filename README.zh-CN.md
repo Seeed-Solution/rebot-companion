@@ -244,7 +244,8 @@ ssh <user>@192.168.42.1 'cd ~/arm && python3 main.py'
   交接未稳定）。急停、其他故障，以及不报告故障码的 armd 上的所有故障，都抛出 `ArmFaultError`；
   这些故障需要检查机械臂后在 Web 驾驶舱中清除。离开 `with` 块时也不会清除它们。
 - `guard(timeout_s)`：后台线程在 `timeout_s` 秒内没有调用 `feed()` 时释放租约（在 `Arm` 方法内部的
-  时间算作已调用），之后由 armd 的租约看门狗处理机械臂，后续调用都抛出 `GuardTimeout`。
+  时间算作已调用，上限为该调用自身的超时加 15 秒：运动用 `timeout` 或 60 秒，其他调用 30 秒），
+  之后由 armd 的租约看门狗处理机械臂，后续调用都抛出 `GuardTimeout`。
 - 命名位姿、`move_to_pose`、`obs_hz` 和故障码需要报告 capabilities 版本 6（`poses`、`obs_rate`、
   `fault_codes`）的 armd。旧版 armd 上位姿相关方法抛出 `UnsupportedError`（`code == "UNSUPPORTED"`），
   不发送 `obs_hz`（armd 按每个控制周期推送），`recover()` 不清除故障。

@@ -437,3 +437,33 @@ def test_reader_failure_stops_heartbeats_and_closes_the_socket(armd):
         assert not armd.conns and armd.lease is None  # socket closed: armd's watchdog owns the arm
     finally:
         s.close()
+
+
+def test_http_timeout_bounds_the_whole_request_not_each_read():
+    import socket
+
+    from rebot import _http
+
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+
+    def trickle():
+        conn, _ = srv.accept()
+        try:
+            conn.recv(4096)
+            for b in b"HTTP/1.1 200 OK\r\nX-Slow: " + b"a" * 40:  # one byte every 0.1 s, never finishes
+                conn.sendall(bytes([b]))
+                time.sleep(0.1)
+        except OSError:
+            pass
+        finally:
+            conn.close()
+            srv.close()
+
+    threading.Thread(target=trickle, daemon=True).start()
+    t0 = time.monotonic()
+    with pytest.raises(_http.HttpTimeout):
+        _http.request("GET", f"http://127.0.0.1:{port}/x", timeout=0.5)
+    assert time.monotonic() - t0 < 1.5
