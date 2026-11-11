@@ -174,3 +174,41 @@ def test_sort_by_label_stops_when_collisions_escalate(armd, capsys):
         assert ok == 0 and bad >= 1
         assert armd.state == "Fault"
     assert "place" not in kinds(armd)
+
+
+def test_demo_wave_waits_out_a_collision_hold(armd, capsys):
+    mod = load("demo_wave")
+    with open_arm(armd) as arm:
+        arm.set_collision_guard(enabled=True)
+        teach(arm, "wave_1", "wave_2", "wave_3")
+        armd.trip_collision(resume_after_s=0.3)  # holding: the next motion is refused with COLLISION_HOLD
+        assert mod.run(arm, dict(mod.CONFIG, rounds=1)) == 1
+    assert "trying the step once more" in capsys.readouterr().out
+
+
+def test_sort_by_label_detects_again_before_retrying_a_grasp(armd):
+    mod = load("sort_by_label")
+    armd.detections = [det("cup")]
+    with open_arm(armd) as arm:
+        arm.set_collision_guard(enabled=True)
+        teach(arm, "scan", "bin_a", "bin_b")
+        real_grasp, grasped = arm.grasp, []
+
+        def grasp(target, **kw):
+            grasped.append(target)
+            if len(grasped) == 1:
+                armd.collision_next_actions = 1  # the first grasp bumps into something halfway
+            return real_grasp(target, **kw)
+
+        arm.grasp = grasp
+        assert mod.run(arm, dict(mod.CONFIG, max_cycles=1)) == (1, 0)
+    assert len(grasped) == 2 and grasped[0] is not grasped[1]
+    assert len(armd.trigger_bodies) == 2  # a fresh detection for the retry, not the old box
+
+
+def test_device_deployment_of_the_stdlib_sdk_is_documented():
+    root = TEMPLATES.parents[1]
+    for doc in ("README.md", "README.zh-CN.md", "AGENTS.md"):
+        assert "/usr/share/rebot-teleop/python" in (root / doc).read_text(), doc
+    # the wheel stays >= 3.10; rebot/ reaches Python 3.8 devices as a folder, not through the wheel
+    assert 'requires-python = ">=3.10"' in (root / "pyproject.toml").read_text()

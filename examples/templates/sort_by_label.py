@@ -11,7 +11,7 @@ First real run: keep speed_scale at 0.3 or lower and stay near the stop button.
 
 import sys
 
-from rebot import ActionFailed, Arm, ArmFaultError
+from rebot import ActionFailed, Arm, ArmCommandRejected, ArmFaultError
 
 # ---- edit this part ----------------------------------------------------------------
 CONFIG = {
@@ -29,17 +29,18 @@ CONFIG = {
 # ------------------------------------------------------------------------------------
 
 
-def retry_after_collision(arm, step):
-    """Run step(); if the arm bumped into something, wait for it to move on its own and try once more."""
+def retry_after_collision(arm, step, retry=None):
+    """Run step(); if the arm bumped into something (or still holds after a bump), wait for it to
+    move on its own and run retry() (default: step) once more."""
     try:
         return step()
-    except ActionFailed as exc:
-        if exc.code != "COLLISION":
+    except (ActionFailed, ArmCommandRejected) as exc:
+        if exc.code not in ("COLLISION", "COLLISION_HOLD"):
             raise
         print("The arm touched something and stopped. Waiting for it to move on its own...")
         arm.wait_until_clear()  # raises ArmFaultError (code COLLISION) after repeated collisions
         print("The arm is free again, trying the step once more.")
-        return step()
+        return (retry or step)()
 
 
 def run(arm, cfg):
@@ -69,7 +70,15 @@ def run(arm, cfg):
                 continue
             empty = 0
             target = targets[0]  # best score first
-            if not retry_after_collision(arm, lambda target=target: arm.grasp(target)).holding:
+
+            def grasp_again(label=target.label):  # the object may have moved: scan again, never reuse the old box
+                arm.move_to_pose(cfg["scan_pose"], speed_scale=speed)
+                fresh = arm.detect(label, min_score=cfg["min_score"])
+                if not fresh:
+                    raise ActionFailed("TARGET_LOST", f"{label} not found again after the collision")
+                return arm.grasp(fresh[0])
+
+            if not retry_after_collision(arm, lambda target=target: arm.grasp(target), grasp_again).holding:
                 raise ActionFailed("NOT_HOLDING", "gripper closed on nothing")
             bin_pose = cfg["bins"][target.label.lower()]
             retry_after_collision(arm, lambda bin_pose=bin_pose: arm.place(pose=bin_pose, speed_scale=speed))

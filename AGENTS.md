@@ -23,9 +23,11 @@ Two layers:
    - No arm: start armd with `armd --follower mock` and run `REBOT_HOST=127.0.0.1 python3 main.py`.
    - Real arm: `REBOT_HOST=192.168.42.1 python3 main.py` with `speed_scale` 0.3 and the user at the
      stop button. Motions are executed by the arm; stdout shows what the script is doing.
-4. **Copy to the device**: `/userdata/rebot-apps/<name>/main.py`, together with the `rebot/` folder
-   if the device does not have it installed. The script runs unchanged (without `REBOT_HOST` it uses
-   `127.0.0.1`).
+4. **Copy to the device**: `/userdata/rebot-apps/<name>/main.py`. `rebot` targets Python 3.8 there; do not
+   `pip install` this project on the device (its wheel requires Python >= 3.10). A rebot-teleop deb built
+   with `REBOT_SDK_DIR` ships `rebot/` in `/usr/share/rebot-teleop/python` (on the app runner's
+   `PYTHONPATH`); if that directory is missing, copy the `rebot/` folder next to `main.py`. The
+   script runs unchanged (without `REBOT_HOST` it uses `127.0.0.1`).
 5. **Enable it** (needs rebot-teleop with the app runner). Either in the reCamera console, rebot-teleop
    settings, group "Your Program": `enabled` = `on`, `name` = `<name>`; or start it by hand with
    `/etc/init.d/K92rebot-teleop app-start <name>` (`app-status`, `app-logs 50`, `app-stop`). The

@@ -7,7 +7,7 @@ Run (PC):      REBOT_HOST=192.168.42.1 uv run python demo_wave.py
 Run (device):  python3 main.py            (no REBOT_HOST needed)
 """
 
-from rebot import ActionFailed, Arm, ArmFaultError
+from rebot import ActionFailed, Arm, ArmCommandRejected, ArmFaultError
 
 # ---- edit this part ----------------------------------------------------------------
 CONFIG = {
@@ -18,17 +18,18 @@ CONFIG = {
 # ------------------------------------------------------------------------------------
 
 
-def retry_after_collision(arm, step):
-    """Run step(); if the arm bumped into something, wait for it to move on its own and try once more."""
+def retry_after_collision(arm, step, retry=None):
+    """Run step(); if the arm bumped into something (or still holds after a bump), wait for it to
+    move on its own and run retry() (default: step) once more."""
     try:
         return step()
-    except ActionFailed as exc:
-        if exc.code != "COLLISION":
+    except (ActionFailed, ArmCommandRejected) as exc:
+        if exc.code not in ("COLLISION", "COLLISION_HOLD"):
             raise
         print("The arm touched something and stopped. Waiting for it to move on its own...")
         arm.wait_until_clear()  # raises ArmFaultError (code COLLISION) after repeated collisions
         print("The arm is free again, trying the step once more.")
-        return step()
+        return (retry or step)()
 
 
 def run(arm, cfg):

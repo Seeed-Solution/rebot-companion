@@ -113,6 +113,10 @@ SDK 不在相机上运行。相机和 armd 提供单一用途的接口：
 - reCamera 上的 `rebot-vision`，用于标记触发（包含在 `rebot-teleop` 安装包内，与 rebot-armd 一起安装，无需另装相机应用）。相机自带的 aruco-detector 也可使用：触发请求需要 JSON body（aruco-detector >= 0.1.3
   否则返回 `415`；SDK 会发送 JSON body），畸变参数需要 aruco-detector >= 0.1.1。
 - SenseCraft 方案 `rebot_agent_arm` 安装 `rebot-teleop`、本 MCP 服务器并运行标定验证步骤。
+- reCamera 上的 `rebot`（该包在设备上以 Python 3.8 为目标）不从本项目的 wheel 安装（wheel 要求
+  Python >= 3.10）。用 `REBOT_SDK_DIR=<rebot-companion 检出目录>` 构建的 rebot-teleop deb 把 `rebot/`
+  目录装到 `/usr/share/rebot-teleop/python`，其程序运行器把该目录加入 `PYTHONPATH`。没有该目录时，
+  把 `rebot/` 目录复制到程序的 `main.py` 旁边。
 
 上位机：
 

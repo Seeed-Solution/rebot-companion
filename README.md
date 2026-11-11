@@ -119,6 +119,11 @@ Software on the devices:
   the SDK sends one) and distortion keys need aruco-detector >= 0.1.1.
 - The SenseCraft solution `rebot_agent_arm` installs `rebot-teleop`, this MCP server and the
   calibration verify step.
+- `rebot` on the reCamera (the package targets Python 3.8 there) does not come from this project's
+  wheel, which requires Python >= 3.10. A rebot-teleop deb built with
+  `REBOT_SDK_DIR=<rebot-companion checkout>` carries the `rebot/` folder in
+  `/usr/share/rebot-teleop/python`, and its app runner puts that directory on `PYTHONPATH`.
+  Without it, copy the `rebot/` folder next to the program's `main.py`.
 
 Host:
 
