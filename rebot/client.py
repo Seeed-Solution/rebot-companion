@@ -690,17 +690,21 @@ class ArmSession:
         return self._closed_reason
 
     def latest_observation(self) -> ArmStatus | None:
+        """Newest observation (None before the first). Raises :class:`ArmConnectionError` once the
+        connection has closed: the last frame no longer describes the arm."""
         with self._state:
+            if self._closed_reason is not None:
+                raise ArmConnectionError(self._closed_reason)
             return self._obs
 
     def wait_for_observation(self, timeout: float = 2.0) -> ArmStatus:
-        """Block until the next telemetry frame arrives."""
+        """Block until the next telemetry frame arrives; :class:`ArmConnectionError` when closed."""
         with self._state:
             start = self._frames
             if not self._state.wait_for(lambda: self._frames > start or self._closed_reason, timeout):
                 raise ArmConnectionError("No telemetry from armd")
-            if self._obs is None:
-                raise ArmConnectionError(self._closed_reason or "No telemetry from armd")
+            if self._closed_reason is not None:
+                raise ArmConnectionError(self._closed_reason)
             return self._obs
 
     def schema(self) -> ObservationSchema:

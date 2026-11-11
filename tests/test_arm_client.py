@@ -12,6 +12,7 @@ from websockets.sync.client import connect as ws_connect
 
 from rebot.client import (
     ArmCommandRejected,
+    ArmConnectionError,
     ArmFaultError,
     ArmStatus,
     LeaseError,
@@ -496,3 +497,22 @@ def test_concurrent_commands_reach_armd_with_increasing_request_ids(armd):
         results["b"] = s.stop()  # e.g. MCP stop while a motion tool runs
         t.join(2.0)
         assert all(isinstance(r, dict) and r["type"] == "command_ack" for r in results.values()), results
+
+
+def test_observations_raise_once_the_connection_closed(armd):
+    s = armd.client.session(client_id="gone", safe_exit="off").open()
+    try:
+        assert s.wait_for_observation() is not None
+        with armd.lock:
+            server_ws, _ = next(iter(armd.conns.values()))
+        server_ws.close()
+        deadline = time.monotonic() + 2.0
+        while s.closed_reason is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert s.closed_reason
+        with pytest.raises(ArmConnectionError):
+            s.latest_observation()
+        with pytest.raises(ArmConnectionError):
+            s.wait_for_observation(timeout=0.2)
+    finally:
+        s.close()
