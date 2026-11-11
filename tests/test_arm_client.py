@@ -415,3 +415,25 @@ def test_heartbeats_keep_flowing_through_jog_unload_cycles_with_a_polling_thread
             th.join(1)
     gaps = [b - a for a, b in zip(beats, beats[1:])]
     assert len(beats) > 5 and max(gaps) < armd.lease_timeout / 2, max(gaps)
+
+
+def test_reader_failure_stops_heartbeats_and_closes_the_socket(armd):
+    s = armd.client.session(client_id="dies", safe_exit="off").open()
+    try:
+        assert s.has_lease
+        with armd.lock:
+            conn = next(iter(armd.conns))
+            # malformed observation: epoch_id is not an int, ArmStatus.from_dict raises in the reader thread
+            bad = dict(armd.observation(), epoch_id="x")
+        armd.send(conn, json.dumps(bad))
+        deadline = time.monotonic() + 2.0
+        while s.closed_reason is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert s.closed_reason and "reader failed" in s.closed_reason
+        time.sleep(0.2)
+        beats = armd.heartbeats
+        time.sleep(armd.lease_timeout * 1.5)
+        assert armd.heartbeats == beats  # no heartbeat renews the lease after the reader died
+        assert not armd.conns and armd.lease is None  # socket closed: armd's watchdog owns the arm
+    finally:
+        s.close()

@@ -731,13 +731,20 @@ class ArmSession:
                     self._dispatch(msg)
         except _ws.WebSocketClosed as exc:
             reason = f"WebSocket closed ({exc})"
-        except Exception as exc:  # pragma: no cover - defensive
-            reason = f"reader failed: {exc}"
+        except Exception as exc:  # protocol error, bad UTF-8, malformed observation, ...
+            reason = f"reader failed: {type(exc).__name__}: {exc}"
         else:
             reason = "session closed"
         with self._state:
             self._closed_reason = reason
             self._state.notify_all()
+        # The session is dead: stop heartbeats and close the socket so armd's lease watchdog takes over
+        # instead of a heartbeat thread renewing a lease nobody reads replies for.
+        self._stop.set()
+        try:
+            ws.close()
+        except Exception:
+            pass
         self._fail_pending(reason)
 
     def _dispatch(self, msg: dict) -> None:
@@ -777,6 +784,8 @@ class ArmSession:
 
     def _heartbeat_loop(self) -> None:
         while not self._stop.wait(self.heartbeat_interval):
+            if self._closed_reason is not None:
+                return
             gen, epoch = self._generation, self._epoch
             if gen is None or epoch is None:
                 continue
