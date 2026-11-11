@@ -786,7 +786,9 @@ policy period, then held. Every frame is clipped to the joint limits and, for jo
 measured position ± 0.95 × `servo_max_lead_rad` (armd schema, default 0.2 rad); the summary counts
 clipped frames per joint and the `observation.motion_limit` reasons armd reported. A step that is
 more than one period late is counted and the schedule restarts from it (no burst of catch-up steps).
-Learned policies run one warm-up inference before the stream starts.
+Learned policies run one warm-up inference before the stream starts. `--max-seconds` is an absolute
+deadline from the start of the stream, checked by the sender before every frame, so slow inference
+does not extend the run. Timing options must be finite and > 0.
 
 Stops: E-stop, Fault, collision hold, servo `blocked` hold, torque off, lease loss, servo rejection
 (for example `MOTION_BUSY`), connection loss, policy stall, stale camera frame, a non-finite or

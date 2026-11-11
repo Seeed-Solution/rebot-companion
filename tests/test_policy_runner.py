@@ -602,3 +602,39 @@ def test_request_stop_does_not_wait_forever_for_a_stuck_send():
         assert r._stop.is_set() and r.result.reason == "fault"
     finally:
         release.set()
+
+
+# --------------------------------------------------------------------------- timing bounds
+
+
+@pytest.mark.parametrize("name", ["fps", "servo_hz", "max_seconds", "stall_s", "max_frame_age_s"])
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), 0, -1])
+def test_timing_parameters_must_be_finite_and_positive(name, value):
+    with pytest.raises(ValueError, match=name):
+        PolicyRunner(None, SinePolicy(0, 0.05, 1.0), **{name: value})
+
+
+def test_the_sender_enforces_the_deadline():
+    r = stub_runner()
+    r._deadline = time.monotonic() - 1e-3
+    r.session = StubSession(r)
+    r._send_loop()
+    assert r.session.sent == [] and r.result.reason == "max_seconds"
+
+
+def test_max_seconds_holds_while_inference_blocks(arm):
+    """Inference that blocks past the deadline does not extend the stream: the sender stops on time."""
+    holder = {}
+
+    class Blocking(Policy):
+        def select(self, obs, step, t):
+            if step == 1:
+                holder["r"]._stop.wait(5.0)  # released by the sender's deadline stop
+            return np.array(obs["observation.state"], dtype=float)
+
+    r = runner(arm, Blocking(), max_seconds=0.1, stall_s=10, park=False)
+    holder["r"] = r
+    res = r.run()
+    assert res.reason == "max_seconds", res
+    assert res.frames <= 0.1 * 50 + 2
+    assert res.duration_s < 1.0

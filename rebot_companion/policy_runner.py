@@ -82,6 +82,17 @@ class RunnerError(RuntimeError):
     """The run could not start."""
 
 
+def _positive(name: str, value: Any) -> float:
+    """``value`` as a finite float > 0, else ValueError naming the parameter."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} must be a finite number > 0, got {value!r}") from None
+    if not math.isfinite(v) or v <= 0:
+        raise ValueError(f"{name} must be a finite number > 0, got {value!r}")
+    return v
+
+
 # --------------------------------------------------------------------------- policies
 
 
@@ -344,20 +355,21 @@ class PolicyRunner:
         connect_timeout: float = 5.0,
         sender_join_s: float = 2 * SEND_TIMEOUT_S,
     ) -> None:
-        if servo_hz < 10:
+        fps_v = _positive("fps", policy.fps or 30 if fps is None else fps)
+        if fps_v != int(fps_v):
+            raise ValueError(f"fps must be a whole number, got {fps!r}")
+        self.fps = int(fps_v)
+        self.servo_hz = _positive("servo_hz", servo_hz)
+        if self.servo_hz < 10:
             raise ValueError("servo_hz must be >= 10 (armd drops a stream 200 ms after its last frame)")
+        self.max_seconds = _positive("max_seconds", max_seconds)
+        self.stall_s = _positive("stall_s", stall_s)
+        self.max_frame_age_s = _positive("max_frame_age_s", max_frame_age_s)
         self.client = client
         self.policy = policy
         self.camera = camera
-        self.fps = int(fps or policy.fps or 30)
-        if self.fps <= 0:
-            raise ValueError("fps must be positive")
-        self.servo_hz = float(servo_hz)
-        self.max_seconds = float(max_seconds)
         self.park = park
         self.operator_present = operator_present
-        self.stall_s = float(stall_s)
-        self.max_frame_age_s = float(max_frame_age_s)
         self.log_path = Path(log_path) if log_path else None
         self.client_id = client_id
         self.connect_timeout = connect_timeout
@@ -377,6 +389,7 @@ class PolicyRunner:
         self._segment: _Segment | None = None
         self._last_sent: np.ndarray | None = None
         self._last_target_t = 0.0
+        self._deadline = math.inf  # monotonic end of the stream, set when it starts
         self._sender: threading.Thread | None = None
         self._lat: dict[str, list[float]] = {
             "obs_age": [],
@@ -511,6 +524,9 @@ class PolicyRunner:
         try:
             while not self._stop.is_set():
                 now = time.monotonic()
+                if now >= self._deadline:
+                    self.request_stop("max_seconds", f"{self.max_seconds:g} s")
+                    break
                 self._lat["send_lag"].append(max(0.0, now - next_t))
                 timed = s.latest_observation_timed()
                 obs = timed[1]
@@ -525,7 +541,7 @@ class PolicyRunner:
                     break
                 frame = self._shape(seg.at(now), obs.positions)
                 with self._send_lock:
-                    if self._stop.is_set():
+                    if self._stop.is_set() or time.monotonic() >= self._deadline:
                         break
                     s.servo(frame.tolist())
                     with self._lock:
@@ -539,6 +555,8 @@ class PolicyRunner:
                 elif -delay > period:
                     self.result.late_frames += 1
                     next_t = time.monotonic()
+            if time.monotonic() >= self._deadline:
+                self.request_stop("max_seconds", f"{self.max_seconds:g} s")  # first reason wins
         except ServoRejected as exc:
             self.request_stop("servo_rejected", str(exc))
         except LeaseError as exc:
@@ -667,6 +685,8 @@ class PolicyRunner:
             self._segment = _Segment(here, here, time.monotonic(), 0.0)
             self._last_target_t = time.monotonic()
         self._sender = threading.Thread(target=self._send_loop, name="policy-servo", daemon=True)
+        # absolute end of the stream, enforced by the sender whatever the policy's inference time
+        self._deadline = time.monotonic() + self.max_seconds
         self._streaming = True
         self._sender.start()
 
@@ -687,7 +707,7 @@ class PolicyRunner:
             if lag > period:
                 self.result.late_steps += 1
                 t0 = now - k * period  # re-anchor: one step per tick, never a burst of catch-up steps
-            if k * period >= self.max_seconds:
+            if now >= self._deadline:
                 self.request_stop("max_seconds", f"{self.max_seconds:g} s")
                 break
             rx, obs = s.latest_observation_timed()
