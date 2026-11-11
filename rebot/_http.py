@@ -121,12 +121,19 @@ def _remaining(deadline: float) -> float:
     return left
 
 
+# A lookup has no timeout of its own, so it runs in a thread that may outlive its request. At most
+# this many lookups run at once; a request that cannot get a slot in time times out without a thread.
+_RESOLVERS = threading.BoundedSemaphore(2)
+
+
 def _resolve(host: str, port: int, deadline: float) -> list:
-    """getaddrinfo bounded by ``deadline`` (a lookup has no timeout of its own; it runs in a thread)."""
+    """getaddrinfo bounded by ``deadline``; IP literals resolve inline without a thread."""
     try:
         return socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM, 0, socket.AI_NUMERICHOST)
     except socket.gaierror:
         pass
+    if not _RESOLVERS.acquire(timeout=_remaining(deadline)):
+        raise socket.timeout(f"resolving {host}: no free resolver within the request deadline")
     out: dict = {}
 
     def run() -> None:
@@ -134,9 +141,15 @@ def _resolve(host: str, port: int, deadline: float) -> list:
             out["infos"] = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
         except OSError as exc:
             out["error"] = exc
+        finally:
+            _RESOLVERS.release()
 
     t = threading.Thread(target=run, name="rebot-resolve", daemon=True)
-    t.start()
+    try:
+        t.start()
+    except BaseException:
+        _RESOLVERS.release()
+        raise
     t.join(_remaining(deadline))
     if t.is_alive():
         raise socket.timeout(f"resolving {host} took longer than the request deadline")

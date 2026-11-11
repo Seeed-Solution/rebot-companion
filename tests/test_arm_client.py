@@ -558,3 +558,36 @@ def test_http_deadline_covers_connecting_to_several_addresses(monkeypatch):
     with pytest.raises(_http.HttpTimeout):
         _http.request("GET", "http://multi.example:9/x", timeout=0.4)
     assert time.monotonic() - t0 < 0.8
+
+
+def test_timed_out_lookups_do_not_pile_up_resolver_threads(monkeypatch):
+    import socket
+
+    from rebot import _http
+
+    real = socket.getaddrinfo
+    gate = threading.Event()
+    lookups = []
+
+    def stuck_dns(host, port, *a, **kw):
+        if host == "stuck.invalid":
+            if len(a) >= 4 and a[3] & socket.AI_NUMERICHOST:
+                raise socket.gaierror("not numeric")
+            lookups.append(host)
+            gate.wait(5.0)
+            raise socket.gaierror("gave up")
+        return real(host, port, *a, **kw)
+
+    monkeypatch.setattr(socket, "getaddrinfo", stuck_dns)
+    try:
+        for _ in range(5):
+            t0 = time.monotonic()
+            with pytest.raises(_http.HttpTimeout):
+                _http.request("GET", "http://stuck.invalid:9/x", timeout=0.1)
+            assert time.monotonic() - t0 < 0.5
+        assert len(lookups) <= 2  # later requests time out without starting another thread
+        with pytest.raises(_http.HttpError):  # an IP literal resolves inline, no resolver slot needed
+            _http.request("GET", "http://127.0.0.1:9/x", timeout=0.5)
+        assert len(lookups) <= 2
+    finally:
+        gate.set()
