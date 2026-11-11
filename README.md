@@ -731,6 +731,25 @@ lerobot 0.6.1 (PyAV decoder) and 0.7.0 (torchcodec decoder) on Linux aarch64; th
 when `REBOT_LEROBOT_PYTHON` names a Python with `lerobot[dataset]` installed, else it is skipped.
 Not yet run against a real armd and reCamera.
 
+**In the simulator.** armd's `sim` follower and the simulated wrist camera of `rebot-sim` (in
+[rebot-armd](https://github.com/Seeed-Solution/rebot-armd), `docs/simulation.md`) stand in for the
+arm and the reCamera: the simulator streams H.264 in the reCamera format at `ws://127.0.0.1:8001/`,
+armd listens on `127.0.0.1:8765`. In the rebot-armd checkout:
+
+```bash
+cd sim/mujoco && uv run rebot-sim --camera --objects cube,cup --seed 3   # terminal 1
+ARMD_DETECTOR_URL=http://127.0.0.1:8090 cargo run --bin armd -- --follower sim \
+  --config kits/recamera-b601dm/profile/rebot-b601dm.json --log-dir off --blackbox-dir off   # terminal 2
+```
+
+Set `ARMD_POSES`, `ARMD_KEEPOUT` and `ARMD_GRASP_SETUP` to writable paths when `/userdata` does
+not exist. Then record with `--armd 127.0.0.1 --camera 127.0.0.1`. The simulated camera runs at
+15 fps by default (`rebot-sim --fps`, 1..30); at the recorder's 30 fps every second row repeats a
+camera frame. Run on spark (Linux aarch64, 2026-11-11, rebot-armd b3ff997): one 3 s episode with
+`--no-prompt` gave 91 rows, a 1280x720 `observation.images.recamera` video, 0 late ticks and 45
+camera repeats. The stream is also decoded with rebot-companion's `snapshot` decoder in
+rebot-armd's `sim/mujoco/tests/test_camera.py`.
+
 ---
 
 ## Run a learned policy
@@ -825,8 +844,15 @@ HTTP. A randomly initialised ACT policy (lerobot 0.7.0, built for the recorder's
 7-joint state and action, one 64x48 camera) runs 10 steps with images from an H.264 WebSocket
 stream in the reCamera format; that test runs when lerobot imports or
 `REBOT_LEROBOT_PYTHON` names a Python with `lerobot[dataset]`, PyAV, pyarrow and scipy, else it is
-skipped. The same lerobot calls exist in 0.6.1 (source read, not run). Not yet run against a real
-armd, the simulator or a trained policy.
+skipped. The same lerobot calls exist in 0.6.1 (source read, not run).
+
+In the simulator (setup as in [Record a LeRobot dataset](#record-a-lerobot-dataset); armd reports
+follower `sim`, so `--i-am-at-the-arm` is not needed; image policies take `--camera 127.0.0.1`):
+on spark (2026-11-11, rebot-armd b3ff997) `--policy replay:<dataset>:0` of a 3 s episode recorded
+from the simulator ran 91 steps and 154 servo frames with 0 late, and parked;
+`--policy sine:1:0.05:4 --max-seconds 5` ran 150 steps and 250 servo frames with 0 late and
+stopped with `max_seconds`. Not yet run against a real armd, with a learned policy in the
+simulator, or with a trained policy.
 
 ---
 
