@@ -400,6 +400,7 @@ class PolicyRunner:
         log_path: str | Path | None = None,
         client_id: str | None = None,
         connect_timeout: float = 5.0,
+        send_timeout_s: float = SEND_TIMEOUT_S,
         sender_join_s: float = 2 * SEND_TIMEOUT_S,
     ) -> None:
         fps_v = _positive("fps", policy.fps or 30 if fps is None else fps)
@@ -421,7 +422,14 @@ class PolicyRunner:
         self.log_path = Path(log_path) if log_path else None
         self.client_id = client_id
         self.connect_timeout = connect_timeout
-        self.sender_join_s = float(sender_join_s)
+        # The sender's in-flight send ends within send_timeout_s; joining it must allow for that plus margin,
+        # else a slow but healthy send would be treated as a stuck sender (REST e-stop).
+        self.send_timeout_s = _positive("send_timeout_s", send_timeout_s)
+        self.sender_join_s = _positive("sender_join_s", sender_join_s)
+        if self.sender_join_s < 1.5 * self.send_timeout_s:
+            raise ValueError(
+                f"sender_join_s ({sender_join_s}) must be >= 1.5 x send_timeout_s ({self.send_timeout_s:g} s)"
+            )
         if policy.image_key and camera is None:
             raise RunnerError(f"policy reads {policy.image_key}: a camera is required")
 
@@ -690,7 +698,7 @@ class PolicyRunner:
                 safe_exit="off",
                 connect_timeout=self.connect_timeout,
                 obs_hz=int(max(self.servo_hz, 50)),
-                send_timeout=SEND_TIMEOUT_S,
+                send_timeout=self.send_timeout_s,
             ).open()
             try:
                 self._prepare()

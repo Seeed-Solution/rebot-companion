@@ -564,7 +564,7 @@ def test_request_stop_sets_the_event_before_anything_else():
 
 def test_a_hung_sender_fails_closed_with_e_stop():
     """If the sender does not end within sender_join_s (a send stuck in the socket), the runner e-stops over REST."""
-    r = stub_runner(sender_join_s=0.05)
+    r = stub_runner(send_timeout_s=0.02, sender_join_s=0.05)
     release = threading.Event()
     r._sender = threading.Thread(target=release.wait, daemon=True)
     r._sender.start()
@@ -586,7 +586,7 @@ def test_a_hung_sender_fails_closed_with_e_stop():
 
 
 def test_request_stop_does_not_wait_forever_for_a_stuck_send():
-    r = stub_runner(sender_join_s=0.05)
+    r = stub_runner(send_timeout_s=0.02, sender_join_s=0.05)
     held, release = threading.Event(), threading.Event()
 
     def stuck():
@@ -752,7 +752,7 @@ def test_bad_schema_limits_are_refused_before_torque(arm, monkeypatch, limits):
 def test_stop_reaches_the_e_stop_within_its_bound_while_a_send_is_stuck():
     """The real sender stuck inside servo() (holding whatever locks it holds while sending): request_stop,
     _publish and _stop_sender all return within their bounds and the REST e-stop goes out."""
-    r = stub_runner(sender_join_s=0.05)
+    r = stub_runner(send_timeout_s=0.02, sender_join_s=0.05)
     entered, release = threading.Event(), threading.Event()
 
     class Stuck(StubSession):
@@ -813,3 +813,11 @@ def test_inference_that_never_returns_still_stops_parks_and_releases(arm, kw, re
     assert res.reason == reason and res.parked, res
     assert res.duration_s < 0.3 + 1.0
     assert "/api/v1/motion/unload" in arm.commands and arm.lease is None
+
+
+@pytest.mark.parametrize("join", [0.5, 1.0, 1.49, float("nan")])
+def test_sender_join_must_exceed_the_send_timeout(join):
+    with pytest.raises(ValueError, match="sender_join_s"):
+        PolicyRunner(None, SinePolicy(0, 0.05, 1.0), sender_join_s=join)  # default send timeout 1 s
+    PolicyRunner(None, SinePolicy(0, 0.05, 1.0), sender_join_s=1.5)
+    PolicyRunner(None, SinePolicy(0, 0.05, 1.0), send_timeout_s=0.02, sender_join_s=0.05)
