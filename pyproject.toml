@@ -35,6 +35,7 @@ Issues = "https://github.com/Seeed-Solution/rebot-companion/issues"
 [project.scripts]
 rebot-mcp = "rebot_companion.mcp_server:main"
 rebot-record = "rebot_companion.lerobot_recorder:main"
+rebot-policy = "rebot_companion.policy_runner:main"
 
 [project.optional-dependencies]
 calib = [
@@ -46,6 +47,12 @@ agent = [
     "pillow>=10",
 ]
 record = [
+    "av>=12",
+    "pyarrow>=14",
+]
+# rebot-policy: camera decode and scripted replay. Learned policies also need torch + lerobot, installed
+# separately (Python >= 3.12), e.g. `uv run --python 3.12 --with 'lerobot[dataset]' rebot-policy ...`
+policy = [
     "av>=12",
     "pyarrow>=14",
 ]

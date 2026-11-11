@@ -292,13 +292,16 @@ def test_fault_fields_parse():
             "fault": {"code": "WATCHDOG_TIMEOUT", "message": "lease", "recoverable": True},
             "previous_action": {"id": 3, "kind": "move_to", "state": "done"},
             "residual_torques": [0.1, 0, 0, 0, 0, 0],
+            "motion_limit": {"reason": "lead", "joint": 1, "since_ms": 5},
         }
     )
+    assert obs.motion_limit["reason"] == "lead"
     assert obs.fault_code == "WATCHDOG_TIMEOUT" and obs.recoverable
     assert obs.previous_action.id == 3 and obs.previous_action.terminal
     assert obs.residual_torques[0] == 0.1
     old = ArmStatus.from_dict({"safety_state": "Armed", "epoch_id": 1})
     assert old.fault is None and not old.recoverable and old.residual_torques is None
+    assert old.motion_limit is None
 
 
 def test_action_completes_from_previous_action(armd):

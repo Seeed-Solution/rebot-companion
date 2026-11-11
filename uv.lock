@@ -1447,6 +1447,13 @@ agent = [
 calib = [
     { name = "opencv-python-headless" },
 ]
+policy = [
+    { name = "av", version = "17.1.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "av", version = "18.1.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
+    { name = "av", version = "19.0.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "pyarrow", version = "25.0.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "pyarrow", version = "26.0.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+]
 record = [
     { name = "av", version = "17.1.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "av", version = "18.1.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
@@ -1472,15 +1479,17 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "av", marker = "extra == 'agent'", specifier = ">=12" },
+    { name = "av", marker = "extra == 'policy'", specifier = ">=12" },
     { name = "av", marker = "extra == 'record'", specifier = ">=12" },
     { name = "mcp", marker = "extra == 'agent'", specifier = ">=2.3,<3" },
     { name = "numpy", specifier = ">=1.24.0" },
     { name = "opencv-python-headless", marker = "extra == 'calib'", specifier = ">=4.8,<5" },
     { name = "pillow", marker = "extra == 'agent'", specifier = ">=10" },
+    { name = "pyarrow", marker = "extra == 'policy'", specifier = ">=14" },
     { name = "pyarrow", marker = "extra == 'record'", specifier = ">=14" },
     { name = "scipy", specifier = ">=1.10.0" },
 ]
-provides-extras = ["calib", "agent", "record"]
+provides-extras = ["calib", "agent", "record", "policy"]
 
 [package.metadata.requires-dev]
 dev = [

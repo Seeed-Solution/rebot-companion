@@ -92,6 +92,8 @@ def test_full_motion_cycle(armd):
         s.servo_stream([q(0.01 * i) for i in range(1, 11)], rate_hz=50)
         time.sleep(0.15)
         assert s.latest_observation().positions[0] == pytest.approx(0.1, abs=0.02)
+        rx, obs = s.latest_observation_timed()
+        assert 0 <= time.monotonic() - rx < 0.5 and obs.positions[0] == pytest.approx(0.1, abs=0.02)
         done = s.unload()
         assert done.safety_state == "Idle" and not done.is_torqued
     assert armd.lease is None  # released on exit

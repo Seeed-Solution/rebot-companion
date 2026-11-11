@@ -1,0 +1,1125 @@
+"""rebot-policy against the fake armd: servo stream, clipping, stop conditions, park, replay round trip.
+
+The learned-policy test builds a tiny randomly initialised ACT policy for the recorder's synthetic
+dataset features and runs ``rebot-policy`` for 10 steps. It needs lerobot (Python >= 3.12, torch):
+in-process when importable, else the interpreter named by ``REBOT_LEROBOT_PYTHON`` (a venv with
+``lerobot[dataset]`` 0.6.1 / 0.7.0, PyAV, pyarrow and scipy), else it skips.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import signal
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+import numpy as np
+import pytest
+from fake_armd import HOME, LIMITS
+from http_mock import Request
+from websockets.exceptions import ConnectionClosed
+from websockets.sync.server import serve
+
+pytest.importorskip("av")
+pytest.importorskip("pyarrow")
+
+import rebot_companion.policy_runner as pr  # noqa: E402
+from rebot.client import ArmSession, ArmStatus  # noqa: E402
+from rebot_companion.lerobot_recorder import EXTRAS, LeRobotRecorder  # noqa: E402
+from rebot_companion.policy_runner import (  # noqa: E402
+    EXTRA_KEYS,
+    Policy,
+    PolicyRunner,
+    ReplayPolicy,
+    RunnerError,
+    SinePolicy,
+    _Segment,
+    main,
+    parse_policy,
+    pretrained_fps,
+)
+
+REPO = Path(__file__).resolve().parent.parent
+FPS = 30
+CAM = "observation.images.recamera"
+W, H = 64, 48
+
+
+def sine() -> SinePolicy:
+    return SinePolicy(0, 0.05, 1.0)
+
+
+def hold(obs) -> np.ndarray:
+    """Target = the measured position."""
+    return np.array(obs["observation.state"], dtype=float)
+
+
+class Img(Policy):
+    image_key, image_size = CAM, (H, W)
+
+    def select(self, obs, step, t):
+        return hold(obs)
+
+
+class EStopClient:
+    """REST client stand-in that records e-stops."""
+
+    def __init__(self):
+        self.calls = []
+
+    def e_stop(self):
+        self.calls.append("e_stop")
+        return {}
+
+
+@pytest.fixture
+def arm(armd):
+    armd.devplat = True  # safety_describe -> follower "mock"
+    return armd
+
+
+def runner(armd, policy, **kw) -> PolicyRunner:
+    kw.setdefault("max_seconds", 0.6)
+    return PolicyRunner(armd.client, policy, **kw)
+
+
+def wait_until(pred, timeout=10.0, poll=0.005) -> None:
+    """Wait for a condition (re-checked every ``poll`` s); fail the test after ``timeout``."""
+    end, tick = time.monotonic() + timeout, threading.Event()
+    while not pred():
+        assert time.monotonic() < end, "condition not reached"
+        tick.wait(poll)
+
+
+def run_with(armd, policy, action=None, at_step=5, **kw):
+    """Run in a thread; call ``action()`` once the policy is asked for step ``at_step`` (the stream is live)."""
+    reached = threading.Event()
+    select = policy.select
+
+    def counting(obs, step, t):
+        if step >= at_step:
+            reached.set()
+        return select(obs, step, t)
+
+    policy.select = counting
+    r = runner(armd, policy, **kw)
+    out = {}
+    t = threading.Thread(target=lambda: out.setdefault("res", r.run()), daemon=True)
+    t.start()
+    if action is not None:
+        assert reached.wait(10), "the run did not reach the injection step"
+        action()
+    t.join(timeout=20)
+    assert not t.is_alive()
+    return out["res"]
+
+
+def assert_in_order(armd) -> None:
+    seqs = [s for s, _, _ in armd.servo_log]
+    assert seqs and seqs == list(range(seqs[0], seqs[0] + len(seqs)))
+
+
+# --------------------------------------------------------------------------- stream + park
+
+
+def test_sine_streams_frames_in_order_and_parks(arm):
+    res = runner(arm, SinePolicy(0, 0.1, 1.0), max_seconds=1.0).run()
+    assert res.reason == "max_seconds", res
+    # upper bounds: a loaded host may run fewer steps and frames in the 1 s deadline, never more
+    assert 0 < res.steps <= FPS + 1
+    assert 0 < res.frames <= 1.0 * 50 + 2
+    assert_in_order(arm)
+    assert len(arm.servo_log) == res.frames
+    assert arm.dropped_servo_frames == 0
+    j1 = [t[0] for _, t, _ in arm.servo_log]
+    assert max(j1) == pytest.approx(0.1, abs=0.02) and min(j1) == pytest.approx(-0.1, abs=0.02)
+    assert arm.commands[-2:] == ["/api/v1/motion/stop", "/api/v1/motion/unload"]
+    assert res.parked and arm.state == "Idle" and not arm.is_torqued
+    assert arm.lease is None
+    for key in ("obs_age_ms", "inference_ms", "send_lag_ms", "step_lag_ms"):
+        assert res.latency_ms[key]["n"] > 0
+    assert res.latency_ms["obs_age_ms"]["max"] < 200
+
+
+def test_interpolates_between_policy_steps(arm):
+    """A 5 Hz policy step to +0.1 rad reaches armd as several 50 Hz frames, not one jump."""
+
+    class Step(Policy):
+        fps = 5
+
+        def select(self, obs, step, t):
+            return np.array(HOME) + np.array([0.1 * (step >= 1), 0, 0, 0, 0, 0, 0])
+
+    res = runner(arm, Step(), max_seconds=0.8, park=False).run()
+    assert res.reason == "max_seconds"
+    j1 = [round(t[0], 4) for _, t, _ in arm.servo_log]
+    rising = [v for v in j1 if 0.001 < v < 0.099]
+    assert len(rising) >= 5, j1
+    assert j1 == sorted(j1), j1
+
+
+def test_the_last_segment_completes_before_policy_done(arm):
+    """A 5 Hz policy that ends right after one step: the stream reaches that step's target before it stops."""
+
+    class OneStep(Policy):
+        fps = 5
+
+        def select(self, obs, step, t):
+            return np.array(HOME) + np.array([0.05, 0, 0, 0, 0, 0, 0]) if step == 0 else None
+
+    res = runner(arm, OneStep(), max_seconds=5, park=False).run()
+    assert res.reason == "policy_done", res
+    j1 = [t[0] for _, t, _ in arm.servo_log]
+    assert j1[-1] == pytest.approx(HOME[0] + 0.05, abs=1e-9), j1
+    assert sum(abs(v - (HOME[0] + 0.05)) < 1e-9 for v in j1) >= 2, j1  # held at the target
+
+
+def test_a_stale_camera_during_the_final_hold_stops(arm):
+    """The hold after the last step keeps the camera freshness check."""
+    gone = threading.Event()
+
+    class Cam:
+        def latest(self):
+            return (time.monotonic() - (2.0 if gone.is_set() else 0.0), np.zeros((H, W, 3), np.uint8))
+
+    class ImgOneStep(Policy):
+        fps, image_key, image_size = 5, CAM, (H, W)
+
+        def select(self, obs, step, t):
+            if step == 0:
+                return np.array(HOME) + np.array([0.05, 0, 0, 0, 0, 0, 0])
+            gone.set()  # the camera stops right as the policy ends
+            return None
+
+    res = runner(arm, ImgOneStep(), camera=Cam(), max_seconds=5, park=False).run()
+    assert res.reason == "camera_stale", res
+
+
+@pytest.mark.parametrize("kw", [{}, {"max_steps": 2}])
+def test_the_deadline_during_the_final_hold_reports_max_seconds(arm, kw):
+    """Policy ends at 0.5 s; its hold would last to 1.0 s, past the 0.8 s deadline: max_seconds, every time."""
+
+    class TwoHz(Policy):
+        fps = 2
+
+        def select(self, obs, step, t):
+            return np.array(HOME) + np.array([0.02, 0, 0, 0, 0, 0, 0]) if step == 0 or kw else None
+
+    res = runner(arm, TwoHz(), max_seconds=0.8, stall_s=5, park=False, **kw).run()
+    assert res.reason == "max_seconds", res
+
+
+def test_no_park_holds(arm):
+    res = runner(arm, sine(), park=False).run()
+    assert res.reason == "max_seconds"
+    assert "/api/v1/motion/unload" not in arm.commands
+    assert arm.state == "Armed" and arm.is_torqued
+    assert not res.parked and "holding" in res.park_detail
+
+
+def test_torques_on_an_idle_arm(arm):
+    assert arm.state == "Idle"
+    runner(arm, sine(), max_seconds=0.2).run()
+    assert arm.commands[0] == "/api/v1/torque"
+
+
+# --------------------------------------------------------------------------- clipping
+
+
+def test_lead_clip_keeps_frames_near_the_measured_position(arm):
+    arm.servo_max_lead_rad = 0.05
+    res = runner(arm, SinePolicy(0, 0.5, 0.5), max_seconds=1.0, park=False).run()
+    assert res.reason == "max_seconds"
+    assert res.lead_clipped_frames > 0
+    assert res.lead_clips_per_joint[0] > 0 and sum(res.lead_clips_per_joint[1:]) == 0
+    # the runner clips against an observation up to one tick old; the fake moves 0.04 rad per tick
+    assert max(abs(t[0] - p[0]) for _, t, p in arm.servo_log) <= 0.05 + 0.045
+    assert arm.dropped_servo_frames == 0
+
+
+def test_joint_limit_clip_on_the_gripper(arm):
+    res = runner(arm, SinePolicy(6, 0.5, 1.0), max_seconds=0.6, park=False).run()
+    assert res.reason == "max_seconds", res
+    assert res.limit_clipped_frames > 0
+    assert max(t[6] for _, t, _ in arm.servo_log) <= LIMITS[6][1]
+    assert res.lead_clips_per_joint[6] == 0  # armd exempts the gripper from the lead cap
+
+
+# --------------------------------------------------------------------------- stop conditions
+
+
+def test_stop_on_fault_does_not_park(arm):
+    res = run_with(arm, sine(), lambda: arm.trigger_fault("FollowingError"), max_seconds=5)
+    assert res.reason == "fault" and res.detail == "FOLLOWING_ERROR"
+    assert not res.parked and "Fault" in res.park_detail
+    assert "/api/v1/motion/unload" not in arm.commands
+    assert res.duration_s < 2
+
+
+def test_stop_on_estop(arm):
+    res = run_with(arm, sine(), arm.do_estop, max_seconds=5)
+    assert res.reason == "estop" and not res.parked
+
+
+def test_stop_on_collision_hold(arm):
+    arm.collision_cfg["enabled"] = True
+    res = run_with(arm, sine(), lambda: arm.trip_collision(resume_after_s=5), max_seconds=5)
+    assert res.reason == "collision_hold"
+    assert not res.parked and "collision" in res.park_detail
+
+
+def test_stop_on_blocked_hold(arm):
+    def block():
+        arm.motion_limit = {"reason": "blocked", "joint": 1, "since_ms": 1}
+
+    res = run_with(arm, sine(), block, max_seconds=5)
+    assert res.reason == "blocked"
+
+
+def test_stop_on_lease_loss(arm):
+    other = {}
+
+    def preempt():
+        other["s"] = ArmSession(arm.client, client_id="cockpit", force=True).open()
+
+    res = run_with(arm, sine(), preempt, max_seconds=5)
+    other["s"].close()
+    assert res.reason == "lease_lost"
+    assert not res.parked and "lease" in res.park_detail
+
+
+def test_stop_on_servo_rejection_then_parks(arm):
+    def busy():
+        arm.motion_gate = lambda targets, servo=False: (409, "MOTION_BUSY") if servo else None
+
+    res = run_with(arm, sine(), busy, max_seconds=5)
+    assert res.reason == "servo_rejected" and "MOTION_BUSY" in res.detail
+    assert res.parked
+
+
+def test_stop_on_policy_stall(arm):
+    release = threading.Event()
+
+    class Slow(Policy):
+        def select(self, obs, step, t):
+            if step == 3:
+                release.wait(10)  # held until the runner has given up on it
+            return hold(obs)
+
+    try:
+        res = runner(arm, Slow(), max_seconds=5, stall_s=0.3).run()
+    finally:
+        release.set()
+    assert res.reason == "policy_stall"
+    assert res.parked
+
+
+def test_interrupt_during_torque_on_parks_and_releases(arm, monkeypatch):
+    real = ArmSession.torque
+
+    def torque_then_ctrl_c(self, enable):
+        real(self, enable)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(ArmSession, "torque", torque_then_ctrl_c)
+    res = runner(arm, sine(), max_seconds=5).run()
+    assert res.reason == "interrupted" and res.steps == 0 and arm.servo_log == []
+    assert res.parked, res
+    assert arm.commands[0] == "/api/v1/torque" and arm.commands[-1] == "/api/v1/motion/unload"
+    assert not arm.is_torqued and arm.lease is None
+
+
+def test_interrupt_before_torque_on_only_releases(arm, monkeypatch):
+    def ctrl_c(self):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(PolicyRunner, "_resolve_obs_age", ctrl_c)
+    arm.state, arm.is_torqued = "Armed", True  # nothing to switch on
+    res = runner(arm, sine(), max_seconds=5).run()
+    assert res.reason == "interrupted"
+    assert arm.commands == [] and arm.lease is None
+
+
+def test_cli_a_second_signal_during_cleanup_does_not_abort_stop_and_park(http_armd, capfd, monkeypatch):
+    """Ctrl-C mid-run, then Ctrl-C and SIGTERM again during motion/stop and unload: cleanup completes."""
+    if threading.current_thread() is not threading.main_thread():
+        pytest.skip("signals are delivered to the main thread")
+
+    class CtrlC(Policy):
+        def select(self, obs, step, t):
+            if step == 3:
+                os.kill(os.getpid(), signal.SIGINT)
+            return hold(obs)
+
+    def again(real, *sigs):
+        def wrapper(self, *a, **k):
+            for sig in sigs:
+                os.kill(os.getpid(), sig)  # the handler runs on this (main) thread before the call
+            return real(self, *a, **k)
+
+        return wrapper
+
+    monkeypatch.setattr(pr, "parse_policy", lambda *a, **k: CtrlC())
+    monkeypatch.setattr(ArmSession, "stop", again(ArmSession.stop, signal.SIGINT))
+    monkeypatch.setattr(ArmSession, "unload", again(ArmSession.unload, signal.SIGINT, signal.SIGTERM))
+    before = signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGTERM)
+    assert main(["--armd", http_armd.http_url, "--policy", "x", "--max-seconds", "10"]) == 130
+    out = capfd.readouterr()
+    assert "stopped: interrupted" in out.out and "parked" in out.out, out
+    assert "Traceback" not in out.err and out.err.count("finishing stop and park") == 3, out.err
+    assert http_armd.commands[-2:] == ["/api/v1/motion/stop", "/api/v1/motion/unload"]
+    assert not http_armd.is_torqued and http_armd.lease is None
+    assert (signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGTERM)) == before  # restored
+
+
+def test_cli_ctrl_c_before_the_run_returns_130(http_armd, capsys, monkeypatch):
+    def ctrl_c(self):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(PolicyRunner, "run", ctrl_c)
+    assert main(["--armd", http_armd.http_url, "--policy", "sine:1:0.05:1"]) == 130
+    assert "interrupted" in capsys.readouterr().err
+
+
+def test_stop_on_bad_action(arm):
+    class Short(Policy):
+        def select(self, obs, step, t):
+            return np.zeros(6)
+
+    res = runner(arm, Short(), max_seconds=5).run()
+    assert res.reason == "bad_action"
+
+
+def test_policy_exception_still_parks(arm):
+    class Boom(Policy):
+        def select(self, obs, step, t):
+            if step == 2:
+                raise RuntimeError("cuda out of memory")
+            return hold(obs)
+
+    res = runner(arm, Boom(), max_seconds=5).run()
+    assert res.reason == "error" and "cuda" in res.detail
+    assert res.parked
+
+
+def test_stale_camera_stops():
+    class Cam:
+        def latest(self):
+            return (time.monotonic() - 2.0, np.zeros((H, W, 3), np.uint8))
+
+    r = PolicyRunner(None, Img(), Cam())
+    assert r._camera_image(time.monotonic()) is None
+    assert r.result.reason == "camera_stale"
+
+
+def test_extra_inputs_match_the_recorder_features():
+    assert EXTRA_KEYS == {"observation.velocity": "velocities", "observation.effort": "torques"}
+    assert set(EXTRA_KEYS) == {key for key, _ in EXTRAS.values()}
+
+
+def test_image_policy_needs_a_camera():
+    with pytest.raises(RunnerError, match="camera"):
+        PolicyRunner(None, Img())
+
+
+# --------------------------------------------------------------------------- operator gate
+
+
+def test_real_follower_needs_the_operator_flag(arm, monkeypatch):
+    monkeypatch.setattr(arm.client, "get_safety_describe", lambda: {"device": {"follower": "rebot-dm"}})
+    with pytest.raises(RunnerError, match="i-am-at-the-arm"):
+        runner(arm, sine()).run()
+    assert arm.acquires == []  # refused before taking the lease
+    res = runner(arm, sine(), operator_present=True, max_seconds=0.2).run()
+    assert res.reason == "max_seconds" and res.follower == "rebot-dm"
+
+
+def test_unknown_follower_needs_the_operator_flag(armd):
+    armd.devplat = False  # no safety_describe -> follower unknown
+    with pytest.raises(RunnerError, match="unknown"):
+        runner(armd, sine()).run()
+
+
+def test_refuses_an_arm_in_fault(arm):
+    arm.trigger_fault("FollowingError")
+    with pytest.raises(RunnerError, match="Fault"):
+        runner(arm, sine()).run()
+    assert arm.servo_log == []
+
+
+# --------------------------------------------------------------------------- policy specs
+
+
+def home_dataset(root: Path, n: int = 45, hold: int = 15, ramp: float = 0.3, image: bool = True) -> np.ndarray:
+    """A recorder dataset at the fake's home pose: J1 ramps 0 -> ``ramp`` over ``n`` frames, then holds."""
+    rec = LeRobotRecorder(
+        root, "test/home", fps=FPS, camera_url=None, armd_host=None, task="pick the cup", with_camera=image
+    )
+    rec.start_episode(sample=False)
+    actions = []
+    for i in range(n + hold):
+        a = np.array(HOME)
+        a[0] = ramp * min(i, n) / n
+        state = a - 0.01 * (i < n)
+        img = np.full((H, W, 3), 16 + (i * 8) % 224, np.uint8) if image else None
+        rec.add_frame(state.tolist(), a.tolist(), img)
+        actions.append(a)
+    rec.stop_episode()
+    rec.save()
+    rec.close()
+    return np.array(actions)
+
+
+def test_parse_policy(tmp_path):
+    actions = home_dataset(tmp_path / "ds", image=False)
+    p = parse_policy(f"replay:{tmp_path / 'ds'}:0")
+    assert isinstance(p, ReplayPolicy) and p.fps == FPS
+    np.testing.assert_allclose(p.actions, actions, atol=1e-6)
+    assert isinstance(parse_policy(f"scripted:replay:{tmp_path / 'ds'}:0"), ReplayPolicy)
+    s = parse_policy("sine:gripper:0.2:2")
+    assert (s.joint, s.amp, s.period) == (6, 0.2, 2.0)
+    assert parse_policy("scripted:sine:2").joint == 1
+    with pytest.raises(RunnerError, match="episode 3"):
+        parse_policy(f"replay:{tmp_path / 'ds'}:3")
+    for bad in ("sine:9", "sine:1:2.0", "replay:x", "scripted:wave", "sin:1", "replay2:x:0", "Sine:1:0.1:2"):
+        with pytest.raises(ValueError):
+            parse_policy(bad)
+
+
+@pytest.mark.parametrize(
+    "data_path,match",
+    [
+        ("../outside/file-{file_index:03d}.parquet", "outside the dataset"),
+        ("/etc/{chunk_index}.parquet", "outside the dataset"),
+        ("data/{unknown}.parquet", "cannot be resolved"),
+        (None, "no data_path"),
+    ],
+)
+def test_replay_data_path_stays_inside_the_dataset(tmp_path, data_path, match):
+    home_dataset(tmp_path / "ds", image=False)
+    info_path = tmp_path / "ds" / "meta" / "info.json"
+    info = json.loads(info_path.read_text())
+    info["data_path"] = data_path
+    info_path.write_text(json.dumps(info))
+    with pytest.raises(RunnerError, match=match):
+        ReplayPolicy(tmp_path / "ds", 0)
+
+
+def test_unknown_prefix_is_not_sent_to_the_hub(monkeypatch):
+    loaded = []
+    monkeypatch.setattr(pr, "LeRobotPolicy", lambda spec, **kw: loaded.append(spec))
+    with pytest.raises(ValueError, match="unknown policy prefix"):
+        parse_policy("sin:1")
+    parse_policy("user/act_pick_cup")  # a Hub repo id still loads
+    assert loaded == ["user/act_pick_cup"]
+
+
+def test_pretrained_fps_from_train_config(tmp_path, monkeypatch):
+    model = tmp_path / "model"
+    model.mkdir()
+    assert pretrained_fps(model) is None  # no train_config.json
+    cfg = model / "train_config.json"
+    cfg.write_text(json.dumps({"env": {"fps": 15}, "dataset": {"repo_id": "test/home"}}))
+    assert pretrained_fps(model)[0] == 15
+    home_dataset(tmp_path / "ds", image=False)
+    cfg.write_text(json.dumps({"env": None, "dataset": {"repo_id": "test/home", "root": str(tmp_path / "ds")}}))
+    assert pretrained_fps(model) == (FPS, str(tmp_path / "ds" / "meta" / "info.json"))
+    monkeypatch.setenv("HF_LEROBOT_HOME", str(tmp_path / "cache"))
+    cfg.write_text(json.dumps({"env": None, "dataset": {"repo_id": "test/home", "root": None}}))
+    assert pretrained_fps(model) is None  # dataset not in the cache
+    (tmp_path / "cache" / "test").mkdir(parents=True)
+    (tmp_path / "ds").rename(tmp_path / "cache" / "test" / "home")
+    assert pretrained_fps(model)[0] == FPS
+
+
+@pytest.mark.parametrize(
+    "cfg,match",
+    [
+        ({"env": {"fps": 30.9}}, "whole number"),
+        ({"env": {"fps": float("inf")}}, "whole number"),
+        ({"env": {"fps": float("nan")}}, "whole number"),
+        ({"env": {"fps": 0}}, "whole number"),
+        ({"env": {"fps": "30"}}, "whole number"),
+        ({"env": {"fps": True}}, "whole number"),
+        ({"env": "pusht"}, "not a JSON object"),
+        ({"env": None, "dataset": [1]}, "not a JSON object"),
+        ({"dataset": {"root": 3}}, "not a string"),
+        ([1, 2], "not a JSON object"),
+    ],
+)
+def test_malformed_train_config_fps_is_refused(tmp_path, cfg, match):
+    (tmp_path / "train_config.json").write_text(json.dumps(cfg))  # json writes inf/nan as Infinity/NaN
+    with pytest.raises(ValueError, match=match):
+        pretrained_fps(tmp_path)
+
+
+def test_malformed_dataset_info_fps_is_refused(tmp_path):
+    (tmp_path / "ds" / "meta").mkdir(parents=True)
+    (tmp_path / "ds" / "meta" / "info.json").write_text(json.dumps({"fps": 29.97}))
+    (tmp_path / "train_config.json").write_text(json.dumps({"dataset": {"root": str(tmp_path / "ds")}}))
+    with pytest.raises(ValueError, match="29.97"):
+        pretrained_fps(tmp_path)
+    assert pretrained_fps(tmp_path / "ds") is None  # no train_config.json at all
+
+
+def test_unknown_policy_fps_names_the_problem():
+    class Unknown(Policy):
+        fps, fps_problem = None, "train_config.json env fps 30.9 is not a whole number > 0"
+
+    with pytest.raises(ValueError, match=r"30.9 .*pass --fps"):
+        PolicyRunner(None, Unknown())
+
+
+def test_unknown_policy_fps_needs_an_explicit_fps():
+    class Unknown(Policy):
+        fps = None
+
+    with pytest.raises(ValueError, match="--fps"):
+        PolicyRunner(None, Unknown())
+    assert PolicyRunner(None, Unknown(), fps=15).fps == 15
+
+
+def test_replay_round_trip(arm, tmp_path):
+    """Recorder dataset -> replay through armd -> recorder observes the arm -> same trajectory."""
+    actions = home_dataset(tmp_path / "a")
+    rec = LeRobotRecorder(tmp_path / "b", "test/b", fps=FPS, camera_url=None, armd_host=arm.url, task="t")
+    with rec:
+        rec.start_episode()
+        res = runner(arm, ReplayPolicy(tmp_path / "a", 0), max_seconds=10, park=False).run()
+        # the recorder samples the held arm for a few more ticks after the run
+        n = len(rec._ep.state)
+        wait_until(lambda: len(rec._ep.state) >= n + 3)
+        rec.stop_episode()
+        rec.save()
+    assert res.reason == "policy_done" and res.steps == len(actions)
+    assert res.lead_clipped_frames == 0 and arm.dropped_servo_frames == 0
+    import pyarrow.parquet as pq
+
+    state = np.array(pq.read_table(tmp_path / "b/data/chunk-000/file-000.parquet").to_pydict()["observation.state"])
+    j1 = state[:, 0]
+    assert j1[-1] == pytest.approx(actions[-1, 0], abs=0.01)
+    assert j1.max() == pytest.approx(actions[:, 0].max(), abs=0.01)
+    np.testing.assert_allclose(state[-1, 1:], actions[-1, 1:], atol=1e-3)
+    # the arm follows the ramp: halfway through the replay J1 is near the middle of the ramp
+    mid = np.argmin(np.abs(j1 - 0.15))
+    assert 0.1 < mid / len(j1) < 0.9
+
+
+# --------------------------------------------------------------------------- CLI over real HTTP
+
+
+@pytest.fixture
+def http_armd(arm):
+    """The fake armd on one port for WS and REST GETs (the CLI and subprocesses use real HTTP)."""
+
+    def process_request(conn, request):
+        if request.headers.get("Upgrade", "").lower() == "websocket":
+            return None
+        res = arm.rest(Request("GET", f"http://h{request.path}", None, dict(request.headers.raw_items())))
+        return conn.respond(res.status, res.body.decode() if res.body else "")
+
+    server = serve(arm.handler, "127.0.0.1", 0, process_request=process_request)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    arm.http_url = f"http://127.0.0.1:{server.socket.getsockname()[1]}"
+    yield arm
+    server.shutdown()
+
+
+def test_cli_sine(http_armd, tmp_path, capsys):
+    log_path = tmp_path / "run.jsonl"
+    argv = ["--armd", http_armd.http_url, "--policy", "sine:1:0.05:1", "--max-steps", "15", "--log", str(log_path)]
+    assert main(argv) == 0
+    out = capsys.readouterr().out
+    assert "stopped: max_steps" in out and "parked" in out
+    lines = [json.loads(x) for x in log_path.read_text().splitlines()]
+    assert lines[-1]["summary"]["steps"] == 15
+    assert [x["step"] for x in lines[:-1]] == list(range(15))
+
+
+def test_cli_rejects_without_camera(http_armd, capsys, monkeypatch):
+    monkeypatch.setattr(pr, "parse_policy", lambda *a, **k: Img())
+    assert main(["--armd", http_armd.http_url, "--policy", "x"]) == 1
+    assert "--camera" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------- learned policy (lerobot)
+
+
+@pytest.fixture
+def camera_server():
+    """reCamera-style H.264 stream (Annex-B access unit + 8-byte unix-ms tail per message) at 30 fps."""
+    from test_lerobot_recorder import h264_aus
+
+    aus = h264_aus(90)
+    done = threading.Event()
+
+    def handler(ws):
+        i = 0
+        try:
+            while not done.wait(1 / FPS if i else 0):  # paced at FPS, ends with the fixture
+                ws.send(aus[i % len(aus)] + int(time.time() * 1000).to_bytes(8, "little"))
+                i += 1
+        except ConnectionClosed:
+            pass
+
+    server = serve(handler, "127.0.0.1", 0)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    yield f"ws://127.0.0.1:{server.socket.getsockname()[1]}/"
+    done.set()
+    server.shutdown()
+
+
+BUILD_ACT = r"""
+import sys
+from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
+from lerobot.policies.act.configuration_act import ACTConfig
+from lerobot.policies.factory import make_policy, make_pre_post_processors
+root, out = sys.argv[1], sys.argv[2]
+meta = LeRobotDatasetMetadata("test/home", root=root)
+cfg = ACTConfig(device="cpu", chunk_size=10, n_action_steps=10, dim_model=32, dim_feedforward=64, n_heads=2,
+                n_encoder_layers=1, n_decoder_layers=1, n_vae_encoder_layers=1, pretrained_backbone_weights=None,
+                push_to_hub=False)
+policy = make_policy(cfg, ds_meta=meta)
+pre, post = make_pre_post_processors(cfg, dataset_stats=meta.stats)
+for obj in (policy, pre, post):
+    obj.save_pretrained(out)
+print("ok")
+"""
+
+
+def lerobot_python() -> str | None:
+    try:
+        import lerobot.datasets  # noqa: F401  (lerobot[dataset])
+        import scipy  # noqa: F401
+
+        return sys.executable
+    except ImportError:
+        return os.environ.get("REBOT_LEROBOT_PYTHON") or None
+
+
+def test_act_policy_runs_10_steps(http_armd, camera_server, tmp_path):
+    python = lerobot_python()
+    if python is None:
+        pytest.skip(
+            "lerobot not importable (needs Python >= 3.12 and torch). Set REBOT_LEROBOT_PYTHON to a venv python "
+            "with lerobot[dataset] 0.6.1 or 0.7.0, PyAV, pyarrow and scipy"
+        )
+    home_dataset(tmp_path / "ds")
+    env = {**os.environ, "HF_HUB_OFFLINE": "1", "PYTHONPATH": str(REPO)}
+    res = subprocess.run(
+        [python, "-c", BUILD_ACT, str(tmp_path / "ds"), str(tmp_path / "act")],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        env=env,
+    )
+    assert res.returncode == 0, res.stderr[-3000:]
+    log_path = tmp_path / "act.jsonl"
+    cmd = [python, "-m", "rebot_companion.policy_runner", "--armd", http_armd.http_url, "--camera", camera_server]
+    # end on the step count, not a wall-clock window: a late step (ACT chunk inference) re-anchors the
+    # schedule and would leave fewer than 10 steps in a 10-period max_seconds
+    cmd += ["--policy", str(tmp_path / "act"), "--fps", str(FPS), "--max-steps", "10", "--max-seconds", "30"]
+    cmd += ["--device", "cpu", "--task", "pick the cup", "--log", str(log_path)]
+    res = subprocess.run(cmd, capture_output=True, text=True, timeout=300, env=env)
+    print(res.stdout)
+    assert res.returncode == 0, res.stdout[-2000:] + res.stderr[-3000:]
+    lines = [json.loads(x) for x in log_path.read_text().splitlines()]
+    summary = lines[-1]["summary"]
+    assert summary["reason"] == "max_steps" and summary["steps"] == 10, summary
+    assert summary["policy"].startswith("lerobot:act:")
+    assert summary["frames"] > 0 and summary["parked"]
+    steps = lines[:-1]
+    assert len(steps) == 10 and all(len(s["action"]) == 7 for s in steps)
+    assert all(s["camera_age_ms"] is not None for s in steps)
+    assert "from local directory" in res.stdout
+    assert "camera observation.images.recamera (48, 64)" in res.stdout
+    assert_in_order(http_armd)
+    assert http_armd.dropped_servo_frames == 0
+
+
+# --------------------------------------------------------------------------- sender unit tests (stub session)
+
+
+def obs_status(positions=None, state="Moving"):
+    return ArmStatus.from_dict(
+        {
+            "positions": list(HOME if positions is None else positions),
+            "safety_state": state,
+            "is_torqued": True,
+            "epoch_id": 1,
+        }
+    )
+
+
+class StubSession:
+    """Synchronous stand-in for ArmSession: the sender loop runs in the test thread."""
+
+    lease_lost = None
+    has_lease = True
+
+    def __init__(self, runner, obs=None, age=0.0, on_obs=None, max_frames=5):
+        self.runner, self.obs, self.age, self.on_obs = runner, obs or obs_status(), age, on_obs
+        self.max_frames = max_frames
+        self.sent: list[list[float]] = []
+        self.reads = 0
+
+    def latest_observation_timed(self):
+        self.reads += 1
+        if self.on_obs is not None:
+            self.on_obs(self)
+        return (time.monotonic() - self.age, self.obs)
+
+    def latest_observation(self):
+        return self.obs
+
+    def servo(self, positions):
+        self.sent.append(list(positions))
+        if len(self.sent) >= self.max_frames:
+            self.runner.request_stop("test_done")
+
+
+def stub_runner(policy=None, **kw):
+    r = PolicyRunner(None, policy or sine(), **kw)
+    r.limits = list(LIMITS)
+    r.result.lead_clips_per_joint = [0] * 7
+    home = np.array(HOME)
+    now = time.monotonic()
+    r._segment = _Segment(home, home, now, 0.0)
+    r._last_sent = home.copy()
+    r._last_target_t = now + 3600  # no stall
+    r._deadline = now + 3600
+    return r
+
+
+def test_no_servo_frame_after_a_stop_requested_during_the_tick():
+    """A stop that arrives after the loop-boundary check (here: while reading telemetry) sends no frame."""
+    r = stub_runner()
+    r.session = StubSession(r, on_obs=lambda s: r.request_stop("fault", "injected"))
+    r._send_loop()
+    assert r.session.sent == []
+    assert r.result.reason == "fault"
+
+
+def test_request_stop_sets_the_event_before_anything_else(monkeypatch):
+    r = stub_runner()
+    seen = {}
+
+    def spy(*a, **k):
+        seen["stop_set"] = r._stop.is_set()
+
+    monkeypatch.setattr(pr.log, "warning", spy)
+    r.request_stop("fault", "x")
+    assert seen["stop_set"] is True
+
+
+def test_a_hung_sender_fails_closed_with_e_stop():
+    """If the sender does not end within sender_join_s (a send stuck in the socket), the runner e-stops over REST."""
+    r = stub_runner(send_timeout_s=0.02, sender_join_s=0.05)
+    release = threading.Event()
+    r._sender = threading.Thread(target=release.wait, daemon=True)
+    r._sender.start()
+    r.client = EStopClient()
+    r.session = StubSession(r)
+    try:
+        assert r._stop_sender() is False
+    finally:
+        release.set()
+    assert r.client.calls == ["e_stop"]
+    assert "sender" in r.result.park_detail
+
+
+def test_request_stop_does_not_wait_forever_for_a_stuck_send():
+    r = stub_runner(send_timeout_s=0.02, sender_join_s=0.05)
+    held, release = threading.Event(), threading.Event()
+
+    def stuck():
+        with r._send_lock:
+            held.set()
+            release.wait()
+
+    t = threading.Thread(target=stuck, daemon=True)
+    t.start()
+    held.wait()
+    try:
+        r.request_stop("fault", "x")  # returns after sender_join_s instead of blocking
+        assert r._stop.is_set() and r.result.reason == "fault"
+    finally:
+        release.set()
+
+
+# --------------------------------------------------------------------------- timing bounds
+
+
+@pytest.mark.parametrize("name", ["fps", "servo_hz", "max_seconds", "stall_s", "max_frame_age_s"])
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), 0, -1])
+def test_timing_parameters_must_be_finite_and_positive(name, value):
+    with pytest.raises(ValueError, match=name):
+        PolicyRunner(None, sine(), **{name: value})
+
+
+def test_the_sender_enforces_the_deadline():
+    r = stub_runner()
+    r._deadline = time.monotonic() - 1e-3
+    r.session = StubSession(r)
+    r._send_loop()
+    assert r.session.sent == [] and r.result.reason == "max_seconds"
+
+
+def test_max_seconds_holds_while_inference_blocks(arm):
+    """Inference that blocks past the deadline does not extend the stream: the sender stops on time."""
+    holder = {}
+
+    class Blocking(Policy):
+        def select(self, obs, step, t):
+            if step == 1:
+                holder["r"]._stop.wait(5.0)  # released by the sender's deadline stop
+            return hold(obs)
+
+    r = runner(arm, Blocking(), max_seconds=0.1, stall_s=10, park=False)
+    holder["r"] = r
+    res = r.run()
+    assert res.reason == "max_seconds", res
+    assert res.steps <= 1  # step 1 never returned
+    assert res.frames <= 0.1 * 50 + 2  # no frame after the deadline
+    # bounded by the deadline plus the sender join, not by the 5 s the inference would block
+    assert res.duration_s < 0.1 + r.sender_join_s
+
+
+# --------------------------------------------------------------------------- telemetry checks
+
+
+def test_stale_telemetry_stops_the_sender():
+    r = stub_runner()
+    r.session = StubSession(r, age=0.2)  # newest observation received 200 ms ago
+    r._send_loop()
+    assert r.session.sent == [] and r.result.reason == "stale_observation"
+
+
+@pytest.mark.parametrize("positions", [[float("nan")] + HOME[1:], HOME[:6], [float("inf")] * 7])
+def test_malformed_telemetry_stops_the_sender(positions):
+    r = stub_runner()
+    r.session = StubSession(r, obs=obs_status(positions))
+    r._send_loop()
+    assert r.session.sent == [] and r.result.reason == "bad_observation"
+
+
+def test_max_steps_ends_the_run_after_that_many_steps(arm):
+    res = runner(arm, sine(), max_seconds=30, max_steps=4, park=False).run()
+    assert res.reason == "max_steps" and res.ok and res.steps == 4, res
+
+
+@pytest.mark.parametrize("value", [0, -1, 1.5, True])
+def test_max_steps_is_validated(value):
+    with pytest.raises(ValueError, match="max_steps"):
+        PolicyRunner(None, sine(), max_steps=value)
+
+
+@pytest.mark.parametrize("value", [float("nan"), 0, -0.1])
+def test_max_obs_age_is_validated(value):
+    with pytest.raises(ValueError, match="max_obs_age_s"):
+        PolicyRunner(None, sine(), max_obs_age_s=value)
+
+
+def test_fresh_telemetry_keeps_streaming():
+    r = stub_runner()
+    r.session = StubSession(r, max_frames=3)
+    r._send_loop()
+    assert len(r.session.sent) == 3 and r.result.reason == "test_done"
+
+
+# --------------------------------------------------------------------------- interpolation start
+
+
+def test_a_new_segment_starts_from_the_last_sent_frame():
+    """After lead clipping the last sent frame lags the nominal path; the next segment starts there,
+    not at the nominal point, so it does not keep pushing toward the old target."""
+    r = stub_runner()
+    home = np.array(HOME)
+    old_target = home.copy()
+    old_target[0] = 1.0
+    r._segment = _Segment(home, old_target, time.monotonic() - 1.0, 0.1)  # nominal point: 1.0 rad
+    sent = home.copy()
+    sent[0] = 0.19  # what the lead clip let through
+    r._last_sent = sent
+    new_target = home.copy()
+    new_target[0] = 0.2
+    r._publish(new_target)
+    np.testing.assert_allclose(r._segment.start, sent)
+    frames = [r._segment.at(r._segment.t0 + f * r._segment.duration) for f in np.linspace(0, 1, 6)]
+    assert all(0.19 - 1e-9 <= f[0] <= 0.2 + 1e-9 for f in frames)
+
+
+def test_the_first_segment_starts_from_the_measured_position(arm):
+    """Before any frame is sent the reference is the measured position."""
+    arm.positions = list(HOME)
+    arm.positions[0] = 0.05
+    r = runner(arm, sine(), max_seconds=0.05, park=False)
+    r.run()
+    first = arm.servo_log[0][1]
+    assert first[0] == pytest.approx(0.05, abs=0.02)
+
+
+# --------------------------------------------------------------------------- limits and lead together
+
+
+def test_lead_clip_cannot_push_a_frame_past_the_joint_limit():
+    """Measured J1 beyond its limit by more than the lead: [limit] and [measured +- lead] do not overlap,
+    so no frame is sent (the old order clipped to the limit, then the lead clip moved it back out)."""
+    r = stub_runner()
+    pos = list(HOME)
+    pos[0] = LIMITS[0][1] + 0.3
+    r.session = StubSession(r, obs=obs_status(pos))
+    r._send_loop()
+    assert r.session.sent == []
+    assert r.result.reason == "outside_limits"
+
+
+def test_frames_stay_in_the_intersection_of_limit_and_lead():
+    r = stub_runner()
+    pos = list(HOME)
+    pos[0] = LIMITS[0][1] + 0.1  # beyond the limit, but within the lead of it
+    r.session = StubSession(r, obs=obs_status(pos), max_frames=2)
+    r._send_loop()
+    lead = r.lead * 0.95
+    for f in r.session.sent:
+        assert pos[0] - lead - 1e-9 <= f[0] <= LIMITS[0][1]
+
+
+@pytest.mark.parametrize(
+    "limits",
+    [
+        LIMITS[:6],
+        [(float("nan"), 1.0)] + LIMITS[1:],
+        [(1.0, -1.0)] + LIMITS[1:],
+        [(-1.0, float("inf"))] + LIMITS[1:],
+    ],
+)
+def test_bad_schema_limits_are_refused_before_torque(arm, monkeypatch, limits):
+    import fake_armd
+
+    monkeypatch.setattr(fake_armd, "LIMITS", limits)
+    with pytest.raises(RunnerError, match="limits"):
+        runner(arm, sine()).run()
+    assert arm.commands == [] and arm.acquires == []
+
+
+def test_stop_reaches_the_e_stop_within_its_bound_while_a_send_is_stuck():
+    """The real sender stuck inside servo() (holding whatever locks it holds while sending): request_stop,
+    _publish and _stop_sender all return within their bounds and the REST e-stop goes out."""
+    r = stub_runner(send_timeout_s=0.02, sender_join_s=0.05)
+    entered, release = threading.Event(), threading.Event()
+
+    class Stuck(StubSession):
+        def servo(self, positions):
+            entered.set()
+            release.wait()
+
+    r.session, r.client = Stuck(r), EStopClient()
+    r._sender = threading.Thread(target=r._send_loop, daemon=True)
+    r._sender.start()
+    assert entered.wait(5)
+    done = threading.Event()
+
+    def stopper():
+        r._publish(np.array(HOME))  # the policy thread must not block on the stuck send either
+        r.request_stop("fault", "x")
+        r._stop_sender()
+        done.set()
+
+    threading.Thread(target=stopper, daemon=True).start()
+    try:
+        assert done.wait(1.0), "request_stop/_stop_sender blocked behind the stuck send"
+        assert r.client.calls == ["e_stop"] and r.result.reason == "fault"
+    finally:
+        release.set()
+
+
+# --------------------------------------------------------------------------- blocked inference
+
+
+@pytest.mark.parametrize(
+    "kw,reason",
+    [({"max_seconds": 0.3, "stall_s": 10}, "max_seconds"), ({"max_seconds": 10, "stall_s": 0.3}, "policy_stall")],
+)
+def test_inference_that_never_returns_still_stops_parks_and_releases(arm, kw, reason):
+    never = threading.Event()
+
+    class Forever(Policy):
+        def select(self, obs, step, t):
+            if step == 2:
+                never.wait()  # blocks until the test ends
+            return hold(obs)
+
+    out = {}
+    t = threading.Thread(target=lambda: out.setdefault("res", runner(arm, Forever(), **kw).run()), daemon=True)
+    t.start()
+    t.join(5.0)
+    never.set()
+    assert not t.is_alive(), "run() blocked behind the policy's inference"
+    res = out["res"]
+    assert res.reason == reason and res.parked, res
+    assert res.duration_s < 0.3 + 1.0
+    assert "/api/v1/motion/unload" in arm.commands and arm.lease is None
+
+
+def test_the_inference_thread_ends_with_the_run_and_a_runner_runs_once(arm):
+    policy = sine()
+    r = runner(arm, policy, max_steps=3, park=False)
+    assert r.run().reason == "max_steps"
+    t = policy._inference_thread
+    assert t is not None and not t.is_alive()  # joined: the thread no longer holds the policy
+    with pytest.raises(RunnerError, match="runs once"):
+        r.run()
+    assert runner(arm, policy, max_steps=3, park=False).run().reason == "max_steps"  # a new runner may reuse it
+
+
+def test_a_policy_with_an_abandoned_inference_is_not_reused(arm):
+    never = threading.Event()
+
+    class Forever(Policy):
+        def select(self, obs, step, t):
+            if step == 2:
+                never.wait(10)
+            return hold(obs)
+
+    policy = Forever()
+    try:
+        assert runner(arm, policy, max_seconds=10, stall_s=0.3).run().reason == "policy_stall"
+        t = policy._inference_thread
+        assert t.is_alive()  # still inside select
+        with pytest.raises(RunnerError, match="abandoned"):
+            runner(arm, policy, max_seconds=0.2).run()
+    finally:
+        never.set()
+    t.join(5)
+    assert not t.is_alive()  # the queued sentinel ends it once select returns
+    assert runner(arm, policy, max_seconds=0.2, park=False).run().reason == "max_seconds"
+
+
+@pytest.mark.parametrize("join", [0.5, 1.0, 1.49, float("nan")])
+def test_sender_join_must_exceed_the_send_timeout(join):
+    with pytest.raises(ValueError, match="sender_join_s"):
+        PolicyRunner(None, sine(), sender_join_s=join)  # default send timeout 1 s
+    PolicyRunner(None, sine(), sender_join_s=1.5)
+    PolicyRunner(None, sine(), send_timeout_s=0.02, sender_join_s=0.05)
+
+
+# --------------------------------------------------------------------------- observation rate
+
+
+def test_low_rate_telemetry_does_not_trip_the_default_age_check(arm):
+    arm.obs_hz_cap = 5  # armd sends 5 observations per second
+    r = runner(arm, sine(), max_seconds=1.0, park=False)
+    res = r.run()
+    assert res.reason == "max_seconds", res
+    assert r.max_obs_age_s >= 3 / 5 - 1e-6
+
+
+def test_an_explicit_obs_age_still_applies_to_low_rate_telemetry(arm):
+    arm.obs_hz_cap = 5
+    res = runner(arm, sine(), max_seconds=2.0, park=False, max_obs_age_s=0.05).run()
+    assert res.reason == "stale_observation"

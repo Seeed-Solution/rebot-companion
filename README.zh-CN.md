@@ -54,6 +54,7 @@
 - [手眼标定](#手眼标定)
 - [相机内参](#相机内参)
 - [录制 LeRobot 数据集](#录制-lerobot-数据集)
+- [运行学习策略](#运行学习策略)
 - [示例](#示例)
 - [安全](#安全)
 - [开发](#开发)
@@ -136,6 +137,7 @@ uv sync                      # 仅 SDK
 uv sync --extra agent        # + MCP 服务器：mcp 2.x、av、pillow
 uv sync --extra calib        # + OpenCV，用于 tools/calibrate_intrinsics.py
 uv sync --extra record       # + PyAV、pyarrow，用于 rebot-record
+uv sync --extra policy       # + PyAV、pyarrow，用于 rebot-policy（学习策略见“运行学习策略”）
 uv sync --all-extras         # 全部（开发用）
 ```
 
@@ -144,6 +146,7 @@ uv sync --all-extras         # 全部（开发用）
 | `agent` | `mcp>=2.3,<3`、`av>=12`、`pillow>=10` | `rebot-mcp`、PyAV 解码快照、带检测框的快照 |
 | `calib` | `opencv-python-headless>=4.8,<5` | 相机内参工具 |
 | `record` | `av>=12`、`pyarrow>=14` | `rebot-record`（LeRobot 数据集录制） |
+| `policy` | `av>=12`、`pyarrow>=14` | `rebot-policy`（相机、脚本策略）；torch 和 lerobot 需另行安装 |
 
 测试在 `uv.lock` 锁定的版本上运行（例如 mcp 2.3.0）。
 
@@ -286,6 +289,7 @@ rebot-companion/
 │   ├── camera_client.py        # reCamera rebot-vision / aruco-detector 客户端（触发 / 最新结果）
 │   ├── snapshot.py             # 从 H.264 流截取 JPEG 快照 + 检测框叠加
 │   ├── lerobot_recorder.py     # LeRobot v3.0 数据集录制（rebot-record）
+│   ├── policy_runner.py        # LeRobot / 脚本策略 -> armd servo 流（rebot-policy）
 │   ├── mcp_server.py           # stdio MCP 服务器（rebot-mcp）
 │   ├── kinematics.py           # B601-DM FK（完整 URDF 链）与平面 FK/IK（Web 驾驶舱移植）
 │   ├── ik.py                   # IK 适配器：基座系位姿 -> armd 7 关节向量（含夹爪）
@@ -672,6 +676,78 @@ Python API：`LeRobotRecorder(root, repo_id, fps=30, camera_url=..., armd_host=.
 CLI。`LeRobotDataset(repo_id, root=...)` 能加载结果并读出图像、动作和任务：lerobot 0.6.1（PyAV
 解码）和 0.7.0（torchcodec 解码），Linux aarch64。该测试在 `REBOT_LEROBOT_PYTHON` 指向装有
 `lerobot[dataset]` 的 Python 时运行，否则跳过。尚未在真实 armd 和 reCamera 上运行。
+
+---
+
+## 运行学习策略
+
+`rebot-policy` 在上位机（学习策略用 GPU 主机）上运行策略，通过 armd 的 servo 流驱动机械臂。armd 的
+servo 保护（限速、领先量上限、受阻保持）、碰撞保护和故障处理与其他客户端相同。
+
+```bash
+# 脚本策略，不需要 torch：回放录制的 episode，或在单个关节上做小幅正弦运动
+uv run --extra policy rebot-policy --armd 127.0.0.1 --policy replay:$HOME/.cache/huggingface/lerobot/user/pick_cup:0
+uv run --extra policy rebot-policy --armd 127.0.0.1 --policy sine:1:0.05:4 --max-seconds 20
+# LeRobot 策略（lerobot-train 保存的本地目录或 Hub repo id），真实机械臂；
+# torch + lerobot 仅为本次运行加入，使用 Python 3.12 环境
+uv run --python 3.12 --extra policy --with 'lerobot[dataset]>=0.6.1,<0.8' rebot-policy \
+  --armd 192.168.16.1 --camera 192.168.16.1 --policy outputs/train/act/checkpoints/last/pretrained_model \
+  --fps 30 --max-seconds 60 --task "pick the cup" --i-am-at-the-arm --log run.jsonl
+```
+
+torch 和 lerobot（0.6.1 或 0.7.0，Python >= 3.12，数 GB）不是 rebot-companion 的依赖。可以像上面那样用
+`uv run --with` 按次加入（在本仓库内 `--python 3.12` 会让项目环境改用 Python 3.12），也可以把
+rebot-companion 安装到已装有 lerobot 的 Python 环境（例如训练环境）。运行器只在使用学习策略时导入它们。
+
+| 选项 | 含义 |
+|---|---|
+| `--policy` | LeRobot 预训练目录或 Hub repo id；`replay:<数据集根目录>:<episode>`（该 episode 的 `action` 列）；`sine:<关节>:<振幅 rad>:<周期 s>`（关节 1..7 或关节名，振幅 <= 0.5 rad）；可加 `scripted:` 前缀；其他 `<词>:` 前缀会被拒绝（不当作 Hub repo id 查找）。运行时输出学习策略来自本地目录还是 Hub |
+| `--fps` | 每秒策略步数。默认：`replay` 取数据集 fps；学习策略取其 `train_config.json` 中的 fps（`env.fps`、`dataset.fps`，否则读训练数据集的 `meta/info.json`，路径为 `dataset.root` 或 `$HF_LEROBOT_HOME/<dataset.repo_id>`），都找不到时必须传 `--fps`；`sine` 为 30。传入的 `--fps` 与其不同时输出警告 |
+| `--servo-hz` | servo 帧率（默认 50，即 armd 控制频率） |
+| `--max-seconds` | 运行时长（默认 60） |
+| `--max-steps` | 运行这么多个策略步后停止（默认不限） |
+| `--task` | 传给策略的任务文本（语言条件策略） |
+| `--device` | torch 设备（默认有 CUDA 时用 `cuda`，否则 `cpu`） |
+| `--no-park` | 结束时保持位置，不停靠 |
+| `--stall-s`、`--max-frame-age`、`--max-obs-age` | 策略超过该时长没有给出目标（默认 1 s）、最新相机帧超过该时长（默认 0.5 s），或最新 armd 观测超过该时长（默认 max(0.1 s, 3 个观测周期)，观测频率取请求的 50 Hz、`timing.control_hz` 和启动时实测频率中的最小值；每个 servo 帧和策略步前检查）时停止 |
+| `--log` | 每步一行 JSON（观测延迟、相机延迟、推理 ms、步延迟、动作、状态），最后一行为汇总 |
+| `--i-am-at-the-arm` | armd 的 follower（`GET /api/v1/safety/describe` 的 `device.follower`）不是 `mock` 或 `sim`、或无法读取时必须加 |
+
+schema 没有给出 7 个有限且 min < max 的关节限位时，运行器在获取租约前拒绝运行。
+
+观测与 `rebot-record` 写入的一行相同：`observation.state` = armd `positions`（7，float32）；策略有
+`observation.velocity` / `observation.effort` 输入时取 `velocities` / `torques`；策略唯一的图像输入
+（例如 `observation.images.recamera`）= 最新解码的 reCamera 帧，RGB uint8，用 PyAV 缩放到策略输入的
+高和宽（录制器编码前用同一个 PyAV 调用缩放）。动作（7）是关节目标，即录制时的 `commanded_positions`。
+学习策略用 lerobot 的 `PreTrainedConfig.from_pretrained`、`get_policy_class(type).from_pretrained`
+和保存的前/后处理器（`make_pre_post_processors`）加载，每步调用 `predict_action`（每步一个动作；ACT
+类策略返回其动作块中的下一个动作）。有多个相机或其他输入的策略会被拒绝。
+
+时序：策略步按 `--fps` 运行；推理在工作线程中执行，主循环最多等到截止时间或 `--stall-s`，之后停止、停靠并
+释放租约（不返回的调用被放弃；预热调用最长 120 s）。发送线程按 `--servo-hz` 发送 servo 帧：每个新目标在一个策略周期内
+从上一个实际发送的帧（裁剪后；首帧前为实测位置）线性插值到达，之后保持。策略结束时（回放结束、`--max-steps`）继续发送，直到最后一段到达目标后再保持一个策略周期，然后停止。保持期间仍检查相机帧新鲜度（`camera_stale`）；保持期间到达 `--max-seconds` 时以 `max_seconds` 结束。
+每帧按关节裁剪到关节限位与（关节 1..6）实测位置 ± 0.95 ×
+`servo_max_lead_rad`（armd schema，默认 0.2 rad）；汇总按关节统计被裁剪的帧数，并统计 armd 报告的
+`observation.motion_limit` 原因。迟到超过一个周期的步会被计数，调度从该步重新开始（不会连续补发）。
+学习策略在开始发送前先做一次预热推理。`--max-seconds` 是从开始发送算起的绝对截止时间，发送线程在每帧前
+检查，推理变慢不会延长运行。时序参数必须是有限值且 > 0。
+
+停止条件：关节实测位置超出限位过多以致交集为空、armd 观测过旧或格式错误（不是 7 个有限值位置）、急停、Fault、碰撞保持、servo `blocked` 保持、力矩关闭、租约丢失、servo 被拒（如
+`MOTION_BUSY`）、连接断开、策略停滞、相机帧过旧、动作非有限值或长度不对、策略异常、回放的 episode
+结束、`--max-steps`、`--max-seconds`、Ctrl+C 或 SIGTERM。之后结束 servo 流，机械臂保持（`motion/stop`）并停靠
+（`unload`），`--no-park` 时不停靠；Fault、急停、碰撞保持或租约丢失后不停靠（汇总写明原因）。请求停止后不再发送 servo 帧；每次 socket 发送最长 1 s。停止 2 s 后（`sender_join_s`，至少为发送超时的 1.5 倍）发送线程仍未结束时，运行器
+发送无需租约的 REST 急停且不停靠。准备阶段（上力矩、预热）在已发送上力矩命令后按 Ctrl+C，同样停止并停靠；在此之前只释放租约。停止开始后，再次 Ctrl+C / SIGTERM 会被忽略（输出提示），直到停止、急停和停靠完成。运行器不会
+清除故障。退出码：`max_seconds`、`max_steps` 或回放结束为 0，Ctrl+C 为 130，其余为 1。Python API：
+`PolicyRunner(ArmdClient(url), parse_policy(spec), camera).run()` 返回 `RunResult`；一个运行器只能运行一次，上一次运行因停滞或截止时间放弃的推理尚未返回时，该策略对象会被拒绝。
+
+已验证（`tests/test_policy_runner.py`，fake armd）：servo 帧按顺序以约 50 Hz 到达且无丢帧；策略步之间的插值；
+领先量裁剪（帧与实测位置的距离在领先量内）和关节限位裁剪；故障、急停、碰撞保持、受阻保持、租约被抢占、
+servo 被拒、策略停滞、错误动作和策略异常时停止；结束时停靠与 `--no-park`；非 mock follower 的操作员标志；
+回放往返（录制器数据集 -> 通过 fake armd 回放 -> 第二次录制观测到相同轨迹）；通过 HTTP 的 CLI。一个随机
+初始化的 ACT 策略（lerobot 0.7.0，按录制器的合成特征构建：7 关节状态与动作、一个 64x48 相机）以 reCamera
+格式的 H.264 WebSocket 流为图像输入运行 10 步；该测试在 lerobot 可导入或
+`REBOT_LEROBOT_PYTHON` 指向装有 `lerobot[dataset]`、PyAV、pyarrow 和 scipy 的 Python 时运行，否则跳过。
+相同的 lerobot 调用在 0.6.1 中也存在（读过源码，未运行）。尚未在真实 armd、仿真器或训练过的策略上运行。
 
 ---
 

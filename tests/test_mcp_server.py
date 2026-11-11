@@ -237,10 +237,19 @@ async def test_e_stop_without_lease(armd, make_ctrl):
 
 @pytest.mark.asyncio
 async def test_allow_clear_fault_flag_exposes_the_tool(armd, make_ctrl):
-    async with Client(build_server(make_ctrl(), allow_clear_fault=True)) as c:
+    ctrl = make_ctrl()
+    async with Client(build_server(ctrl, allow_clear_fault=True)) as c:
         assert "clear_fault" in {t.name for t in (await c.list_tools()).tools}
         assert not (await c.call_tool("e_stop", {})).is_error
-        assert body(await c.call_tool("clear_fault", {}))["safety_state"] == "Idle"
+        # e_stop goes out on the WebSocket and over REST, and each path advances armd's epoch.
+        # clear_fault carries the epoch of the latest observation, so it must not run before an
+        # observation after both paths has arrived (otherwise armd answers EPOCH_MISMATCH, by
+        # design: a stale decision never clears a newer stop).
+        s = ctrl.actuator()
+        await asyncio.to_thread(lambda: [s.wait_for_observation() for _ in range(3)])
+        res = await c.call_tool("clear_fault", {})
+        assert not res.is_error, body(res)
+        assert body(res)["safety_state"] == "Idle"
 
 
 @pytest.mark.asyncio
