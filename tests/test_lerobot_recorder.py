@@ -75,6 +75,7 @@ class FakeObservations:
 
     def __init__(self) -> None:
         self._latest = None
+        self._history = []
         self._stop = threading.Event()
         self.t0 = time.monotonic()
 
@@ -85,6 +86,7 @@ class FakeObservations:
         while not self._stop.wait(0.005):
             now = time.monotonic()
             self._latest = (now, obs(now - self.t0))
+            self._history = self._history[-99:] + [self._latest]
 
     def wait_first(self, timeout: float) -> None:
         end = time.monotonic() + timeout
@@ -93,6 +95,9 @@ class FakeObservations:
 
     def latest(self):
         return self._latest
+
+    def at_or_before(self, t: float):
+        return next((e for e in reversed(self._history) if e[0] <= t), None)
 
     def close(self) -> None:
         self._stop.set()
@@ -249,6 +254,33 @@ def test_live_sampling_with_synthetic_streams(tmp_path):
     # camera frames come from the decoded stream: gray levels follow the synthetic sequence
     means = decode_means(root / "videos" / CAM / "chunk-000/file-000.mp4")
     assert all(any(abs(m - level(i)) < 6 for i in range(90)) for m in means)
+
+
+def test_overdue_ticks_never_use_samples_received_after_their_due_time(tmp_path):
+    src = FakeObservations()
+    rec = LeRobotRecorder(tmp_path / "late", "test/late", fps=FPS, task="t", obs_source=src, camera_url=None)
+    real_add = rec.add_frame
+    calls = []
+
+    def stalling_add(*a, **kw):
+        calls.append(1)
+        if len(calls) == 5:
+            time.sleep(4 / FPS)  # the next ticks are overdue
+        return real_add(*a, **kw)
+
+    rec.add_frame = stalling_add
+    with rec:
+        rec.start_episode()
+        started = time.monotonic()  # the sampler's t0 is no later than this
+        time.sleep(0.5)
+        summary = rec.stop_episode()
+        rec.save()
+    assert summary.late_ticks >= 1
+    data = pq.read_table(tmp_path / "late/data/chunk-000/file-000.parquet").to_pydict()
+    rx = np.array(data["observation.state"])[:, 0] + src.t0  # host receive time of each row's sample
+    due_bound = started + np.arange(len(rx)) / FPS
+    assert np.all(rx <= due_bound + 1e-3), (rx - due_bound)[rx > due_bound + 1e-3]
+    assert summary.obs_age_ms_mean >= 0
 
 
 def test_observation_stream_is_lease_free(armd, tmp_path):

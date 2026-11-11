@@ -36,6 +36,7 @@ Scripted recording without the live sources: ``start_episode(sample=False)`` the
 from __future__ import annotations
 
 import argparse
+import collections
 import json
 import logging
 import queue
@@ -98,9 +99,14 @@ def camera_url(host: str) -> str:
 
 
 class _Stream:
-    """Background WebSocket reader keeping the newest parsed message with its host receive time."""
+    """Background WebSocket reader keeping the newest parsed messages with their host receive times.
+
+    ``history`` recent items are kept so the sampler can pick, for a tick that runs late, the item
+    received at or before the tick's due time instead of a newer one.
+    """
 
     name = "stream"
+    history = 128
 
     def __init__(self, url: str, connect_timeout: float = 5.0) -> None:
         self.url = url
@@ -108,6 +114,7 @@ class _Stream:
         self.error: str | None = None
         self.count = 0
         self._latest: tuple[float, Any] | None = None
+        self._history: collections.deque = collections.deque(maxlen=self.history)
         self._cond = threading.Condition()
         self._stop = threading.Event()
         self._ws = None
@@ -142,6 +149,7 @@ class _Stream:
             return
         with self._cond:
             self._latest = (rx, item)
+            self._history.append(self._latest)
             self.count += 1
             self._cond.notify_all()
 
@@ -151,6 +159,14 @@ class _Stream:
     def latest(self) -> tuple[float, Any] | None:
         with self._cond:
             return self._latest
+
+    def at_or_before(self, t: float) -> tuple[float, Any] | None:
+        """Newest ``(rx, item)`` received at or before host time ``t``; None if the history is newer."""
+        with self._cond:
+            for entry in reversed(self._history):
+                if entry[0] <= t:
+                    return entry
+        return None
 
     def wait_first(self, timeout: float) -> None:
         with self._cond:
@@ -202,6 +218,7 @@ class CameraStream(_Stream):
     """reCamera H.264 debug stream decoded with PyAV; items are :class:`CameraFrame`."""
 
     name = "camera"
+    history = 32  # decoded frames are large; about 1 s at 30 fps
 
     def __init__(self, url: str, connect_timeout: float = 5.0) -> None:
         super().__init__(camera_url(url), connect_timeout)
@@ -222,6 +239,20 @@ class CameraStream(_Stream):
             return None
         self._seq += 1
         return CameraFrame(frame, parsed[1], self._seq)
+
+
+def _sample_at(src: Any, due: float, prev: tuple[float, Any] | None) -> tuple[float, Any] | None:
+    """The item ``src`` received at or before ``due`` (never a later one, so ages are >= 0).
+
+    Sources without ``at_or_before`` give their latest item when it is not newer than ``due``.
+    When nothing old enough is left (the sampler stalled longer than the history), the previous
+    row's item is held.
+    """
+    pick = getattr(src, "at_or_before", None)
+    item = pick(due) if pick is not None else src.latest()
+    if item is None or item[0] > due:
+        return prev
+    return item
 
 
 # --------------------------------------------------------------------------- video
@@ -764,6 +795,7 @@ class LeRobotRecorder:
         k = 0
         obs_ages, cam_ages = [], []
         last_seq = None
+        prev_obs = prev_cam = None
         try:
             while not self._stop_sampling.is_set():
                 due = t0 + k * period
@@ -773,7 +805,7 @@ class LeRobotRecorder:
                         break
                 elif now - due > period:
                     s.late_ticks += 1
-                obs_item = self.obs_source.latest()
+                obs_item = prev_obs = _sample_at(self.obs_source, due, prev_obs)
                 if obs_item is None:
                     raise RecorderError("no observation received")
                 rx, obs = obs_item
@@ -787,7 +819,7 @@ class LeRobotRecorder:
                     action = obs.positions
                 image = None
                 if self.frame_source is not None:
-                    cam = self.frame_source.latest()
+                    cam = prev_cam = _sample_at(self.frame_source, due, prev_cam)
                     if cam is None:
                         raise RecorderError("no camera frame received")
                     crx, frame = cam
