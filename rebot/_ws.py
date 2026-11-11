@@ -25,6 +25,7 @@ from typing import Optional, Union
 from urllib.parse import urlsplit
 
 _GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+_CLOSE_SEND_TIMEOUT = 0.5  # seconds close() spends on the close frame before shutting down
 OP_CONT, OP_TEXT, OP_BINARY, OP_CLOSE, OP_PING, OP_PONG = 0x0, 0x1, 0x2, 0x8, 0x9, 0xA
 
 
@@ -248,8 +249,14 @@ class WebSocket:
         """Send a close frame (best effort) and close the socket; unblocks a thread in :meth:`recv`."""
         if not self._close_sent and self._closed is None:
             self._close_sent = True
-            try:  # bounded: a stuck sender or reader never delays the shutdown below for long
-                self._send_frame(OP_CLOSE, struct.pack("!H", code), lock_timeout=0.5)
+            # The close frame is best effort: wait at most 0.5 s for a concurrent sender and 0.5 s for
+            # the write itself (a peer that stopped reading), then shut the socket down regardless.
+            try:
+                self.sock.settimeout(_CLOSE_SEND_TIMEOUT)
+            except OSError:
+                pass
+            try:
+                self._send_frame(OP_CLOSE, struct.pack("!H", code), lock_timeout=_CLOSE_SEND_TIMEOUT)
             except WebSocketClosed:
                 pass
         if self._closed is None:

@@ -252,3 +252,39 @@ def test_https_is_refused_with_a_clear_error():
 
     with pytest.raises(ArmConnectionError, match="http:// only"):
         _http.request("GET", "https://127.0.0.1:1/api/v1/observation", timeout=0.5)
+
+
+def test_close_does_not_wait_out_the_send_timeout_on_a_stuck_peer():
+    a, b = socket.socketpair()
+
+    class StuckPeer:
+        """A peer that stopped reading: sendall blocks for the socket's send timeout."""
+
+        timeout = 10.0
+        shut = False
+
+        def fileno(self):
+            return a.fileno()
+
+        def settimeout(self, t):
+            self.timeout = t
+
+        def sendall(self, data):
+            time.sleep(min(self.timeout, 3.0))
+            raise TimeoutError("timed out")
+
+        def shutdown(self, how):
+            self.shut = True
+
+        def close(self):
+            a.close()
+            b.close()
+
+    sock = StuckPeer()
+    ws = _ws.WebSocket(sock)
+    t0 = time.monotonic()
+    ws.close()
+    assert time.monotonic() - t0 < 1.0
+    assert sock.shut
+    with pytest.raises(_ws.WebSocketClosed):
+        ws.recv(timeout=0.1)
