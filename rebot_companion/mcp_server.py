@@ -211,7 +211,8 @@ def map_exception(exc: BaseException) -> ToolFail | None:
             return ToolFail(
                 "COLLISION",
                 str(exc),
-                "repeated collisions latched a fault; ask the user to check the workspace and clear it in the web cockpit",
+                "repeated collisions latched a fault; "
+                "ask the user to check the workspace and clear it in the web cockpit",
             )
         return ToolFail("FAULT", str(exc), f"armd fault: {exc.status.fault_reason}; call clear_fault then enable")
     if isinstance(exc, LeaseError):

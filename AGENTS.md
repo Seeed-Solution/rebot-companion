@@ -40,15 +40,16 @@ Two layers:
 ```python
 from rebot import Arm, ActionFailed, ArmFaultError, RebotError
 
-with Arm() as arm:                     # $REBOT_HOST or 127.0.0.1; takes control, torque on
+with Arm() as arm:  # $REBOT_HOST or 127.0.0.1; takes control, torque on
     arm.home()
-    arm.move_to_pose("scan", speed_scale=0.3)          # saved pose, joint-space; speed_scale 0.1..1.0
-    for d in arm.detect(min_score=0.5):                # label, score, box_norm; best score first
-        if arm.grasp(d).holding:                       # armd centres on the box, descends, closes, lifts
-            arm.place(pose="bin_a", speed_scale=0.3)   # lift, approach, descend, open, retreat
+    arm.move_to_pose("scan", speed_scale=0.3)  # saved pose, joint-space; speed_scale 0.1..1.0
+    for d in arm.detect(min_score=0.5):  # label, score, box_norm; best score first
+        if arm.grasp(d).holding:  # armd centres on the box, descends, closes, lifts
+            arm.place(pose="bin_a", speed_scale=0.3)  # lift, approach, descend, open, retreat
         break
-    arm.move_to((0.25, 0.0, 0.15))                     # metres, base frame: x forward, y left, z up
-    arm.gripper_open(); arm.gripper_close()            # gripper_close().holding
+    arm.move_to((0.25, 0.0, 0.15))  # metres, base frame: x forward, y left, z up
+    arm.gripper_open()
+    arm.gripper_close()  # gripper_close().holding
 # leaving the block parks the arm (torque off) and releases control, also after errors and Ctrl+C
 ```
 

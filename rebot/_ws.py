@@ -300,7 +300,8 @@ def connect(
         for line in header_lines:
             k, _, v = line.partition(":")
             hdrs[k.strip().lower()] = v.strip()
-        expect = binascii.b2a_base64(hashlib.sha1((key + _GUID).encode("ascii")).digest(), newline=False).decode("ascii")
+        digest = hashlib.sha1((key + _GUID).encode("ascii")).digest()
+        expect = binascii.b2a_base64(digest, newline=False).decode("ascii")
         if hdrs.get("sec-websocket-accept") != expect:
             raise WebSocketError("handshake failed: bad Sec-WebSocket-Accept")
         sock.settimeout(send_timeout)  # reads use select(); this bounds blocking sends

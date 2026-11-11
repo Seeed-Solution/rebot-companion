@@ -69,10 +69,10 @@ def run(arm, cfg):
                 continue
             empty = 0
             target = targets[0]  # best score first
-            if not retry_after_collision(arm, lambda: arm.grasp(target)).holding:
+            if not retry_after_collision(arm, lambda target=target: arm.grasp(target)).holding:
                 raise ActionFailed("NOT_HOLDING", "gripper closed on nothing")
             bin_pose = cfg["bins"][target.label.lower()]
-            retry_after_collision(arm, lambda: arm.place(pose=bin_pose, speed_scale=speed))
+            retry_after_collision(arm, lambda bin_pose=bin_pose: arm.place(pose=bin_pose, speed_scale=speed))
             successes += 1
             print(f"cycle {cycle}: {target.label} -> {cfg['bins'][target.label.lower()]}")
         except (ActionFailed, ArmFaultError) as exc:
@@ -81,7 +81,7 @@ def run(arm, cfg):
             if exc.code == "COLLISION":  # hit again after the retry: let the arm free itself first
                 try:
                     arm.wait_until_clear()
-                except ArmFaultError as fault:
+                except ArmFaultError:
                     print("stopping, repeated collisions. Check the workspace, then clear the fault in the cockpit.")
                     break
             if arm.state().is_stopped:  # fault or E-stop

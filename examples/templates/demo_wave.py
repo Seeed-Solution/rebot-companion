@@ -46,7 +46,7 @@ def run(arm, cfg):
         for round_no in range(1, cfg["rounds"] + 1):
             for name in cfg["poses"]:
                 print(f"round {round_no}: moving to {name}")
-                retry_after_collision(arm, lambda: arm.move_to_pose(name, speed_scale=speed))
+                retry_after_collision(arm, lambda name=name: arm.move_to_pose(name, speed_scale=speed))
                 retry_after_collision(arm, arm.gripper_open)
                 retry_after_collision(arm, lambda: arm.gripper_close(grasp=False))  # close fully, no object search
             rounds_done += 1

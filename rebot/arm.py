@@ -27,7 +27,6 @@ import time
 from typing import Any, Callable, List, Optional, Sequence, Union
 
 from ._log import _log
-
 from .client import ActionResult, ArmdClient, ArmSession, ArmStatus, ObservationSchema
 from .detection import PIPELINES, Detection, DetectionClient, parse_detections
 from .errors import (

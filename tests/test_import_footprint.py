@@ -5,6 +5,7 @@ import socket
 import subprocess
 import sys
 import threading
+
 import pytest
 
 from rebot import _http
@@ -12,12 +13,7 @@ from rebot import _http
 
 def test_import_rebot_footprint():
     repo_root = str(pathlib.Path(__file__).resolve().parent.parent)
-    code = (
-        f"import sys\n"
-        f"sys.path.insert(0, {repo_root!r})\n"
-        f"import rebot\n"
-        f"print(repr(list(sys.modules.keys())))\n"
-    )
+    code = f"import sys\nsys.path.insert(0, {repo_root!r})\nimport rebot\nprint(repr(list(sys.modules.keys())))\n"
     res = subprocess.run(
         [sys.executable, "-I", "-c", code],
         capture_output=True,
@@ -48,8 +44,6 @@ def test_import_rebot_footprint():
 
 
 def test_lazy_logging():
-    from rebot._log import _log
-
     # Without REBOT_DEBUG, logging should not be imported
     repo_root = str(pathlib.Path(__file__).resolve().parent.parent)
     code = (
@@ -171,6 +165,7 @@ def test_http_socket_transport_delete_and_timeout():
                 req += conn.recv(1024)
             # Sleep longer than client timeout to trigger timeout
             import time
+
             time.sleep(0.3)
             conn.sendall(b"HTTP/1.1 204 No Content\r\n\r\n")
 

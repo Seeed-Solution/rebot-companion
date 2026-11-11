@@ -839,10 +839,17 @@ class FakeArmd:
             if method == "GET" and path == "/api/v1/safety/collision" and self.devplat and self.collision_cap:
                 scale = {"low": 1.5, "medium": 1.0, "high": 0.7}[self.collision_cfg["sensitivity"]]
                 return Response(
-                    200, json={**self.collision_cfg, "thresholds_nm": [round(x * scale, 2) for x in [6, 6, 6, 2.5, 2.5, 2.5]]}
+                    200,
+                    json={
+                        **self.collision_cfg,
+                        "thresholds_nm": [round(x * scale, 2) for x in [6, 6, 6, 2.5, 2.5, 2.5]],
+                    },
                 )
             if method == "GET" and path == "/api/v1/safety/describe" and self.devplat and self.describe_cap:
-                return Response(200, json=json.loads((pathlib.Path(__file__).parent / "fixtures" / "safety_describe.json").read_text()))
+                return Response(
+                    200,
+                    json=json.loads((pathlib.Path(__file__).parent / "fixtures" / "safety_describe.json").read_text()),
+                )
             if method == "GET" and path == "/api/v1/workspace/keepout" and self.devplat:
                 return Response(200, json={"boxes": self.keepout, "source": "runtime" if self.keepout else "profile"})
             if method == "GET" and path == "/api/v1/vision/mode":
