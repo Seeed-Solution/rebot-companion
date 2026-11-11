@@ -1,0 +1,828 @@
+"""Run a policy on the reBot arm through armd's servo stream (``rebot-policy``).
+
+The runner builds each observation the way ``rebot-record`` writes a dataset row
+(:mod:`rebot_companion.lerobot_recorder`), asks the policy for the next joint target and streams
+targets to armd as servo frames. armd's servo guard (speed cap, lead cap, blocked hold, collision
+hold, faults) applies unchanged; the runner adds its own lead clip and stops on every guard event.
+
+Observation (keys and units as in the dataset):
+
+* ``observation.state`` = ``positions`` (7: joints 1..6 + gripper, rad, float32)
+* ``observation.velocity`` = ``velocities``, ``observation.effort`` = ``torques`` when the policy
+  lists them as inputs (``rebot-record --extras``)
+* ``observation.images.<key>`` = the newest decoded reCamera frame, RGB uint8 (H, W, 3), resized
+  with PyAV to the policy's input size. The recorder scales with the same PyAV call before encoding
+  the mp4, so the only difference to a training frame is the video codec's loss.
+
+The action (7 values) is the joint target: ``commanded_positions`` in the recorded data.
+
+Timing: policy steps run at ``fps`` (default: the dataset's fps for ``replay``, else 30) on the
+main thread. A sender thread streams servo frames at ``servo_hz`` (default 50 Hz, armd's control
+rate): when a policy step publishes a target, the sender interpolates linearly from the frame it
+last sent to the new target over one policy period, then holds the target. Every frame is clipped
+to the joint limits and, for joints 1..6, to ``measured +- 0.95 x servo_max_lead_rad`` (schema
+field, default 0.2 rad), so armd's lead cap does not have to act.
+
+Stop conditions: E-stop, Fault, collision hold, servo ``blocked`` hold, torque off, lease loss,
+servo rejection, connection loss, policy stall (no new target for ``stall_s``), stale camera frame,
+non-finite or wrong-sized action, end of a replayed episode, ``max_seconds``, Ctrl-C / SIGTERM.
+After a stop the stream ends, the arm holds (``motion/stop``) and parks (``unload``) unless
+``park=False`` or armd cannot park (Fault, E-stop, collision hold, lease lost).
+
+Policies (``--policy``):
+
+* ``replay:<dataset root>:<episode>``: the ``action`` column of a recorded episode (pyarrow).
+* ``sine:<joint>:<amp rad>:<period s>``: ``start + amp * sin(2 pi t / period)`` on one joint
+  (1..7 or a joint name); ``amp`` <= 0.5 rad.
+* anything else: a LeRobot pretrained policy directory or Hub repo id (``PreTrainedConfig`` /
+  ``PreTrainedPolicy.from_pretrained``, the saved pre/post-processors, ``predict_action``).
+  Needs ``torch`` and ``lerobot`` (extra ``policy``; Python >= 3.12); imported only for this case.
+
+A ``scripted:`` prefix on ``replay:`` / ``sine:`` is accepted. When armd's follower is not ``mock``
+or ``sim`` (``GET /api/v1/safety/describe`` ``device.follower``, unknown on armd without
+``safety_describe``), the run needs ``operator_present=True`` (CLI ``--i-am-at-the-arm``).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import math
+import signal
+import sys
+import threading
+import time
+from collections.abc import Sequence
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+from rebot.client import GRIPPER_INDEX, ArmdClient, ArmSession, ArmStatus
+from rebot.errors import ArmConnectionError, LeaseError, RebotError, ServoRejected
+
+from .lerobot_recorder import JOINT_NAMES, armd_url
+
+log = logging.getLogger("rebot_companion.policy_runner")
+
+SIM_FOLLOWERS = ("mock", "sim")
+DEFAULT_LEAD_RAD = 0.2  # armd's servo_max_lead_rad default (control_safety_contract.md)
+LEAD_FRACTION = 0.95  # clip inside armd's lead: the observation the clip uses is a few ms old
+LIMIT_MARGIN = 1e-3  # rad inside the joint limits
+STATE_KEY = "observation.state"
+EXTRA_KEYS = {"observation.velocity": "velocities", "observation.effort": "torques"}
+ROBOT_TYPE = "rebot_b601_dm"
+
+
+class RunnerError(RuntimeError):
+    """The run could not start."""
+
+
+# --------------------------------------------------------------------------- policies
+
+
+class Policy:
+    """``select(obs, step, t)`` returns the next 7 joint targets, or None when the policy is finished.
+
+    ``inputs``: observation keys the policy reads; ``image_key`` / ``image_size`` (H, W) name the
+    camera input (None: no camera). ``fps``: the rate the policy was made for (None: unknown).
+    """
+
+    name = "policy"
+    fps: int | None = None
+    inputs: tuple[str, ...] = (STATE_KEY,)
+    image_key: str | None = None
+    image_size: tuple[int, int] | None = None
+    warmup = False  # run one inference before the stream starts (first-call latency)
+
+    def reset(self) -> None:
+        pass
+
+    def select(self, obs: dict[str, np.ndarray], step: int, t: float) -> np.ndarray | None:
+        raise NotImplementedError
+
+
+class ReplayPolicy(Policy):
+    """Plays the ``action`` column of one episode of a LeRobot v3.0 dataset."""
+
+    def __init__(self, root: str | Path, episode: int) -> None:
+        import pyarrow.parquet as pq
+
+        root = Path(root)
+        info = json.loads((root / "meta" / "info.json").read_text())
+        self.fps = int(info["fps"])
+        rows = []
+        for f in sorted((root / "meta" / "episodes").glob("*/*.parquet")):
+            rows += pq.read_table(f, columns=["episode_index", "data/chunk_index", "data/file_index"]).to_pylist()
+        row = next((r for r in rows if r["episode_index"] == episode), None)
+        if row is None:
+            raise RunnerError(f"episode {episode} not in {root} (episodes: {[r['episode_index'] for r in rows]})")
+        path = root / info["data_path"].format(chunk_index=row["data/chunk_index"], file_index=row["data/file_index"])
+        data = pq.read_table(path, columns=["episode_index", "action"]).to_pydict()
+        actions = [a for e, a in zip(data["episode_index"], data["action"]) if e == episode]
+        if not actions:
+            raise RunnerError(f"episode {episode} has no rows in {path}")
+        self.actions = np.asarray(actions, dtype=np.float64)
+        self.name = f"replay:{root}:{episode}"
+
+    def select(self, obs: dict[str, np.ndarray], step: int, t: float) -> np.ndarray | None:
+        return self.actions[step] if step < len(self.actions) else None
+
+
+class SinePolicy(Policy):
+    """``start + amp * sin(2 pi t / period)`` on one joint; the other joints hold their start position."""
+
+    def __init__(self, joint: int, amp: float, period: float) -> None:
+        if not 0 <= joint < len(JOINT_NAMES):
+            raise ValueError(f"joint must be 1..{len(JOINT_NAMES)} or one of {JOINT_NAMES}")
+        if not 0 < amp <= 0.5:
+            raise ValueError("amp must be in (0, 0.5] rad")
+        if period < 0.5:
+            raise ValueError("period must be >= 0.5 s")
+        self.joint, self.amp, self.period = joint, float(amp), float(period)
+        self.name = f"sine:{JOINT_NAMES[joint]}:{amp:g}:{period:g}"
+        self._start: np.ndarray | None = None
+
+    def reset(self) -> None:
+        self._start = None
+
+    def select(self, obs: dict[str, np.ndarray], step: int, t: float) -> np.ndarray | None:
+        if self._start is None:
+            self._start = np.asarray(obs[STATE_KEY], dtype=np.float64).copy()
+        out = self._start.copy()
+        out[self.joint] += self.amp * math.sin(2 * math.pi * t / self.period)
+        return out
+
+
+class LeRobotPolicy(Policy):
+    """A LeRobot ``PreTrainedPolicy`` with its saved pre/post-processors (lerobot 0.6.1 / 0.7.0 API)."""
+
+    warmup = True
+
+    def __init__(self, path: str, device: str | None = None, task: str = "") -> None:
+        try:
+            import torch
+            from lerobot.configs.policies import PreTrainedConfig
+            from lerobot.configs.types import FeatureType
+            from lerobot.policies.factory import get_policy_class, make_pre_post_processors
+        except ImportError as exc:
+            raise RunnerError(
+                "learned policies need torch and lerobot (pip install 'rebot-companion[policy]', Python >= 3.12): "
+                f"{exc}"
+            ) from exc
+        try:
+            from lerobot.common.control_utils import predict_action  # 0.6.1, 0.7.0
+        except ImportError:  # pragma: no cover - older layout
+            from lerobot.utils.control_utils import predict_action
+
+        self._torch, self._predict = torch, predict_action
+        device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        cfg = PreTrainedConfig.from_pretrained(path)
+        cfg.pretrained_path = path
+        cfg.device = device
+        self.policy = get_policy_class(cfg.type).from_pretrained(path, config=cfg)
+        self.pre, self.post = make_pre_post_processors(
+            cfg, pretrained_path=path, preprocessor_overrides={"device_processor": {"device": device}}
+        )
+        self.device = torch.device(device)
+        self.task = task
+        self.name = f"lerobot:{cfg.type}:{path}"
+        inputs = dict(cfg.input_features or {})
+        visual = [k for k, v in inputs.items() if v.type == FeatureType.VISUAL]
+        if len(visual) > 1:
+            raise RunnerError(f"policy expects {len(visual)} cameras {visual}; rebot-policy feeds one")
+        unsupported = [k for k in inputs if k not in visual and k != STATE_KEY and k not in EXTRA_KEYS]
+        if unsupported:
+            raise RunnerError(f"policy inputs {unsupported} are not produced by rebot-policy")
+        if visual:
+            self.image_key = visual[0]
+            c, h, w = inputs[self.image_key].shape
+            self.image_size = (int(h), int(w))
+        self.inputs = tuple(inputs)
+        action = (cfg.output_features or {}).get("action")
+        self.action_dim = int(action.shape[0]) if action is not None else None
+
+    def reset(self) -> None:
+        self.policy.reset()
+        for p in (self.pre, self.post):
+            if hasattr(p, "reset"):
+                p.reset()
+
+    def select(self, obs: dict[str, np.ndarray], step: int, t: float) -> np.ndarray | None:
+        action = self._predict(
+            obs, self.policy, self.device, self.pre, self.post, use_amp=False, task=self.task, robot_type=ROBOT_TYPE
+        )
+        return action.squeeze(0).to("cpu").numpy().astype(np.float64)
+
+
+def parse_policy(spec: str, device: str | None = None, task: str = "") -> Policy:
+    """``replay:<root>:<episode>``, ``sine:<joint>:<amp>:<period>`` (optional ``scripted:`` prefix), or a
+    LeRobot pretrained path / repo id."""
+    s = spec[len("scripted:") :] if spec.startswith("scripted:") else spec
+    if s.startswith("replay:"):
+        root, sep, ep = s[len("replay:") :].rpartition(":")
+        if not sep or not root or not ep.isdigit():
+            raise ValueError("replay policy: replay:<dataset root>:<episode index>")
+        return ReplayPolicy(root, int(ep))
+    if s.startswith("sine:"):
+        parts = s[len("sine:") :].split(":")
+        if not 1 <= len(parts) <= 3:
+            raise ValueError("sine policy: sine:<joint>[:<amp rad>[:<period s>]]")
+        j = parts[0]
+        joint = int(j) - 1 if j.isdigit() else (JOINT_NAMES.index(j) if j in JOINT_NAMES else -1)
+        amp = float(parts[1]) if len(parts) > 1 else 0.05
+        period = float(parts[2]) if len(parts) > 2 else 4.0
+        return SinePolicy(joint, amp, period)
+    if spec.startswith("scripted:"):
+        raise ValueError(f"unknown scripted policy {spec!r}: replay:<root>:<episode> or sine:<joint>:<amp>:<period>")
+    return LeRobotPolicy(spec, device=device, task=task)
+
+
+# --------------------------------------------------------------------------- images
+
+
+def to_image(frame: Any, size: tuple[int, int] | None) -> np.ndarray:
+    """Camera item (``CameraFrame``, ``av.VideoFrame`` or RGB array) -> RGB uint8 (H, W, 3) at ``size`` (H, W)."""
+    frame = getattr(frame, "frame", frame)
+    if isinstance(frame, np.ndarray):
+        arr = np.ascontiguousarray(frame[..., :3], dtype=np.uint8)
+        if size is None or arr.shape[:2] == tuple(size):
+            return arr
+        import av
+
+        frame = av.VideoFrame.from_ndarray(arr, format="rgb24")
+    if size is None:
+        return frame.to_ndarray(format="rgb24")
+    h, w = size
+    return frame.reformat(width=w, height=h, format="rgb24").to_ndarray()
+
+
+# --------------------------------------------------------------------------- runner
+
+
+def _stats_ms(values: Sequence[float]) -> dict | None:
+    if not values:
+        return None
+    a = np.asarray(values, dtype=np.float64) * 1000.0
+    return {
+        "mean": round(float(a.mean()), 2),
+        "p50": round(float(np.percentile(a, 50)), 2),
+        "p95": round(float(np.percentile(a, 95)), 2),
+        "max": round(float(a.max()), 2),
+        "n": len(a),
+    }
+
+
+@dataclass
+class RunResult:
+    reason: str  # max_seconds | policy_done | interrupted | estop | fault | collision_hold | blocked | ...
+    detail: str = ""
+    policy: str = ""
+    follower: str | None = None
+    fps: int = 0
+    servo_hz: float = 0.0
+    duration_s: float = 0.0
+    steps: int = 0
+    late_steps: int = 0
+    frames: int = 0
+    late_frames: int = 0
+    lead_clipped_frames: int = 0
+    lead_clips_per_joint: list[int] = field(default_factory=list)
+    limit_clipped_frames: int = 0
+    camera_repeats: int = 0
+    armd_motion_limits: dict[str, int] = field(default_factory=dict)  # observation.motion_limit reasons seen
+    parked: bool = False
+    park_detail: str = ""
+    latency_ms: dict[str, dict | None] = field(default_factory=dict)
+
+    @property
+    def ok(self) -> bool:
+        return self.reason in ("max_seconds", "policy_done")
+
+    def to_dict(self) -> dict:
+        return {k: getattr(self, k) for k in self.__dataclass_fields__}
+
+
+class _Segment:
+    """Linear interpolation from ``start`` to ``end`` over [t0, t0 + duration], then hold ``end``."""
+
+    def __init__(self, start: np.ndarray, end: np.ndarray, t0: float, duration: float) -> None:
+        self.start, self.end, self.t0, self.duration = start, end, t0, duration
+
+    def at(self, t: float) -> np.ndarray:
+        if self.duration <= 0:
+            return self.end
+        a = min(1.0, max(0.0, (t - self.t0) / self.duration))
+        return self.start + (self.end - self.start) * a
+
+
+class PolicyRunner:
+    """One policy run on one armd. ``client`` is a :class:`rebot.client.ArmdClient`; ``camera`` is any
+    source with ``latest() -> (host_monotonic_s, frame) | None`` (optional ``start()``,
+    ``wait_first(timeout)``, ``close()``), e.g. :class:`rebot_companion.lerobot_recorder.CameraStream`.
+    """
+
+    def __init__(
+        self,
+        client: ArmdClient,
+        policy: Policy,
+        camera: Any = None,
+        *,
+        fps: int | None = None,
+        servo_hz: float = 50.0,
+        max_seconds: float = 60.0,
+        park: bool = True,
+        operator_present: bool = False,
+        stall_s: float = 1.0,
+        max_frame_age_s: float = 0.5,
+        log_path: str | Path | None = None,
+        client_id: str | None = None,
+        connect_timeout: float = 5.0,
+    ) -> None:
+        if servo_hz < 10:
+            raise ValueError("servo_hz must be >= 10 (armd drops a stream 200 ms after its last frame)")
+        self.client = client
+        self.policy = policy
+        self.camera = camera
+        self.fps = int(fps or policy.fps or 30)
+        if self.fps <= 0:
+            raise ValueError("fps must be positive")
+        self.servo_hz = float(servo_hz)
+        self.max_seconds = float(max_seconds)
+        self.park = park
+        self.operator_present = operator_present
+        self.stall_s = float(stall_s)
+        self.max_frame_age_s = float(max_frame_age_s)
+        self.log_path = Path(log_path) if log_path else None
+        self.client_id = client_id
+        self.connect_timeout = connect_timeout
+        if policy.image_key and camera is None:
+            raise RunnerError(f"policy reads {policy.image_key}: a camera is required")
+
+        self.session: ArmSession | None = None
+        self.lead = DEFAULT_LEAD_RAD
+        self.limits: list[tuple[float, float]] = []
+        self.result = RunResult(reason="", policy=policy.name, fps=self.fps, servo_hz=self.servo_hz)
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._segment: _Segment | None = None
+        self._last_sent: np.ndarray | None = None
+        self._last_target_t = 0.0
+        self._sender: threading.Thread | None = None
+        self._lat: dict[str, list[float]] = {
+            "obs_age": [],
+            "camera_age": [],
+            "inference": [],
+            "step_lag": [],
+            "send_lag": [],
+        }
+        self._log_file = None
+        self._last_seq: Any = None
+        self._streaming = False
+
+    # ---- stop bookkeeping ----------------------------------------------------
+
+    def request_stop(self, reason: str, detail: str = "") -> None:
+        """First reason wins."""
+        with self._lock:
+            if not self.result.reason:
+                self.result.reason, self.result.detail = reason, detail
+                log.warning("stop: %s %s", reason, detail)
+        self._stop.set()
+
+    def _check(self, obs: ArmStatus, count: bool = False) -> tuple[str, str] | None:
+        if obs.safety_state == "EStop":
+            return "estop", "E-stop latched"
+        if obs.safety_state == "Fault":
+            return "fault", obs.fault_code or str(obs.fault_reason or "")
+        if obs.collision and obs.collision.get("active"):
+            return "collision_hold", f"joint {obs.collision.get('joint')}"
+        ml = obs.motion_limit
+        if ml:
+            reason = str(ml.get("reason"))
+            if count:  # once per servo frame
+                self.result.armd_motion_limits[reason] = self.result.armd_motion_limits.get(reason, 0) + 1
+            if reason == "blocked":
+                return "blocked", f"armd held a blocked joint (index {ml.get('joint')})"
+        if not obs.is_torqued or not obs.is_operational:
+            return "not_armed", f"state {obs.safety_state}, torque {'on' if obs.is_torqued else 'off'}"
+        s = self.session
+        if s is not None and s.lease_lost is not None:
+            return "lease_lost", str(s.lease_lost.get("reason", ""))
+        return None
+
+    # ---- setup ---------------------------------------------------------------
+
+    def _read_arm(self) -> None:
+        follower = None
+        try:
+            follower = (self.client.get_safety_describe().get("device") or {}).get("follower")
+        except (RebotError, OSError, ValueError) as exc:
+            log.info("no safety description (%s); follower unknown", exc)
+        self.result.follower = follower
+        if follower not in SIM_FOLLOWERS and not self.operator_present:
+            raise RunnerError(
+                f"armd follower is {follower or 'unknown'} (not mock/sim): the policy would move a real arm. "
+                "Stand at the arm with a way to cut power and pass --i-am-at-the-arm."
+            )
+        res = self.client.request("GET", "/api/v1/observation/schema")
+        res.raise_for_status()
+        schema = res.json()
+        lead = schema.get("servo_max_lead_rad")
+        self.lead = float(lead) if isinstance(lead, (int, float)) and lead > 0 else DEFAULT_LEAD_RAD
+        self.limits = [(float(lim["min_position"]), float(lim["max_position"])) for lim in schema.get("limits") or []]
+        dof = int(schema.get("dof") or len(self.limits))
+        if dof != len(JOINT_NAMES):
+            raise RunnerError(f"armd reports {dof} joints; rebot-policy drives the 7-DOF B601-DM")
+
+    def _observation(self, obs: ArmStatus) -> dict[str, np.ndarray]:
+        out = {STATE_KEY: np.asarray(obs.positions, dtype=np.float32)}
+        for key, attr in EXTRA_KEYS.items():
+            if key in self.policy.inputs:
+                out[key] = np.asarray(getattr(obs, attr), dtype=np.float32)
+        return out
+
+    def _camera_image(self, now: float) -> np.ndarray | None:
+        if not self.policy.image_key:
+            return None
+        item = self.camera.latest()
+        if item is None:
+            raise RunnerError("no camera frame")
+        rx, frame = item
+        age = now - rx
+        self._lat["camera_age"].append(age)
+        if age > self.max_frame_age_s:
+            self.request_stop("camera_stale", f"newest frame is {age * 1000:.0f} ms old")
+            return None
+        seq = getattr(frame, "seq", None)
+        if seq is not None and seq == self._last_seq:
+            self.result.camera_repeats += 1
+        self._last_seq = seq
+        return to_image(frame, self.policy.image_size)
+
+    # ---- servo sender --------------------------------------------------------
+
+    def _shape(self, frame: np.ndarray, measured: Sequence[float]) -> np.ndarray:
+        out = frame.copy()
+        if self.limits:
+            lo = np.array([a for a, _ in self.limits]) + LIMIT_MARGIN
+            hi = np.array([b for _, b in self.limits]) - LIMIT_MARGIN
+            clipped = np.clip(out, lo, hi)
+            if np.any(clipped != out):
+                self.result.limit_clipped_frames += 1
+            out = clipped
+        lead = self.lead * LEAD_FRACTION
+        any_clip = False
+        for j in range(min(len(out), len(measured))):
+            if j == GRIPPER_INDEX:
+                continue  # armd exempts the gripper from the lead cap
+            m = measured[j]
+            v = min(max(out[j], m - lead), m + lead)
+            if v != out[j]:
+                out[j] = v
+                self.result.lead_clips_per_joint[j] += 1
+                any_clip = True
+        if any_clip:
+            self.result.lead_clipped_frames += 1
+        return out
+
+    def _send_loop(self) -> None:
+        period = 1.0 / self.servo_hz
+        next_t = time.monotonic()
+        s = self.session
+        try:
+            while not self._stop.is_set():
+                now = time.monotonic()
+                self._lat["send_lag"].append(max(0.0, now - next_t))
+                timed = s.latest_observation_timed()
+                obs = timed[1]
+                stop = self._check(obs, count=True)
+                if stop:
+                    self.request_stop(*stop)
+                    break
+                with self._lock:
+                    seg, last_target = self._segment, self._last_target_t
+                if now - last_target > self.stall_s:
+                    self.request_stop("policy_stall", f"no new target for {now - last_target:.2f} s")
+                    break
+                frame = self._shape(seg.at(now), obs.positions)
+                s.servo(frame.tolist())
+                with self._lock:
+                    self._last_sent = frame
+                self.result.frames += 1
+                next_t += period
+                delay = next_t - time.monotonic()
+                if delay > 0:
+                    if self._stop.wait(delay):
+                        break
+                elif -delay > period:
+                    self.result.late_frames += 1
+                    next_t = time.monotonic()
+        except ServoRejected as exc:
+            self.request_stop("servo_rejected", str(exc))
+        except LeaseError as exc:
+            self.request_stop("lease_lost", str(exc))
+        except ArmConnectionError as exc:
+            self.request_stop("connection_lost", str(exc))
+        except RebotError as exc:  # ServoJumpError, ...
+            self.request_stop(exc.code.lower() if exc.code else "armd_error", str(exc))
+        except Exception as exc:  # pragma: no cover - defensive
+            self.request_stop("sender_error", f"{type(exc).__name__}: {exc}")
+
+    def _publish(self, target: np.ndarray) -> None:
+        now = time.monotonic()
+        with self._lock:
+            start = self._segment.at(now) if self._segment is not None else target
+            self._segment = _Segment(np.asarray(start, dtype=np.float64), target, now, 1.0 / self.fps)
+            self._last_target_t = now
+
+    # ---- run -----------------------------------------------------------------
+
+    def run(self) -> RunResult:
+        """Blocks until a stop condition; returns the result (``result.reason`` says why it stopped)."""
+        self._read_arm()
+        self.result.lead_clips_per_joint = [0] * len(JOINT_NAMES)
+        if self.log_path:
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            self._log_file = open(self.log_path, "w", encoding="utf-8")
+        cam_started = False
+        t_start = time.monotonic()
+        try:
+            if self.camera is not None and self.policy.image_key:
+                if hasattr(self.camera, "start"):
+                    self.camera.start()
+                cam_started = True
+                if hasattr(self.camera, "wait_first"):
+                    self.camera.wait_first(self.connect_timeout)
+            self.session = ArmSession(
+                self.client,
+                client_id=self.client_id,
+                safe_exit="off",
+                connect_timeout=self.connect_timeout,
+                obs_hz=int(max(self.servo_hz, 50)),
+            ).open()
+            try:
+                self._prepare()
+                t_start = time.monotonic()
+                self._loop()
+            except KeyboardInterrupt:
+                self.request_stop("interrupted", "Ctrl-C / SIGTERM")
+            except RunnerError:
+                if not self._streaming:
+                    raise
+                self.request_stop("error", str(sys.exc_info()[1]))
+            except Exception as exc:
+                if not self._streaming:
+                    raise
+                self.request_stop("error", f"{type(exc).__name__}: {exc}")
+            finally:
+                self._stop.set()
+                if self._sender is not None:
+                    self._sender.join(timeout=2.0)
+                self.result.duration_s = round(time.monotonic() - t_start, 3)
+                if self._streaming:
+                    self._finish()
+        finally:
+            if self.session is not None:
+                try:
+                    self.session.close()
+                except Exception as exc:  # pragma: no cover - defensive
+                    log.warning("closing the session failed: %s", exc)
+            if cam_started and hasattr(self.camera, "close"):
+                self.camera.close()
+            self.result.latency_ms = {k + "_ms": _stats_ms(v) for k, v in self._lat.items()}
+            if self._log_file is not None:
+                self._log_file.write(json.dumps({"summary": self.result.to_dict()}) + "\n")
+                self._log_file.close()
+        return self.result
+
+    def _prepare(self) -> None:
+        s = self.session
+        obs = s.wait_for_observation(self.connect_timeout)
+        if obs.is_stopped:
+            raise RunnerError(
+                f"arm is in {obs.safety_state} ({obs.fault_code or obs.fault_reason}); "
+                "check it and clear the fault in the cockpit"
+            )
+        if obs.collision and obs.collision.get("active"):
+            raise RunnerError("arm is holding after a collision; wait until it resumes")
+        if not obs.is_torqued or not obs.is_operational:
+            s.torque(True)
+            deadline = time.monotonic() + self.connect_timeout
+            while not (obs.is_torqued and obs.is_operational):
+                if time.monotonic() > deadline:
+                    raise RunnerError(f"torque on did not arm the arm (state {obs.safety_state})")
+                obs = s.wait_for_observation(self.connect_timeout)
+        self.policy.reset()
+        if self.policy.warmup:
+            image = self._camera_image(time.monotonic()) if self.policy.image_key else None
+            o = self._observation(obs)
+            if image is not None:
+                o[self.policy.image_key] = image
+            t = time.perf_counter()
+            self.policy.select(o, 0, 0.0)
+            log.info("warm-up inference %.1f ms", (time.perf_counter() - t) * 1000)
+            self.policy.reset()
+        here = np.asarray(s.latest_observation().positions, dtype=np.float64)
+        with self._lock:
+            self._segment = _Segment(here, here, time.monotonic(), 0.0)
+            self._last_target_t = time.monotonic()
+        self._sender = threading.Thread(target=self._send_loop, name="policy-servo", daemon=True)
+        self._streaming = True
+        self._sender.start()
+
+    def _loop(self) -> None:
+        s = self.session
+        period = 1.0 / self.fps
+        t0 = time.monotonic()
+        k = 0
+        while not self._stop.is_set():
+            due = t0 + k * period
+            now = time.monotonic()
+            if due > now:
+                if self._stop.wait(due - now):
+                    break
+                now = time.monotonic()
+            lag = now - due
+            self._lat["step_lag"].append(lag)
+            if lag > period:
+                self.result.late_steps += 1
+                t0 = now - k * period  # re-anchor: one step per tick, never a burst of catch-up steps
+            if k * period >= self.max_seconds:
+                self.request_stop("max_seconds", f"{self.max_seconds:g} s")
+                break
+            rx, obs = s.latest_observation_timed()
+            self._lat["obs_age"].append(now - rx)
+            stop = self._check(obs)
+            if stop:
+                self.request_stop(*stop)
+                break
+            o = self._observation(obs)
+            if self.policy.image_key:
+                image = self._camera_image(now)
+                if image is None:
+                    break
+                o[self.policy.image_key] = image
+            t_inf = time.perf_counter()
+            action = self.policy.select(o, k, k * period)
+            inf = time.perf_counter() - t_inf
+            self._lat["inference"].append(inf)
+            if action is None:
+                self.request_stop("policy_done", f"{k} steps")
+                break
+            action = np.asarray(action, dtype=np.float64).reshape(-1)
+            if action.shape[0] != len(JOINT_NAMES) or not np.all(np.isfinite(action)):
+                self.request_stop("bad_action", f"policy returned {action.tolist()}")
+                break
+            self._publish(action)
+            self.result.steps = k + 1
+            if self._log_file is not None:
+                self._log_file.write(
+                    json.dumps(
+                        {
+                            "step": k,
+                            "t": round(k * period, 4),
+                            "obs_age_ms": round((now - rx) * 1000, 2),
+                            "camera_age_ms": round(self._lat["camera_age"][-1] * 1000, 2)
+                            if self.policy.image_key
+                            else None,
+                            "inference_ms": round(inf * 1000, 2),
+                            "step_lag_ms": round(lag * 1000, 2),
+                            "action": [round(float(x), 5) for x in action],
+                            "state": [round(float(x), 5) for x in obs.positions],
+                        }
+                    )
+                    + "\n"
+                )
+            k += 1
+
+    def _finish(self) -> None:
+        s = self.session
+        if not self.result.reason:
+            self.result.reason = "stopped"
+        try:
+            obs = s.latest_observation()
+        except RebotError as exc:
+            self.result.park_detail = f"not parked: {exc}"
+            return
+        if obs is None or s.lease_lost is not None or not s.has_lease:
+            self.result.park_detail = "not parked: the control lease is gone"
+            return
+        if obs.is_stopped:
+            self.result.park_detail = f"not parked: arm in {obs.safety_state}; clear it in the cockpit"
+            return
+        if obs.collision and obs.collision.get("active"):
+            self.result.park_detail = "not parked: collision hold"
+            return
+        try:
+            if obs.is_operational:
+                s.stop()
+            if not self.park:
+                self.result.park_detail = "holding (--no-park)"
+                return
+            if not obs.is_torqued:
+                self.result.park_detail = "not parked: torque is off"
+                return
+            s.unload(wait=True, timeout=30.0)
+            self.result.parked = True
+            self.result.park_detail = "parked"
+        except RebotError as exc:
+            self.result.park_detail = f"park failed: {exc}"
+
+
+# --------------------------------------------------------------------------- CLI
+
+
+def _print_summary(r: RunResult) -> None:
+    print(f"stopped: {r.reason}" + (f" ({r.detail})" if r.detail else ""))
+    print(f"policy {r.policy}, follower {r.follower or 'unknown'}, {r.fps} Hz policy, {r.servo_hz:g} Hz servo")
+    print(
+        f"{r.steps} steps ({r.late_steps} late), {r.frames} servo frames ({r.late_frames} late), {r.duration_s:.2f} s"
+    )
+    print(
+        f"lead-clipped frames {r.lead_clipped_frames} (per joint {r.lead_clips_per_joint}), "
+        f"limit-clipped frames {r.limit_clipped_frames}"
+        + (f", armd motion limits {r.armd_motion_limits}" if r.armd_motion_limits else "")
+    )
+    for name, st in r.latency_ms.items():
+        if st:
+            cols = "  ".join(f"{k} {st[k]:7.2f}" for k in ("mean", "p50", "p95", "max"))
+            print(f"  {name:16s} {cols}")
+    print(r.park_detail)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    p = argparse.ArgumentParser(
+        prog="rebot-policy",
+        description="Run a LeRobot or scripted policy on the reBot arm through armd's servo stream.",
+    )
+    p.add_argument("--armd", default="192.168.16.1", help="armd host or URL (default port 8765)")
+    p.add_argument("--camera", help="reCamera host or ws:// URL (default port 8001); needed by image policies")
+    p.add_argument(
+        "--policy",
+        required=True,
+        help="LeRobot pretrained dir / Hub repo id, replay:<dataset root>:<episode>, or sine:<joint>:<amp>:<period>",
+    )
+    p.add_argument("--fps", type=int, help="policy steps per second (default: dataset fps for replay, else 30)")
+    p.add_argument("--servo-hz", type=float, default=50.0, help="servo frame rate (default 50)")
+    p.add_argument("--max-seconds", type=float, default=60.0)
+    p.add_argument("--task", default="", help="task text for language-conditioned policies")
+    p.add_argument("--device", help="torch device (default cuda if available, else cpu)")
+    p.add_argument("--no-park", action="store_true", help="hold position at the end instead of parking")
+    p.add_argument("--stall-s", type=float, default=1.0, help="stop when the policy gives no target for this long")
+    p.add_argument("--max-frame-age", type=float, default=0.5, help="stop when the newest camera frame is older (s)")
+    p.add_argument("--log", help="write per-step JSON lines (latency, action, state) and a summary")
+    p.add_argument(
+        "--i-am-at-the-arm",
+        action="store_true",
+        help="required when armd drives a real arm (follower not mock/sim): you watch it and can cut power",
+    )
+    args = p.parse_args(argv)
+    logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
+
+    def _term(*_: Any) -> None:
+        raise KeyboardInterrupt
+
+    try:
+        signal.signal(signal.SIGTERM, _term)
+    except ValueError:  # not the main thread (tests)
+        pass
+    camera = None
+    try:
+        policy = parse_policy(args.policy, device=args.device, task=args.task)
+        if policy.image_key:
+            if not args.camera:
+                raise RunnerError(f"policy reads {policy.image_key}: pass --camera")
+            from .lerobot_recorder import CameraStream
+
+            camera = CameraStream(args.camera)
+        runner = PolicyRunner(
+            ArmdClient(armd_url(args.armd)),
+            policy,
+            camera,
+            fps=args.fps,
+            servo_hz=args.servo_hz,
+            max_seconds=args.max_seconds,
+            park=not args.no_park,
+            operator_present=args.i_am_at_the_arm,
+            stall_s=args.stall_s,
+            max_frame_age_s=args.max_frame_age,
+            log_path=args.log,
+        )
+        print(
+            f"policy {policy.name}" + (f", camera {policy.image_key} {policy.image_size}" if policy.image_key else "")
+        )
+        result = runner.run()
+    except (RunnerError, ValueError, ImportError, RebotError, OSError) as exc:
+        print(f"rebot-policy: {exc}", file=sys.stderr)
+        return 1
+    _print_summary(result)
+    if result.reason == "interrupted":
+        return 130
+    return 0 if result.ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
