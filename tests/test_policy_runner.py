@@ -785,3 +785,31 @@ def test_stop_reaches_the_e_stop_within_its_bound_while_a_send_is_stuck():
         assert calls == ["e_stop"] and r.result.reason == "fault"
     finally:
         release.set()
+
+
+# --------------------------------------------------------------------------- blocked inference
+
+
+@pytest.mark.parametrize(
+    "kw,reason",
+    [({"max_seconds": 0.3, "stall_s": 10}, "max_seconds"), ({"max_seconds": 10, "stall_s": 0.3}, "policy_stall")],
+)
+def test_inference_that_never_returns_still_stops_parks_and_releases(arm, kw, reason):
+    never = threading.Event()
+
+    class Forever(Policy):
+        def select(self, obs, step, t):
+            if step == 2:
+                never.wait()  # blocks until the test ends
+            return np.array(obs["observation.state"], dtype=float)
+
+    out = {}
+    t = threading.Thread(target=lambda: out.setdefault("res", runner(arm, Forever(), **kw).run()), daemon=True)
+    t.start()
+    t.join(5.0)
+    never.set()
+    assert not t.is_alive(), "run() blocked behind the policy's inference"
+    res = out["res"]
+    assert res.reason == reason and res.parked, res
+    assert res.duration_s < 0.3 + 1.0
+    assert "/api/v1/motion/unload" in arm.commands and arm.lease is None

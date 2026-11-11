@@ -50,6 +50,7 @@ import argparse
 import json
 import logging
 import math
+import queue
 import signal
 import sys
 import threading
@@ -72,6 +73,7 @@ SIM_FOLLOWERS = ("mock", "sim")
 DEFAULT_LEAD_RAD = 0.2  # armd's servo_max_lead_rad default (control_safety_contract.md)
 LEAD_FRACTION = 0.95  # clip inside armd's lead: the observation the clip uses is a few ms old
 LIMIT_MARGIN = 1e-3  # rad inside the joint limits
+WARMUP_TIMEOUT_S = 120.0  # first inference (model load, CUDA init) before the stream starts
 SEND_TIMEOUT_S = 1.0  # bound on one blocking WebSocket send (servo frame)
 STATE_KEY = "observation.state"
 EXTRA_KEYS = {"observation.velocity": "velocities", "observation.effort": "torques"}
@@ -318,6 +320,50 @@ class RunResult:
         return {k: getattr(self, k) for k in self.__dataclass_fields__}
 
 
+class _InferenceWorker:
+    """Runs ``policy.select`` on a daemon thread so the main loop can wait with a bound. A call that does
+    not return in time is abandoned (the thread stays blocked; the runner stops and cleans up)."""
+
+    def __init__(self, policy: Policy, wake: threading.Event) -> None:
+        self.policy, self.wake = policy, wake
+        self._req: queue.Queue = queue.Queue()
+        self._done = threading.Event()
+        self._out: tuple[Any, BaseException | None] = (None, None)
+        self.busy = False
+        threading.Thread(target=self._run, name="policy-inference", daemon=True).start()
+
+    def _run(self) -> None:
+        while True:
+            args = self._req.get()
+            try:
+                self._out = (self.policy.select(*args), None)
+            except BaseException as exc:
+                self._out = (None, exc)
+            self._done.set()
+            self.wake.set()
+
+    def call(self, args: tuple, timeout: float) -> tuple[bool, Any]:
+        """``(True, action)`` or ``(False, None)`` on timeout / wake-up by a stop; re-raises the policy's error."""
+        if self.busy:
+            return False, None  # a previous call is still running
+        self._done.clear()
+        self.busy = True
+        self._req.put(args)
+        end = time.monotonic() + max(0.0, timeout)
+        while not self._done.is_set():
+            left = end - time.monotonic()
+            if left <= 0 or not self.wake.wait(left):
+                return False, None
+            self.wake.clear()
+            if not self._done.is_set():
+                return False, None  # woken by request_stop
+        self.busy = False
+        value, exc = self._out
+        if exc is not None:
+            raise exc
+        return True, value
+
+
 class _Segment:
     """Linear interpolation from ``start`` to ``end`` over [t0, t0 + duration], then hold ``end``."""
 
@@ -384,6 +430,8 @@ class PolicyRunner:
         self.limits: list[tuple[float, float]] = []
         self.result = RunResult(reason="", policy=policy.name, fps=self.fps, servo_hz=self.servo_hz)
         self._stop = threading.Event()
+        self._wake = threading.Event()  # set by request_stop and by a finished inference
+        self._worker: _InferenceWorker | None = None
         # _lock guards the segment and the last committed frame; it is never held across I/O.
         self._lock = threading.RLock()
         # _send_lock is held across "stop requested?" + the servo send only. request_stop takes it with a
@@ -412,6 +460,7 @@ class PolicyRunner:
     def request_stop(self, reason: str, detail: str = "") -> None:
         """First reason wins. Cancels the stream first; returns after any in-flight frame has been written."""
         self._stop.set()
+        self._wake.set()
         # Wait for an in-flight frame (bounded by the send timeout). If the lock is not free within
         # sender_join_s the sender is stuck; _stop_sender then fails closed.
         locked = self._send_lock.acquire(timeout=self.sender_join_s)
@@ -677,6 +726,11 @@ class PolicyRunner:
                 self._log_file.close()
         return self.result
 
+    def _infer(self, args: tuple, timeout: float) -> tuple[bool, Any]:
+        if self._worker is None:
+            self._worker = _InferenceWorker(self.policy, self._wake)
+        return self._worker.call(args, timeout)
+
     def _stop_sender(self) -> bool:
         """Wait for the sender thread; True when it has ended. A sender still alive after ``sender_join_s``
         is stuck in a socket send, so the WebSocket cannot carry ``motion/stop``: fail closed with the
@@ -719,7 +773,9 @@ class PolicyRunner:
             if image is not None:
                 o[self.policy.image_key] = image
             t = time.perf_counter()
-            self.policy.select(o, 0, 0.0)
+            ok, _ = self._infer((o, 0, 0.0), WARMUP_TIMEOUT_S)
+            if not ok:
+                raise RunnerError(f"warm-up inference did not return within {WARMUP_TIMEOUT_S:g} s")
             log.info("warm-up inference %.1f ms", (time.perf_counter() - t) * 1000)
             self.policy.reset()
         here = np.asarray(s.latest_observation().positions, dtype=np.float64)
@@ -771,8 +827,15 @@ class PolicyRunner:
                     break
                 o[self.policy.image_key] = image
             t_inf = time.perf_counter()
-            action = self.policy.select(o, k, k * period)
+            # bounded wait: inference that blocks past the deadline or stall_s does not block the stop
+            ok, action = self._infer((o, k, k * period), min(self._deadline - time.monotonic(), self.stall_s))
             inf = time.perf_counter() - t_inf
+            if not ok:
+                if time.monotonic() >= self._deadline:
+                    self.request_stop("max_seconds", f"{self.max_seconds:g} s")
+                else:
+                    self.request_stop("policy_stall", f"inference took longer than {self.stall_s:g} s")
+                break
             self._lat["inference"].append(inf)
             if action is None:
                 self.request_stop("policy_done", f"{k} steps")

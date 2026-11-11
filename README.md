@@ -783,7 +783,9 @@ pre/post-processors (`make_pre_post_processors`), and stepped with `predict_acti
 step; ACT-style policies return the next action of their chunk). Policies with more than one camera
 or other inputs are refused.
 
-Timing: policy steps run at `--fps` on the main thread. A sender thread streams servo frames at
+Timing: policy steps run at `--fps`; inference runs on a worker thread and the main loop waits for it
+at most until the deadline or `--stall-s`, then stops, parks and releases the lease (a call that never
+returns is abandoned; the warm-up call may take up to 120 s). A sender thread streams servo frames at
 `--servo-hz`: each new target is reached by linear interpolation from the last sent frame (after clipping;
 the measured position before the first frame) over one policy period, then held.
 Every frame is clipped per joint to the intersection of the joint limits and, for joints 1..6,
