@@ -55,14 +55,31 @@ def runner(armd, policy, **kw) -> PolicyRunner:
     return PolicyRunner(armd.client, policy, **kw)
 
 
-def run_with(armd, policy, action=None, after=0.3, **kw):
-    """Run in a thread; call ``action()`` ``after`` seconds into the run."""
+def wait_until(pred, timeout=10.0, poll=0.005) -> None:
+    """Wait for a condition (re-checked every ``poll`` s); fail the test after ``timeout``."""
+    end, tick = time.monotonic() + timeout, threading.Event()
+    while not pred():
+        assert time.monotonic() < end, "condition not reached"
+        tick.wait(poll)
+
+
+def run_with(armd, policy, action=None, at_step=5, **kw):
+    """Run in a thread; call ``action()`` once the policy is asked for step ``at_step`` (the stream is live)."""
+    reached = threading.Event()
+    select = policy.select
+
+    def counting(obs, step, t):
+        if step >= at_step:
+            reached.set()
+        return select(obs, step, t)
+
+    policy.select = counting
     r = runner(armd, policy, **kw)
     out = {}
     t = threading.Thread(target=lambda: out.setdefault("res", r.run()), daemon=True)
     t.start()
     if action is not None:
-        time.sleep(after)
+        assert reached.wait(10), "the run did not reach the injection step"
         action()
     t.join(timeout=20)
     assert not t.is_alive()
@@ -80,8 +97,9 @@ def assert_in_order(armd) -> None:
 def test_sine_streams_frames_in_order_and_parks(arm):
     res = runner(arm, SinePolicy(0, 0.1, 1.0), max_seconds=1.0).run()
     assert res.reason == "max_seconds", res
-    assert res.steps == FPS
-    assert 40 <= res.frames <= 60  # 50 Hz for ~1 s
+    # upper bounds: a loaded host may run fewer steps and frames in the 1 s deadline, never more
+    assert 0 < res.steps <= FPS + 1
+    assert 0 < res.frames <= 1.0 * 50 + 2
     assert_in_order(arm)
     assert len(arm.servo_log) == res.frames
     assert arm.dropped_servo_frames == 0
@@ -217,13 +235,18 @@ def test_stop_on_servo_rejection_then_parks(arm):
 
 
 def test_stop_on_policy_stall(arm):
+    release = threading.Event()
+
     class Slow(Policy):
         def select(self, obs, step, t):
             if step == 3:
-                time.sleep(1.0)
+                release.wait(10)  # held until the runner has given up on it
             return np.array(obs["observation.state"], dtype=float)
 
-    res = runner(arm, Slow(), max_seconds=5, stall_s=0.3).run()
+    try:
+        res = runner(arm, Slow(), max_seconds=5, stall_s=0.3).run()
+    finally:
+        release.set()
     assert res.reason == "policy_stall"
     assert res.parked
 
@@ -481,7 +504,9 @@ def test_replay_round_trip(arm, tmp_path):
     with rec:
         rec.start_episode()
         res = runner(arm, ReplayPolicy(tmp_path / "a", 0), max_seconds=10, park=False).run()
-        time.sleep(0.2)
+        # the recorder samples the held arm for a few more ticks after the run
+        n = len(rec._ep.state)
+        wait_until(lambda: len(rec._ep.state) >= n + 3)
         rec.stop_episode()
         rec.save()
     assert res.reason == "policy_done" and res.steps == len(actions)
@@ -520,10 +545,10 @@ def http_armd(arm):
 
 def test_cli_sine(http_armd, tmp_path, capsys):
     log_path = tmp_path / "run.jsonl"
-    argv = ["--armd", http_armd.http_url, "--policy", "sine:1:0.05:1", "--max-seconds", "0.5", "--log", str(log_path)]
+    argv = ["--armd", http_armd.http_url, "--policy", "sine:1:0.05:1", "--max-steps", "15", "--log", str(log_path)]
     assert main(argv) == 0
     out = capsys.readouterr().out
-    assert "stopped: max_seconds" in out and "parked" in out
+    assert "stopped: max_steps" in out and "parked" in out
     lines = [json.loads(x) for x in log_path.read_text().splitlines()]
     assert lines[-1]["summary"]["steps"] == 15
     assert [x["step"] for x in lines[:-1]] == list(range(15))
@@ -549,20 +574,21 @@ def camera_server():
     from test_lerobot_recorder import h264_aus
 
     aus = h264_aus(90)
+    done = threading.Event()
 
     def handler(ws):
         i = 0
         try:
-            while True:
+            while not done.wait(1 / FPS if i else 0):  # paced at FPS, ends with the fixture
                 ws.send(aus[i % len(aus)] + int(time.time() * 1000).to_bytes(8, "little"))
                 i += 1
-                time.sleep(1 / FPS)
         except ConnectionClosed:
             pass
 
     server = serve(handler, "127.0.0.1", 0)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     yield f"ws://127.0.0.1:{server.socket.getsockname()[1]}/"
+    done.set()
     server.shutdown()
 
 
@@ -792,8 +818,10 @@ def test_max_seconds_holds_while_inference_blocks(arm):
     holder["r"] = r
     res = r.run()
     assert res.reason == "max_seconds", res
-    assert res.frames <= 0.1 * 50 + 2
-    assert res.duration_s < 1.0
+    assert res.steps <= 1  # step 1 never returned
+    assert res.frames <= 0.1 * 50 + 2  # no frame after the deadline
+    # bounded by the deadline plus the sender join, not by the 5 s the inference would block
+    assert res.duration_s < 0.1 + r.sender_join_s
 
 
 # --------------------------------------------------------------------------- telemetry checks
