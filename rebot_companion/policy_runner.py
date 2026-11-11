@@ -52,6 +52,7 @@ import json
 import logging
 import math
 import queue
+import re
 import signal
 import sys
 import threading
@@ -107,6 +108,7 @@ class Policy:
     """
 
     name = "policy"
+    source = ""  # where a learned policy was loaded from (local directory / Hugging Face Hub)
     fps: int | None = None
     inputs: tuple[str, ...] = (STATE_KEY,)
     image_key: str | None = None
@@ -210,6 +212,15 @@ class LeRobotPolicy(Policy):
             from lerobot.utils.control_utils import predict_action
 
         self._torch, self._predict = torch, predict_action
+        local = Path(path).expanduser()
+        if local.is_dir():
+            path = str(local)
+            self.source = f"local directory {local.resolve()}"
+        elif path.startswith(("/", ".", "~")) or path.count("/") > 1:
+            raise RunnerError(f"policy directory {path} does not exist")
+        else:
+            self.source = f"Hugging Face Hub repo {path}"
+        log.info("loading policy from %s", self.source)
         device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         cfg = PreTrainedConfig.from_pretrained(path)
         cfg.pretrained_path = path
@@ -269,7 +280,16 @@ def parse_policy(spec: str, device: str | None = None, task: str = "") -> Policy
         return SinePolicy(joint, amp, period)
     if spec.startswith("scripted:"):
         raise ValueError(f"unknown scripted policy {spec!r}: replay:<root>:<episode> or sine:<joint>:<amp>:<period>")
+    # a Hub repo id ("org/name") has no colon: "<word>:..." is a mistyped prefix unless it is a local directory
+    if _PREFIX.match(spec) and not Path(spec).expanduser().is_dir():
+        raise ValueError(
+            f"unknown policy prefix in {spec!r}: use replay:<root>:<episode>, sine:<joint>:<amp>:<period>, "
+            "a LeRobot pretrained directory or a Hub repo id"
+        )
     return LeRobotPolicy(spec, device=device, task=task)
+
+
+_PREFIX = re.compile(r"[A-Za-z][\w.+-]*:")
 
 
 # --------------------------------------------------------------------------- images
@@ -1044,7 +1064,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             log_path=args.log,
         )
         print(
-            f"policy {policy.name}" + (f", camera {policy.image_key} {policy.image_size}" if policy.image_key else "")
+            f"policy {policy.name}"
+            + (f" from {policy.source}" if policy.source else "")
+            + (f", camera {policy.image_key} {policy.image_size}" if policy.image_key else "")
         )
         result = runner.run()
     except (RunnerError, ValueError, ImportError, RebotError, OSError) as exc:

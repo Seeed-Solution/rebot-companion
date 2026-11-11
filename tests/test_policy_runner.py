@@ -324,7 +324,7 @@ def test_parse_policy(tmp_path):
     assert parse_policy("scripted:sine:2").joint == 1
     with pytest.raises(RunnerError, match="episode 3"):
         parse_policy(f"replay:{tmp_path / 'ds'}:3")
-    for bad in ("sine:9", "sine:1:2.0", "replay:x", "scripted:wave"):
+    for bad in ("sine:9", "sine:1:2.0", "replay:x", "scripted:wave", "sin:1", "replay2:x:0", "Sine:1:0.1:2"):
         with pytest.raises(ValueError):
             parse_policy(bad)
 
@@ -346,6 +346,17 @@ def test_replay_data_path_stays_inside_the_dataset(tmp_path, data_path, match):
     info_path.write_text(json.dumps(info))
     with pytest.raises(RunnerError, match=match):
         ReplayPolicy(tmp_path / "ds", 0)
+
+
+def test_unknown_prefix_is_not_sent_to_the_hub(monkeypatch):
+    import rebot_companion.policy_runner as pr
+
+    loaded = []
+    monkeypatch.setattr(pr, "LeRobotPolicy", lambda spec, **kw: loaded.append(spec))
+    with pytest.raises(ValueError, match="unknown policy prefix"):
+        parse_policy("sin:1")
+    parse_policy("user/act_pick_cup")  # a Hub repo id still loads
+    assert loaded == ["user/act_pick_cup"]
 
 
 def test_replay_round_trip(arm, tmp_path):
@@ -502,6 +513,7 @@ def test_act_policy_runs_10_steps(http_armd, camera_server, tmp_path):
     steps = lines[:-1]
     assert len(steps) == 10 and all(len(s["action"]) == 7 for s in steps)
     assert all(s["camera_age_ms"] is not None for s in steps)
+    assert "from local directory" in res.stdout
     assert "camera observation.images.recamera (48, 64)" in res.stdout
     assert_in_order(http_armd)
     assert http_armd.dropped_servo_frames == 0
