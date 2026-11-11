@@ -8,15 +8,15 @@ frames, fragmented or oversized control frames, bad close payloads, invalid UTF-
 connection with 1002 (1007 for UTF-8, 1009 for max_size) and raise :class:`WebSocketProtocolError`.
 
 One thread may call :meth:`WebSocket.recv` while others call :meth:`WebSocket.send`. On ``wss://``
-an ``ssl.SSLSocket`` must not be read and written at the same time, so socket reads and writes
-share one lock there (a read holds it only after ``select`` reports data, or while TLS has
-buffered bytes).
+an ``ssl.SSLSocket`` must not be read and written at the same time, so reads and writes share one
+lock there. The reader waits for data with ``select()`` (or ``pending()``) without the lock and
+holds it only for one non-blocking read; a partial TLS record goes back to waiting. ``ws://``
+takes no such lock.
 """
 
 from __future__ import annotations
 
 import binascii
-import contextlib
 import hashlib
 import os
 import select
@@ -67,7 +67,8 @@ class WebSocket:
         self._buf = bytearray(buffered)
         self._send_lock = threading.Lock()
         # SSLSocket (has pending()) is not safe for concurrent recv/send: serialise socket I/O on it.
-        self._io_lock = threading.Lock() if hasattr(sock, "pending") else contextlib.nullcontext()
+        self._tls = hasattr(sock, "pending")
+        self._io_lock = threading.Lock()  # used only when _tls
         self._closed: Optional[WebSocketClosed] = None
         self._close_sent = False
         self._fragments: list = []
@@ -75,7 +76,9 @@ class WebSocket:
 
     # ---- sending -------------------------------------------------------------
 
-    def _send_frame(self, opcode: int, payload: bytes) -> None:
+    def _send_frame(self, opcode: int, payload: bytes, lock_timeout: Optional[float] = None) -> None:
+        """Send one frame. ``lock_timeout`` bounds the wait for the send (and TLS) locks;
+        :class:`WebSocketClosed` when it passes."""
         n = len(payload)
         if n < 126:
             header = struct.pack("!BB", 0x80 | opcode, 0x80 | n)
@@ -85,11 +88,21 @@ class WebSocket:
             header = struct.pack("!BBQ", 0x80 | opcode, 0x80 | 127, n)
         mask = os.urandom(4)
         masked = _mask(payload, mask)
-        with self._send_lock, self._io_lock:
+        wait = -1 if lock_timeout is None else lock_timeout
+        locks = [self._send_lock, self._io_lock] if self._tls else [self._send_lock]
+        held = []
+        try:
+            for lock in locks:
+                if not lock.acquire(timeout=wait):
+                    raise WebSocketClosed(None, "send lock not available")
+                held.append(lock)
             try:
                 self.sock.sendall(header + mask + masked)
             except OSError as exc:
                 raise WebSocketClosed(None, f"send failed: {exc}") from exc
+        finally:
+            for lock in reversed(held):
+                lock.release()
 
     def send(self, data: Union[str, bytes]) -> None:
         """Send one text (``str``) or binary (``bytes``) message."""
@@ -107,24 +120,50 @@ class WebSocket:
 
     def _fill(self, deadline: Optional[float]) -> None:
         """Read more bytes into the buffer; raise WebSocketTimeout at ``deadline``."""
-        with self._io_lock:
-            pending = hasattr(self.sock, "pending") and self.sock.pending() > 0
-        if not pending:
-            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+        while True:
             try:
-                ready, _, _ = select.select([self.sock], [], [], remaining)
-            except (OSError, ValueError) as exc:  # socket closed by another thread
+                pending = self._tls and self.sock.pending() > 0
+            except (OSError, ValueError) as exc:
                 raise WebSocketClosed(None, "socket closed") from exc
-            if not ready:
-                raise WebSocketTimeout("no message within the timeout")
+            if not pending:  # wait for data without holding any lock
+                remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+                try:
+                    ready, _, _ = select.select([self.sock], [], [], remaining)
+                except (OSError, ValueError) as exc:  # socket closed by another thread
+                    raise WebSocketClosed(None, "socket closed") from exc
+                if not ready:
+                    raise WebSocketTimeout("no message within the timeout")
+            try:
+                chunk = self._tls_read(deadline) if self._tls else self.sock.recv(65536)
+            except WebSocketTimeout:  # a TimeoutError, hence an OSError: keep it a timeout
+                raise
+            except (OSError, ValueError) as exc:
+                raise WebSocketClosed(None, f"recv failed: {exc}") from exc
+            if chunk is None:  # only part of a TLS record arrived: wait for the rest
+                continue
+            if not chunk:
+                raise WebSocketClosed(None, "connection ended")
+            self._buf += chunk
+            return
+
+    def _tls_read(self, deadline: Optional[float]) -> Optional[bytes]:
+        """One non-blocking read under the TLS lock (taken within ``deadline``); None if TLS needs more data."""
+        import ssl  # already loaded: the socket is an SSLSocket
+
+        remaining = -1 if deadline is None else max(0.0, deadline - time.monotonic())
+        if not self._io_lock.acquire(timeout=remaining):
+            raise WebSocketTimeout("no message within the timeout")
         try:
-            with self._io_lock:
-                chunk = self.sock.recv(65536)
-        except (OSError, ValueError) as exc:
-            raise WebSocketClosed(None, f"recv failed: {exc}") from exc
-        if not chunk:
-            raise WebSocketClosed(None, "connection ended")
-        self._buf += chunk
+            prev = self.sock.gettimeout()
+            self.sock.settimeout(0.0)
+            try:
+                return self.sock.recv(65536)
+            except (ssl.SSLWantReadError, ssl.SSLWantWriteError, BlockingIOError):
+                return None
+            finally:
+                self.sock.settimeout(prev)
+        finally:
+            self._io_lock.release()
 
     def _parse(self) -> Optional[tuple]:
         """One complete frame ``(fin, opcode, payload)`` from the buffer, or None if incomplete."""
@@ -252,8 +291,8 @@ class WebSocket:
         """Send a close frame (best effort) and close the socket; unblocks a thread in :meth:`recv`."""
         if not self._close_sent and self._closed is None:
             self._close_sent = True
-            try:
-                self._send_frame(OP_CLOSE, struct.pack("!H", code))
+            try:  # bounded: a stuck sender or reader never delays the shutdown below for long
+                self._send_frame(OP_CLOSE, struct.pack("!H", code), lock_timeout=0.5)
             except WebSocketClosed:
                 pass
         if self._closed is None:

@@ -264,6 +264,12 @@ def test_tls_socket_is_never_read_and_written_at_once():
         def fileno(self):
             return a.fileno()
 
+        def gettimeout(self):
+            return 10.0
+
+        def settimeout(self, t):
+            pass
+
         def shutdown(self, how):
             pass
 
@@ -279,3 +285,97 @@ def test_tls_socket_is_never_read_and_written_at_once():
     t.join(2)
     ws.close()
     assert overlap == []
+
+
+class PartialTlsRecord:
+    """SSLSocket stand-in over a socketpair: the bytes that arrive are only part of a TLS record,
+    so a non-blocking recv raises SSLWantReadError and a blocking recv would wait for the rest."""
+
+    def __init__(self):
+        self.a, self.b = socket.socketpair()
+        self.timeout = 10.0
+        self.sent = []
+
+    def pending(self):
+        return 0
+
+    def fileno(self):
+        return self.a.fileno()
+
+    def gettimeout(self):
+        return self.timeout
+
+    def settimeout(self, t):
+        self.timeout = t
+
+    def recv(self, n):
+        import ssl
+
+        if self.timeout == 0.0:
+            self.a.recv(4096)  # OpenSSL takes the raw bytes into its buffer
+            raise ssl.SSLWantReadError("partial record")
+        time.sleep(1.0)  # blocking read: waits for the rest of the record
+        raise OSError("record never completed")
+
+    def sendall(self, data):
+        self.sent.append(data)
+
+    def shutdown(self, how):
+        pass
+
+    def close(self):
+        self.a.close()
+        self.b.close()
+
+
+def test_tls_reader_never_blocks_senders_or_close_on_a_partial_record():
+    sock = PartialTlsRecord()
+    ws = _ws.WebSocket(sock)
+    errors = []
+
+    def reader():
+        try:
+            ws.recv(timeout=3)
+        except Exception as exc:
+            errors.append(exc)
+
+    t = threading.Thread(target=reader)
+    t.start()
+    sock.b.sendall(b"\x17\x03\x03")  # start of a TLS record: the socket turns readable
+    time.sleep(0.1)
+    t0 = time.monotonic()
+    ws.send("heartbeat")
+    assert time.monotonic() - t0 < 0.2  # not stuck behind the reader
+    t0 = time.monotonic()
+    ws.close()
+    assert time.monotonic() - t0 < 0.3
+    t.join(1.0)
+    assert not t.is_alive() and isinstance(errors[0], _ws.WebSocketClosed)
+
+
+def test_tls_lock_wait_respects_the_recv_deadline():
+    sock = PartialTlsRecord()
+    ws = _ws.WebSocket(sock)
+    sock.b.sendall(b"\x81\x00")  # readable
+    ws._io_lock.acquire()  # a sender is mid-write
+    try:
+        t0 = time.monotonic()
+        with pytest.raises(TimeoutError):
+            ws.recv(timeout=0.2)
+        assert time.monotonic() - t0 < 0.5
+    finally:
+        ws._io_lock.release()
+        ws.close()
+
+
+def test_plain_ws_reads_take_no_tls_lock():
+    a, b = socket.socketpair()
+    ws = _ws.WebSocket(a)
+    b.sendall(b"\x81\x02hi")
+    ws._io_lock.acquire()  # would block a TLS read; a plain socket does not use it
+    try:
+        assert ws.recv(timeout=1) == "hi"
+    finally:
+        ws._io_lock.release()
+        ws.close()
+        b.close()
