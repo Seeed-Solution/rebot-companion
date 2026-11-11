@@ -53,6 +53,7 @@ Python SDK and stdio [MCP](https://modelcontextprotocol.io) server bridging **Se
 - [MCP server (agent control)](#mcp-server-agent-control)
 - [Hand-eye calibration](#hand-eye-calibration)
 - [Camera intrinsics](#camera-intrinsics)
+- [Record a LeRobot dataset](#record-a-lerobot-dataset)
 - [Examples](#examples)
 - [Safety](#safety)
 - [Development](#development)
@@ -136,6 +137,7 @@ cd rebot-companion
 uv sync                      # SDK only
 uv sync --extra agent        # + MCP server: mcp 2.x, av, pillow
 uv sync --extra calib        # + OpenCV for tools/calibrate_intrinsics.py
+uv sync --extra record       # + PyAV, pyarrow for rebot-record
 uv sync --all-extras         # everything (development)
 ```
 
@@ -143,6 +145,7 @@ uv sync --all-extras         # everything (development)
 |---|---|---|
 | `agent` | `mcp>=2.3,<3`, `av>=12`, `pillow>=10` | `rebot-mcp`, snapshots with PyAV, annotated snapshots |
 | `calib` | `opencv-python-headless>=4.8,<5` | camera intrinsics tool |
+| `record` | `av>=12`, `pyarrow>=14` | `rebot-record` (LeRobot dataset recorder) |
 
 The test suite runs against the versions pinned in `uv.lock` (for example mcp 2.3.0).
 
@@ -289,6 +292,7 @@ rebot-companion/
 │   ├── arm_client.py           # re-export of rebot.client
 │   ├── camera_client.py        # reCamera rebot-vision / aruco-detector client (trigger / latest result)
 │   ├── snapshot.py             # JPEG snapshots from the H.264 stream + detection overlay
+│   ├── lerobot_recorder.py     # LeRobot v3.0 dataset recorder (rebot-record)
 │   ├── mcp_server.py           # stdio MCP server (rebot-mcp)
 │   ├── kinematics.py           # B601-DM FK (full URDF chain) and planar FK/IK (port of the Web cockpit)
 │   ├── ik.py                   # IK adapter: base-frame pose -> armd 7-joint vector (incl. gripper)
@@ -669,6 +673,53 @@ Resolution assumption: calibration runs on the 1280x720 RTSP stream, the detecto
 640x360 from the same sensor. The tool assumes the same field of view (no crop) and scales fx,
 fy, cx, cy by the width/height ratio (pixel-centre convention). This has not been verified on
 the device; check a measured marker distance against a tape measure.
+
+---
+
+## Record a LeRobot dataset
+
+`rebot-record` records teleoperation or scripted episodes from the host PC into a
+[LeRobot](https://github.com/huggingface/lerobot) dataset (format `codebase_version` v3.0, as
+written by `lerobot` 0.6.1; details in [`docs/lerobot_dataset.md`](docs/lerobot_dataset.md)).
+It needs the `record` extra (PyAV, pyarrow), not lerobot.
+
+```bash
+uv sync --extra record
+uv run rebot-record --armd 192.168.16.1 --camera 192.168.16.1 \
+  --repo-id user/pick_cup --task "pick the cup" --episodes 5 --episode-s 30
+```
+
+Each episode: Enter starts it; Enter stops it early (otherwise it stops after `--episode-s`);
+then Enter saves it, `d` discards it, `q` saves and quits. `--no-prompt` records back to back
+(`--reset-s` pause between episodes). The dataset goes to
+`~/.cache/huggingface/lerobot/<repo-id>` unless `--root` is given; the directory must be new.
+
+| Feature | Source |
+|---|---|
+| `observation.state` (7) | armd `positions` (joints 1..6, gripper; rad) |
+| `action` (7) | armd `commanded_positions` (falls back to `positions` on older armd) |
+| `observation.velocity`, `observation.effort` (7) | `velocities`, `torques`, with `--extras velocity,effort` |
+| `observation.images.recamera` | reCamera H.264 stream, decoded and re-encoded (libsvtav1 if PyAV has it, else h264; `g=2`, `crf=30`) |
+
+The recorder does not take the control lease: it reads the armd observation WebSocket
+(`/api/v1/ws?obs_hz=2*fps`) while a teleop app or program holds the lease. Alignment uses the
+host receive time of every message (`time.monotonic()`): row `k` is due at `T0 + k/fps` and takes
+the newest observation and the newest decoded camera frame received by then. armd's own
+timestamp and the camera's ms tail are other clocks; they are stored per episode in
+`meta/rebot_episodes.jsonl` with the observation and camera sample ages. Camera pipeline and
+network delay are not compensated.
+
+Python API: `LeRobotRecorder(root, repo_id, fps=30, camera_url=..., armd_host=..., task=...)`
+with `start_episode()`, `stop_episode()`, `save()`, `discard()`; `start_episode(sample=False)`
+plus `add_frame(state, action, image)` records scripted steps at a fixed `fps`.
+
+Verified (`tests/test_lerobot_recorder.py`, synthetic observations and libx264 Annex-B frames
+fed through the same PyAV decode path): file layout, indices, timestamps, stats and task
+metadata; one mp4 frame per row; a lease-free run against the fake armd; the Enter-driven CLI.
+`LeRobotDataset(repo_id, root=...)` loads the result and returns frames, actions and the task with
+lerobot 0.6.1 (PyAV decoder) and 0.7.0 (torchcodec decoder) on Linux aarch64; this test runs
+when `REBOT_LEROBOT_PYTHON` names a Python with `lerobot[dataset]` installed, else it is skipped.
+Not yet run against a real armd and reCamera.
 
 ---
 
