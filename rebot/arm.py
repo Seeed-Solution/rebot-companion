@@ -254,7 +254,9 @@ class Arm:
             if limit is None:
                 continue
             with self._busy_lock:
-                busy_until = max(self._busy_until.values()) if self._busy_until else None
+                # each running call has its own deadline: the earliest one ends the exemption, so a
+                # newer overlapping call never keeps an expired one exempt
+                busy_until = min(self._busy_until.values()) if self._busy_until else None
             now = time.monotonic()
             if busy_until is not None:
                 if now < busy_until:

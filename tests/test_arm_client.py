@@ -516,3 +516,45 @@ def test_observations_raise_once_the_connection_closed(armd):
             s.wait_for_observation(timeout=0.2)
     finally:
         s.close()
+
+
+def test_http_deadline_covers_name_resolution(monkeypatch):
+    import socket
+
+    from rebot import _http
+
+    real = socket.getaddrinfo
+
+    def slow_dns(host, port, *a, **kw):
+        if host == "slow.invalid":
+            if len(a) >= 4 and a[3] & socket.AI_NUMERICHOST:
+                raise socket.gaierror("not numeric")
+            time.sleep(2.0)
+            return real("127.0.0.1", port, socket.AF_INET, socket.SOCK_STREAM)
+        return real(host, port, *a, **kw)
+
+    monkeypatch.setattr(socket, "getaddrinfo", slow_dns)
+    t0 = time.monotonic()
+    with pytest.raises(_http.HttpTimeout):
+        _http.request("GET", "http://slow.invalid:9/x", timeout=0.3)
+    assert time.monotonic() - t0 < 1.0
+
+
+def test_http_deadline_covers_connecting_to_several_addresses(monkeypatch):
+    import socket
+
+    from rebot import _http
+
+    addrs = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 9))] * 3
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *a, **kw: addrs)
+
+    class Blackhole(socket.socket):
+        def connect(self, addr):  # an address that never answers: waits out its timeout
+            time.sleep(self.gettimeout() or 5.0)
+            raise socket.timeout("timed out")  # noqa: UP041 (Python 3.8)
+
+    monkeypatch.setattr(socket, "socket", Blackhole)
+    t0 = time.monotonic()
+    with pytest.raises(_http.HttpTimeout):
+        _http.request("GET", "http://multi.example:9/x", timeout=0.4)
+    assert time.monotonic() - t0 < 0.8

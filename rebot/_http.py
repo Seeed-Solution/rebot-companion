@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json as _json
 import socket
+import threading
 import time
 from typing import Any, Callable, Dict, Optional
 from urllib.parse import urlencode, urlsplit
@@ -113,6 +114,54 @@ class _DeadlineSocket:
         self.sock.sendall(data)
 
 
+def _remaining(deadline: float) -> float:
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise socket.timeout("request deadline passed")
+    return left
+
+
+def _resolve(host: str, port: int, deadline: float) -> list:
+    """getaddrinfo bounded by ``deadline`` (a lookup has no timeout of its own; it runs in a thread)."""
+    try:
+        return socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM, 0, socket.AI_NUMERICHOST)
+    except socket.gaierror:
+        pass
+    out: dict = {}
+
+    def run() -> None:
+        try:
+            out["infos"] = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+        except OSError as exc:
+            out["error"] = exc
+
+    t = threading.Thread(target=run, name="rebot-resolve", daemon=True)
+    t.start()
+    t.join(_remaining(deadline))
+    if t.is_alive():
+        raise socket.timeout(f"resolving {host} took longer than the request deadline")
+    if "error" in out:
+        raise out["error"]
+    return out["infos"]
+
+
+def _connect(host: str, port: int, deadline: float) -> socket.socket:
+    """Try each address with the time left before ``deadline``; stop once it has passed."""
+    err: Optional[OSError] = None
+    for family, kind, proto, _, addr in _resolve(host, port, deadline):
+        sock = socket.socket(family, kind, proto)
+        try:
+            sock.settimeout(_remaining(deadline))
+            sock.connect(addr)
+            return sock
+        except OSError as exc:
+            sock.close()
+            if isinstance(exc, socket.timeout) and deadline <= time.monotonic():
+                raise
+            err = exc
+    raise err or OSError(f"no address for {host}")
+
+
 def _read_chunked(sock: _DeadlineSocket, initial: bytes) -> bytes:
     buf = bytearray(initial)
     body = bytearray()
@@ -188,7 +237,7 @@ def socket_transport(
     deadline = time.monotonic() + timeout
     raw: Optional[socket.socket] = None
     try:
-        raw = socket.create_connection((host, port), timeout=timeout)
+        raw = _connect(host, port, deadline)
         if scheme == "https":
             import ssl
 

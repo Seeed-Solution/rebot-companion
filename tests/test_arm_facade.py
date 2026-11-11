@@ -179,6 +179,34 @@ def test_guard_exempts_a_busy_call_only_up_to_its_budget(armd, monkeypatch):
             arm.feed()
 
 
+def test_guard_newer_long_call_does_not_extend_an_expired_one(armd, monkeypatch):
+    import threading
+
+    import rebot.arm as arm_mod
+
+    monkeypatch.setattr(arm_mod, "GUARD_CALL_BUDGET_S", 0.2, raising=False)
+    monkeypatch.setattr(arm_mod, "GUARD_BUSY_MARGIN_S", 0.2, raising=False)
+    with open_arm(armd, park_on_exit=False) as arm:
+        arm.guard(0.3)
+        started = threading.Event()
+
+        def long_call():  # overlaps with a generous budget of its own
+            started.set()
+            time.sleep(1.5)
+
+        t = threading.Thread(target=lambda: arm._run(long_call, budget=30.0))
+        monkeypatch.setattr(arm.client, "get_poses", lambda: time.sleep(1.5) or [])
+        p = threading.Thread(target=arm.poses)  # 0.2 s budget + 0.2 s margin
+        p.start()
+        time.sleep(0.05)
+        t.start()
+        assert started.wait(1.0)
+        time.sleep(0.8)  # the short call is past its own deadline, the long one is not
+        assert armd.lease is None
+        p.join(2.0)
+        t.join(2.0)
+
+
 def test_recover_clears_only_recoverable_faults(armd):
     armd.devplat = True
     with open_arm(armd) as arm:
