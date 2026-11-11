@@ -249,6 +249,14 @@ def test_stale_camera_stops():
     assert r.result.reason == "camera_stale"
 
 
+def test_extra_inputs_match_the_recorder_features():
+    from rebot_companion.lerobot_recorder import EXTRAS
+    from rebot_companion.policy_runner import EXTRA_KEYS
+
+    assert EXTRA_KEYS == {"observation.velocity": "velocities", "observation.effort": "torques"}
+    assert set(EXTRA_KEYS) == {key for key, _ in EXTRAS.values()}
+
+
 def test_image_policy_needs_a_camera():
     class Img(Policy):
         image_key, image_size = CAM, (H, W)

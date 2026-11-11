@@ -66,7 +66,7 @@ import numpy as np
 from rebot.client import GRIPPER_INDEX, ArmdClient, ArmSession, ArmStatus
 from rebot.errors import ArmConnectionError, LeaseError, RebotError, ServoRejected
 
-from .lerobot_recorder import JOINT_NAMES, armd_url
+from .lerobot_recorder import EXTRAS, JOINT_NAMES, armd_url
 
 log = logging.getLogger("rebot_companion.policy_runner")
 
@@ -77,7 +77,7 @@ LIMIT_MARGIN = 1e-3  # rad inside the joint limits
 WARMUP_TIMEOUT_S = 120.0  # first inference (model load, CUDA init) before the stream starts
 SEND_TIMEOUT_S = 1.0  # bound on one blocking WebSocket send (servo frame)
 STATE_KEY = "observation.state"
-EXTRA_KEYS = {"observation.velocity": "velocities", "observation.effort": "torques"}
+EXTRA_KEYS = dict(EXTRAS.values())  # dataset key -> ArmStatus attribute, as rebot-record writes them
 ROBOT_TYPE = "rebot_b601_dm"
 
 
