@@ -215,11 +215,13 @@ def socket_transport(
 ) -> HttpResponse:
     parts = urlsplit(url)
     scheme = parts.scheme.lower()
-    if scheme not in ("http", "https"):
+    if scheme == "https":
+        raise HttpError(f"rebot supports http:// only; armd and the reCamera services have no TLS: {url}")
+    if scheme != "http":
         raise HttpError(f"unsupported URL scheme: {scheme}")
 
     host = parts.hostname or "127.0.0.1"
-    port = parts.port or (443 if scheme == "https" else 80)
+    port = parts.port or 80
     path = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
     host_hdr = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
 
@@ -238,11 +240,6 @@ def socket_transport(
     raw: Optional[socket.socket] = None
     try:
         raw = _connect(host, port, deadline)
-        if scheme == "https":
-            import ssl
-
-            raw.settimeout(max(0.001, deadline - time.monotonic()))
-            raw = ssl.create_default_context().wrap_socket(raw, server_hostname=host)
         sock = _DeadlineSocket(raw, deadline)
         sock.sendall(payload)
 

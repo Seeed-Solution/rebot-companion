@@ -7,11 +7,8 @@ messages, fragmentation, ping -> pong, close, and receive timeouts. No extension
 frames, fragmented or oversized control frames, bad close payloads, invalid UTF-8) close the
 connection with 1002 (1007 for UTF-8, 1009 for max_size) and raise :class:`WebSocketProtocolError`.
 
-One thread may call :meth:`WebSocket.recv` while others call :meth:`WebSocket.send`. On ``wss://``
-an ``ssl.SSLSocket`` must not be read and written at the same time, so reads and writes share one
-lock there. The reader waits for data with ``select()`` (or ``pending()``) without the lock and
-holds it only for one non-blocking read; a partial TLS record goes back to waiting. ``ws://``
-takes no such lock.
+One thread may call :meth:`WebSocket.recv` while others call :meth:`WebSocket.send`.
+``ws://`` only: armd and the camera stream serve no TLS, so ``wss://`` raises :class:`ValueError`.
 """
 
 from __future__ import annotations
@@ -66,9 +63,6 @@ class WebSocket:
         self.max_size = max_size
         self._buf = bytearray(buffered)
         self._send_lock = threading.Lock()
-        # SSLSocket (has pending()) is not safe for concurrent recv/send: serialise socket I/O on it.
-        self._tls = hasattr(sock, "pending")
-        self._io_lock = threading.Lock()  # used only when _tls
         self._closed: Optional[WebSocketClosed] = None
         self._close_sent = False
         self._fragments: list = []
@@ -77,7 +71,7 @@ class WebSocket:
     # ---- sending -------------------------------------------------------------
 
     def _send_frame(self, opcode: int, payload: bytes, lock_timeout: Optional[float] = None) -> None:
-        """Send one frame. ``lock_timeout`` bounds the wait for the send (and TLS) locks;
+        """Send one frame. ``lock_timeout`` bounds the wait for the send lock;
         :class:`WebSocketClosed` when it passes."""
         n = len(payload)
         if n < 126:
@@ -88,21 +82,14 @@ class WebSocket:
             header = struct.pack("!BBQ", 0x80 | opcode, 0x80 | 127, n)
         mask = os.urandom(4)
         masked = _mask(payload, mask)
-        wait = -1 if lock_timeout is None else lock_timeout
-        locks = [self._send_lock, self._io_lock] if self._tls else [self._send_lock]
-        held = []
+        if not self._send_lock.acquire(timeout=-1 if lock_timeout is None else lock_timeout):
+            raise WebSocketClosed(None, "send lock not available")
         try:
-            for lock in locks:
-                if not lock.acquire(timeout=wait):
-                    raise WebSocketClosed(None, "send lock not available")
-                held.append(lock)
-            try:
-                self.sock.sendall(header + mask + masked)
-            except OSError as exc:
-                raise WebSocketClosed(None, f"send failed: {exc}") from exc
+            self.sock.sendall(header + mask + masked)
+        except OSError as exc:
+            raise WebSocketClosed(None, f"send failed: {exc}") from exc
         finally:
-            for lock in reversed(held):
-                lock.release()
+            self._send_lock.release()
 
     def send(self, data: Union[str, bytes]) -> None:
         """Send one text (``str``) or binary (``bytes``) message."""
@@ -120,50 +107,20 @@ class WebSocket:
 
     def _fill(self, deadline: Optional[float]) -> None:
         """Read more bytes into the buffer; raise WebSocketTimeout at ``deadline``."""
-        while True:
-            try:
-                pending = self._tls and self.sock.pending() > 0
-            except (OSError, ValueError) as exc:
-                raise WebSocketClosed(None, "socket closed") from exc
-            if not pending:  # wait for data without holding any lock
-                remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
-                try:
-                    ready, _, _ = select.select([self.sock], [], [], remaining)
-                except (OSError, ValueError) as exc:  # socket closed by another thread
-                    raise WebSocketClosed(None, "socket closed") from exc
-                if not ready:
-                    raise WebSocketTimeout("no message within the timeout")
-            try:
-                chunk = self._tls_read(deadline) if self._tls else self.sock.recv(65536)
-            except WebSocketTimeout:  # a TimeoutError, hence an OSError: keep it a timeout
-                raise
-            except (OSError, ValueError) as exc:
-                raise WebSocketClosed(None, f"recv failed: {exc}") from exc
-            if chunk is None:  # only part of a TLS record arrived: wait for the rest
-                continue
-            if not chunk:
-                raise WebSocketClosed(None, "connection ended")
-            self._buf += chunk
-            return
-
-    def _tls_read(self, deadline: Optional[float]) -> Optional[bytes]:
-        """One non-blocking read under the TLS lock (taken within ``deadline``); None if TLS needs more data."""
-        import ssl  # already loaded: the socket is an SSLSocket
-
-        remaining = -1 if deadline is None else max(0.0, deadline - time.monotonic())
-        if not self._io_lock.acquire(timeout=remaining):
+        remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+        try:
+            ready, _, _ = select.select([self.sock], [], [], remaining)
+        except (OSError, ValueError) as exc:  # socket closed by another thread
+            raise WebSocketClosed(None, "socket closed") from exc
+        if not ready:
             raise WebSocketTimeout("no message within the timeout")
         try:
-            prev = self.sock.gettimeout()
-            self.sock.settimeout(0.0)
-            try:
-                return self.sock.recv(65536)
-            except (ssl.SSLWantReadError, ssl.SSLWantWriteError, BlockingIOError):
-                return None
-            finally:
-                self.sock.settimeout(prev)
-        finally:
-            self._io_lock.release()
+            chunk = self.sock.recv(65536)
+        except (OSError, ValueError) as exc:
+            raise WebSocketClosed(None, f"recv failed: {exc}") from exc
+        if not chunk:
+            raise WebSocketClosed(None, "connection ended")
+        self._buf += chunk
 
     def _parse(self) -> Optional[tuple]:
         """One complete frame ``(fin, opcode, payload)`` from the buffer, or None if incomplete."""
@@ -339,17 +296,18 @@ def connect(
     max_size: Optional[int] = None,
     send_timeout: float = 10.0,
 ) -> WebSocket:
-    """Open ``ws://`` or ``wss://`` ``url``.
+    """Open ``ws://`` ``url`` (``wss://`` raises :class:`ValueError`: armd has no TLS).
 
     ``origin=True`` sends ``Origin: http://<host>:<port>`` matching the ``Host`` header (armd's
     same-origin check accepts that); a string sends that value; ``False`` sends none.
     """
     parts = urlsplit(url)
-    if parts.scheme not in ("ws", "wss"):
-        raise ValueError(f"not a ws:// or wss:// URL: {url}")
-    secure = parts.scheme == "wss"
+    if parts.scheme == "wss":
+        raise ValueError(f"rebot supports ws:// only; armd has no TLS: {url}")
+    if parts.scheme != "ws":
+        raise ValueError(f"not a ws:// URL: {url}")
     host = parts.hostname or "127.0.0.1"
-    port = parts.port or (443 if secure else 80)
+    port = parts.port or 80
     path = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
     host_hdr = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
     try:
@@ -357,10 +315,6 @@ def connect(
     except OSError as exc:
         raise WebSocketError(f"cannot connect to {host}:{port}: {exc}") from exc
     try:
-        if secure:
-            import ssl
-
-            sock = ssl.create_default_context().wrap_socket(sock, server_hostname=host)
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         key = binascii.b2a_base64(os.urandom(16), newline=False).decode("ascii")
         lines = [
@@ -372,7 +326,7 @@ def connect(
             "Sec-WebSocket-Version: 13",
         ]
         if origin is True:
-            lines.append(f"Origin: {'https' if secure else 'http'}://{host_hdr}")
+            lines.append(f"Origin: http://{host_hdr}")
         elif origin:
             lines.append(f"Origin: {origin}")
         for k, v in (headers or {}).items():
