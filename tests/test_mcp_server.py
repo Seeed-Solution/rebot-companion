@@ -377,6 +377,22 @@ async def test_recover_only_for_recoverable_faults(armd, make_ctrl):
 
 
 @pytest.mark.asyncio
+async def test_recover_does_not_clear_an_estop_that_latched_after_the_check(armd, make_ctrl):
+    from test_arm_facade import estop_after_first_observation
+
+    armd.devplat = True
+    ctrl = make_ctrl()
+    async with Client(build_server(ctrl)) as c:
+        await c.call_tool("enable", {})
+        armd.trigger_fault("WatchdogTimeout")
+        await asyncio.sleep(0.3)
+        estop_after_first_observation(armd, ctrl.actuator())
+        err = body(await c.call_tool("recover", {}))
+        assert err["code"] == "NOT_RECOVERABLE" and "EStop" in err["message"]
+        assert armd.state == "EStop"
+
+
+@pytest.mark.asyncio
 async def test_collision_tools_and_state(armd, make_ctrl):
     armd.devplat = True
     async with Client(build_server(make_ctrl())) as c:

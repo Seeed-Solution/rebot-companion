@@ -574,7 +574,8 @@ class Arm:
         last: Optional[RebotError] = None
         for _ in range(max(1, int(max_attempts))):
             try:
-                self.session.clear_fault()
+                # bound to obs.epoch_id: a stop that latches after this check is re-checked, not cleared blindly
+                self.session.clear_fault(obs, recheck=lambda o: o.recoverable)
                 self.session._wait_until(
                     self.session._frames,
                     lambda o: not o.is_stopped and o.feedback_valid,

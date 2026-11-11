@@ -191,6 +191,40 @@ def test_recover_clears_only_recoverable_faults(armd):
     assert armd.commands.count("/api/v1/safety/clear_fault") == 1
 
 
+def estop_after_first_observation(armd, session):
+    """Patch ``session.wait_for_observation``: the first call returns, then an E-stop latches
+    and the session sees it before the caller acts on that first observation."""
+    real = session.wait_for_observation
+    calls = []
+
+    def wrapped(timeout=2.0):
+        obs = real(timeout)
+        if not calls:
+            calls.append(obs)
+            with armd.lock:
+                armd.do_estop()
+            deadline = time.monotonic() + 2.0
+            while session.epoch_id != armd.epoch and time.monotonic() < deadline:
+                time.sleep(0.01)
+        return obs
+
+    session.wait_for_observation = wrapped
+    return calls
+
+
+def test_recover_does_not_clear_an_estop_that_latched_after_the_check(armd):
+    armd.devplat = True
+    with open_arm(armd, park_on_exit=False) as arm:
+        armd.trigger_fault("WatchdogTimeout")
+        time.sleep(0.3)
+        calls = estop_after_first_observation(armd, arm.session)
+        with pytest.raises(ArmFaultError) as info:
+            arm.recover(max_attempts=3)
+        assert calls and calls[0].recoverable
+        assert info.value.code == "ESTOP"
+        assert armd.state == "EStop"
+
+
 def test_recover_never_clears_on_armd_without_fault_codes(armd):
     with open_arm(armd, park_on_exit=False) as arm:
         armd.trigger_fault("WatchdogTimeout")

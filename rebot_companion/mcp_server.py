@@ -571,7 +571,10 @@ class Controller:
             msg = (obs.fault or {}).get("message") or obs.safety_state
             raise ToolFail("NOT_RECOVERABLE", f"{obs.fault_code or obs.safety_state}: {msg}", human)
         code = obs.fault_code
-        s.clear_fault()
+        try:  # bound to obs.epoch_id: a stop that latches after the checks above is re-checked, not cleared
+            s.clear_fault(obs, recheck=lambda o: o.recoverable and o.fault_code != "COLLISION")
+        except ArmFaultError as exc:
+            raise ToolFail("NOT_RECOVERABLE", str(exc), human) from None
         s._wait_until(
             s._frames, lambda o: not o.is_stopped and o.feedback_valid, 3.0, "fresh feedback", check_stopped=False
         )

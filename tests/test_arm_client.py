@@ -136,6 +136,7 @@ def test_epoch_change_invalidates_commands_and_clear_fault_recovers(armd):
         with pytest.raises(ArmCommandRejected) as exc:
             s.move_to(q(0.1), duration=0.1)
         assert exc.value.code in ("EPOCH_MISMATCH", "ESTOP_ACTIVE")
+        assert s.wait_for_observation().e_stopped  # clear_fault is bound to the observed epoch
         ack = s.clear_fault()
         assert ack["epoch_id"] == 3 and ack["safety_state"] == "Idle"
         with pytest.raises(ArmCommandRejected) as exc:  # clear_fault leaves the arm needing re-arm

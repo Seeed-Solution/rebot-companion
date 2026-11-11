@@ -48,7 +48,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 from . import _http, _ws
 from ._log import _log
@@ -646,7 +646,7 @@ class ArmSession:
             if obs.e_stopped:
                 return SafeExitOutcome("estop", "EStop is latched; not cleared automatically, arm left holding")
             if obs.faulted:
-                self.clear_fault()
+                self.clear_fault(obs, recheck=lambda o: o.faulted and not o.e_stopped)
                 obs = self.wait_for_observation(timeout=1.0)
             if not obs.is_operational:
                 self.torque(True)  # re-arm after clear_fault; plans no motion
@@ -853,12 +853,15 @@ class ArmSession:
             raise ArmConnectionError("Epoch unknown: no telemetry yet")
         return self._generation
 
-    def command(self, path: str, body: dict | None = None, timeout: float | None = None) -> dict:
+    def command(
+        self, path: str, body: dict | None = None, timeout: float | None = None, epoch_id: int | None = None
+    ) -> dict:
         """Send one actuator command over the lease-holding socket; returns the ``command_ack``.
 
         Raises :class:`ArmCommandRejected` on ``command_reject``. A rejected
         ``EPOCH_MISMATCH`` is not retried: the epoch advanced because of an
-        e-stop or fault, and the command was issued before it.
+        e-stop or fault, and the command was issued before it. ``epoch_id`` binds
+        the command to that epoch instead of the latest one seen.
         """
         generation = self._check_lease()
         request_id = next(self._request_ids)
@@ -871,7 +874,7 @@ class ArmSession:
                 "path": path,
                 "body": body or {},
                 "generation": generation,
-                "epoch_id": self._epoch,
+                "epoch_id": self._epoch if epoch_id is None else epoch_id,
                 "client_id": self.client_id,
             },
             timeout=timeout or self.command_timeout,
@@ -904,15 +907,34 @@ class ArmSession:
         self._unload_pending = False
         return self.command("/api/v1/motion/stop")
 
-    def clear_fault(self) -> dict:
-        """Clear EStop/Fault back to Idle (advances the epoch). Call :meth:`torque` (True) before moving again."""
-        try:
-            return self.command("/api/v1/safety/clear_fault")
-        except ArmCommandRejected as exc:
-            if exc.code != "EPOCH_MISMATCH":
-                raise
-            # Recovery is the one command where retrying with the current epoch is the intent.
-            return self.command("/api/v1/safety/clear_fault")
+    def clear_fault(
+        self,
+        observation: ArmStatus | None = None,
+        recheck: Callable[[ArmStatus], bool] | None = None,
+        attempts: int = 3,
+    ) -> dict:
+        """Clear the EStop/Fault seen in ``observation`` back to Idle (advances the epoch).
+
+        The command carries ``observation.epoch_id`` (default: the latest observation), so armd
+        rejects it with ``EPOCH_MISMATCH`` when a newer stop latched after that observation; a
+        newer E-stop is never cleared by a stale decision. On ``EPOCH_MISMATCH`` a fresh
+        observation is fetched and ``recheck(obs)`` decides whether that new stop may be cleared
+        too; without ``recheck`` (or when it says no) the rejection or :class:`ArmFaultError` is
+        raised. Call :meth:`torque` (True) before moving again.
+        """
+        obs = observation or self.latest_observation() or self.wait_for_observation()
+        for attempt in range(max(1, int(attempts))):
+            try:
+                return self.command("/api/v1/safety/clear_fault", epoch_id=obs.epoch_id)
+            except ArmCommandRejected as exc:
+                if exc.code != "EPOCH_MISMATCH" or recheck is None or attempt == attempts - 1:
+                    raise
+            obs = self.wait_for_observation(timeout=2.0)
+            if not obs.is_stopped:
+                return {"type": "command_ack", "safety_state": obs.safety_state, "epoch_id": obs.epoch_id}
+            if not recheck(obs):
+                raise ArmFaultError(obs, f"a newer {obs.safety_state} latched before clear_fault; not cleared")
+        raise AssertionError("unreachable")  # pragma: no cover
 
     def e_stop(self) -> dict:
         """Emergency stop: sent on this socket and via REST. Neither path requires the lease."""
