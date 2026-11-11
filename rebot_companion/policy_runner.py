@@ -384,10 +384,13 @@ class PolicyRunner:
         self.limits: list[tuple[float, float]] = []
         self.result = RunResult(reason="", policy=policy.name, fps=self.fps, servo_hz=self.servo_hz)
         self._stop = threading.Event()
+        # _lock guards the segment and the last committed frame; it is never held across I/O.
         self._lock = threading.RLock()
-        # Held across "stop requested?" + servo send, and by request_stop: once request_stop returns, no
-        # further frame is sent (a frame already in the socket finishes, bounded by SEND_TIMEOUT_S).
+        # _send_lock is held across "stop requested?" + the servo send only. request_stop takes it with a
+        # timeout, so after it returns no further frame is sent unless the sender is stuck in a send
+        # (then _stop_sender fails closed). _reason_lock only guards the stop reason.
         self._send_lock = threading.RLock()
+        self._reason_lock = threading.Lock()
         self._segment: _Segment | None = None
         self._last_sent: np.ndarray | None = None
         self._last_target_t = 0.0
@@ -413,7 +416,7 @@ class PolicyRunner:
         # sender_join_s the sender is stuck; _stop_sender then fails closed.
         locked = self._send_lock.acquire(timeout=self.sender_join_s)
         try:
-            with self._lock:
+            with self._reason_lock:  # never held across anything that blocks
                 first = not self.result.reason
                 if first:
                     self.result.reason, self.result.detail = reason, detail
@@ -568,17 +571,19 @@ class PolicyRunner:
                 if now - last_target > self.stall_s:
                     self.request_stop("policy_stall", f"no new target for {now - last_target:.2f} s")
                     break
-                # Lock order send_lock -> lock (as in request_stop). Holding _lock from reading the segment
-                # until _last_sent is updated keeps _publish from starting a segment at an older frame.
-                with self._send_lock, self._lock:
+                # Compute and commit the frame under _lock (it becomes the next segment's start before it is
+                # sent, so _publish never starts from an older frame), then send under _send_lock only.
+                with self._lock:
+                    frame, problem = self._shape(self._segment.at(now), obs.positions)
+                    if frame is not None:
+                        self._last_sent = frame
+                if frame is None:
+                    self.request_stop("outside_limits", problem)
+                    break
+                with self._send_lock:
                     if self._stop.is_set() or time.monotonic() >= self._deadline:
                         break
-                    frame, problem = self._shape(self._segment.at(now), obs.positions)
-                    if frame is None:
-                        self.request_stop("outside_limits", problem)
-                        break
                     s.servo(frame.tolist())
-                    self._last_sent = frame
                 self.result.frames += 1
                 next_t += period
                 delay = next_t - time.monotonic()

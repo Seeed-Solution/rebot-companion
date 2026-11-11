@@ -747,3 +747,41 @@ def test_bad_schema_limits_are_refused_before_torque(arm, monkeypatch, limits):
     with pytest.raises(RunnerError, match="limits"):
         runner(arm, SinePolicy(0, 0.05, 1.0)).run()
     assert arm.commands == [] and arm.acquires == []
+
+
+def test_stop_reaches_the_e_stop_within_its_bound_while_a_send_is_stuck():
+    """The real sender stuck inside servo() (holding whatever locks it holds while sending): request_stop,
+    _publish and _stop_sender all return within their bounds and the REST e-stop goes out."""
+    r = stub_runner(sender_join_s=0.05)
+    entered, release = threading.Event(), threading.Event()
+
+    class Stuck(StubSession):
+        def servo(self, positions):
+            entered.set()
+            release.wait()
+
+    calls = []
+
+    class Client:
+        def e_stop(self):
+            calls.append("e_stop")
+            return {}
+
+    r.session, r.client = Stuck(r), Client()
+    r._sender = threading.Thread(target=r._send_loop, daemon=True)
+    r._sender.start()
+    assert entered.wait(5)
+    done = threading.Event()
+
+    def stopper():
+        r._publish(np.array(HOME))  # the policy thread must not block on the stuck send either
+        r.request_stop("fault", "x")
+        r._stop_sender()
+        done.set()
+
+    threading.Thread(target=stopper, daemon=True).start()
+    try:
+        assert done.wait(1.0), "request_stop/_stop_sender blocked behind the stuck send"
+        assert calls == ["e_stop"] and r.result.reason == "fault"
+    finally:
+        release.set()
