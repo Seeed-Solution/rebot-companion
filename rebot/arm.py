@@ -92,7 +92,8 @@ class Arm:
     ``obs_hz``: observations per second from armd (used only when armd supports ``obs_rate``).
     ``handle_sigterm``: in the main thread, turn SIGTERM into ``SystemExit`` so the ``with`` block
     parks and releases control (the device app runner stops apps with SIGTERM); the previous
-    handler is restored on :meth:`close`.
+    handler is restored on :meth:`close` (after a close on another thread it takes over SIGTERM
+    until a main-thread close reinstalls it).
     """
 
     def __init__(
@@ -122,6 +123,7 @@ class Arm:
         self._guard_stop = threading.Event()
         self._guard_thread: Optional[threading.Thread] = None
         self._sigterm_handler: Any = None
+        self._sigterm_closed = False
         self._prev_sigterm: Any = None
         try:
             self.schema: ObservationSchema = self.client.get_schema()
@@ -158,6 +160,16 @@ class Arm:
             return
 
         def on_sigterm(signum: int, frame: Any) -> None:
+            if self._sigterm_closed:  # closed from another thread: behave like the previous handler
+                prev = self._prev_sigterm
+                if callable(prev):
+                    prev(signum, frame)
+                    return
+                if prev == signal.SIG_IGN:
+                    return
+                signal.signal(signal.SIGTERM, signal.SIG_DFL)
+                os.kill(os.getpid(), signum)
+                return
             raise SystemExit(128 + signum)
 
         try:
@@ -167,9 +179,15 @@ class Arm:
             self._sigterm_handler = None
 
     def _restore_sigterm(self) -> None:
-        handler, self._sigterm_handler = self._sigterm_handler, None
-        if handler is None or threading.current_thread() is not threading.main_thread():
+        handler = self._sigterm_handler
+        if handler is None:
             return
+        self._sigterm_closed = True
+        if threading.current_thread() is not threading.main_thread():
+            # signal.signal() works only on the main thread: keep the reference so a later close() on
+            # the main thread restores it; until then the handler delegates to the previous one.
+            return
+        self._sigterm_handler = None
         try:
             if signal.getsignal(signal.SIGTERM) is handler:  # someone else's handler stays
                 signal.signal(signal.SIGTERM, self._prev_sigterm if self._prev_sigterm is not None else signal.SIG_DFL)

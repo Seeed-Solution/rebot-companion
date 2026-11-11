@@ -407,3 +407,29 @@ def test_safety_description(armd):
     with Arm(armd.url, transport=armd.transport) as arm:
         with pytest.raises(UnsupportedError):
             arm.safety()
+
+
+def test_close_from_another_thread_keeps_sigterm_restorable(armd):
+    import os
+    import signal
+    import threading
+
+    received = []
+
+    def previous(signum, frame):
+        received.append(signum)
+
+    old = signal.signal(signal.SIGTERM, previous)
+    try:
+        arm = open_arm(armd, park_on_exit=False)
+        assert signal.getsignal(signal.SIGTERM) is not previous
+        t = threading.Thread(target=arm.close)
+        t.start()
+        t.join(5.0)
+        os.kill(os.getpid(), signal.SIGTERM)  # handled like the previous handler, no SystemExit
+        time.sleep(0.05)
+        assert received == [signal.SIGTERM]
+        arm.close()  # main thread: the previous handler is reinstalled
+        assert signal.getsignal(signal.SIGTERM) is previous
+    finally:
+        signal.signal(signal.SIGTERM, old)
