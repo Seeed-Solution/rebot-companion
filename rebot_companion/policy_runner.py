@@ -16,7 +16,8 @@ Observation (keys and units as in the dataset):
 
 The action (7 values) is the joint target: ``commanded_positions`` in the recorded data.
 
-Timing: policy steps run at ``fps`` (default: the dataset's fps for ``replay``, else 30) on the
+Timing: policy steps run at ``fps`` (default: the dataset's fps for ``replay``, the fps in a learned
+policy's ``train_config.json`` or its training dataset, which is required otherwise; 30 for ``sine``) on the
 main thread. A sender thread streams servo frames at ``servo_hz`` (default 50 Hz, armd's control
 rate): when a policy step publishes a target, the sender interpolates linearly from the frame it
 last sent to the new target over one policy period, then holds the target. Every frame is clipped
@@ -51,6 +52,7 @@ import argparse
 import json
 import logging
 import math
+import os
 import queue
 import re
 import signal
@@ -104,12 +106,13 @@ class Policy:
     """``select(obs, step, t)`` returns the next 7 joint targets, or None when the policy is finished.
 
     ``inputs``: observation keys the policy reads; ``image_key`` / ``image_size`` (H, W) name the
-    camera input (None: no camera). ``fps``: the rate the policy was made for (None: unknown).
+    camera input (None: no camera). ``fps``: the rate the policy was made for (None: unknown, the
+    runner then needs an explicit ``fps``); scripted policies default to 30.
     """
 
     name = "policy"
     source = ""  # where a learned policy was loaded from (local directory / Hugging Face Hub)
-    fps: int | None = None
+    fps: int | None = 30
     inputs: tuple[str, ...] = (STATE_KEY,)
     image_key: str | None = None
     image_size: tuple[int, int] | None = None
@@ -244,6 +247,10 @@ class LeRobotPolicy(Policy):
             c, h, w = inputs[self.image_key].shape
             self.image_size = (int(h), int(w))
         self.inputs = tuple(inputs)
+        found = pretrained_fps(path)
+        self.fps = found[0] if found else None
+        if found:
+            log.info("policy fps %d from %s", *found)
         action = (cfg.output_features or {}).get("action")
         self.action_dim = int(action.shape[0]) if action is not None else None
 
@@ -258,6 +265,51 @@ class LeRobotPolicy(Policy):
             obs, self.policy, self.device, self.pre, self.post, use_amp=False, task=self.task, robot_type=ROBOT_TYPE
         )
         return action.squeeze(0).to("cpu").numpy().astype(np.float64)
+
+
+def _fps_value(value: Any) -> int | None:
+    return int(value) if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0 else None
+
+
+def pretrained_fps(path: str | Path) -> tuple[int, str] | None:
+    """``(fps, where it came from)`` for a LeRobot pretrained directory or Hub repo id, from its
+    ``train_config.json``: ``env.fps``, ``dataset.fps``, else the training dataset's ``meta/info.json``
+    (``dataset.root``, else ``$HF_LEROBOT_HOME/<dataset.repo_id>``). None when none of them is available."""
+    local = Path(path).expanduser()
+    cfg_file = local / "train_config.json"
+    if not local.is_dir():
+        try:
+            from huggingface_hub import hf_hub_download
+
+            cfg_file = Path(hf_hub_download(str(path), "train_config.json"))
+        except Exception as exc:  # no huggingface_hub, offline, no such file
+            log.info("no train_config.json for %s: %s", path, exc)
+            return None
+    try:
+        cfg = json.loads(cfg_file.read_text())
+    except (OSError, ValueError) as exc:
+        log.info("no usable train_config.json in %s: %s", path, exc)
+        return None
+    for section in ("env", "dataset"):
+        fps = _fps_value((cfg.get(section) or {}).get("fps"))
+        if fps:
+            return fps, f"{cfg_file} {section}.fps"
+    dataset = cfg.get("dataset") or {}
+    roots = []
+    if dataset.get("root"):
+        roots.append(Path(dataset["root"]).expanduser())
+    if dataset.get("repo_id"):
+        home = os.environ.get("HF_LEROBOT_HOME") or Path.home() / ".cache" / "huggingface" / "lerobot"
+        roots.append(Path(home) / str(dataset["repo_id"]))
+    for root in roots:
+        info = root / "meta" / "info.json"
+        try:
+            fps = _fps_value(json.loads(info.read_text()).get("fps"))
+        except (OSError, ValueError):
+            continue
+        if fps:
+            return fps, str(info)
+    return None
 
 
 def parse_policy(spec: str, device: str | None = None, task: str = "") -> Policy:
@@ -441,7 +493,13 @@ class PolicyRunner:
         send_timeout_s: float = SEND_TIMEOUT_S,
         sender_join_s: float = 2 * SEND_TIMEOUT_S,
     ) -> None:
-        fps_v = _positive("fps", policy.fps or 30 if fps is None else fps)
+        if fps is None and policy.fps is None:
+            raise ValueError(
+                f"fps of {policy.name} is unknown (no fps in its train_config.json or training dataset): pass --fps"
+            )
+        if fps is not None and policy.fps is not None and fps != policy.fps:
+            log.warning("fps %s differs from the %d fps %s was made for", fps, policy.fps, policy.name)
+        fps_v = _positive("fps", policy.fps if fps is None else fps)
         if fps_v != int(fps_v):
             raise ValueError(f"fps must be a whole number, got {fps!r}")
         self.fps = int(fps_v)
@@ -1009,7 +1067,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         required=True,
         help="LeRobot pretrained dir / Hub repo id, replay:<dataset root>:<episode>, or sine:<joint>:<amp>:<period>",
     )
-    p.add_argument("--fps", type=int, help="policy steps per second (default: dataset fps for replay, else 30)")
+    p.add_argument(
+        "--fps",
+        type=int,
+        help="policy steps per second (default: dataset fps for replay, train_config.json fps for a learned policy "
+        "(required when it has none), 30 for sine)",
+    )
     p.add_argument("--servo-hz", type=float, default=50.0, help="servo frame rate (default 50)")
     p.add_argument("--max-seconds", type=float, default=60.0)
     p.add_argument("--max-steps", type=int, help="stop after this many policy steps")

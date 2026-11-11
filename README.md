@@ -759,7 +759,7 @@ The runner imports them only for a learned policy.
 | Option | Meaning |
 |---|---|
 | `--policy` | LeRobot pretrained directory or Hub repo id; `replay:<dataset root>:<episode>` (the episode's `action` column); `sine:<joint>:<amp rad>:<period s>` (joint 1..7 or a name, amp <= 0.5 rad); a `scripted:` prefix is accepted; any other `<word>:` prefix is refused (not looked up on the Hub). The run prints whether a learned policy came from a local directory or the Hub |
-| `--fps` | policy steps per second (default: the dataset fps for `replay`, else 30); use the fps of the training dataset |
+| `--fps` | policy steps per second. Default: the dataset fps for `replay`; for a learned policy the fps in its `train_config.json` (`env.fps`, `dataset.fps`, else the training dataset's `meta/info.json` from `dataset.root` or `$HF_LEROBOT_HOME/<dataset.repo_id>`), and `--fps` is required when none is found; 30 for `sine`. A different `--fps` is logged as a warning |
 | `--servo-hz` | servo frame rate (default 50, armd's control rate) |
 | `--max-seconds` | run length (default 60) |
 | `--max-steps` | stop after this many policy steps (default: no limit) |

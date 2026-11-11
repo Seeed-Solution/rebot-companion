@@ -359,6 +359,35 @@ def test_unknown_prefix_is_not_sent_to_the_hub(monkeypatch):
     assert loaded == ["user/act_pick_cup"]
 
 
+def test_pretrained_fps_from_train_config(tmp_path, monkeypatch):
+    from rebot_companion.policy_runner import pretrained_fps
+
+    model = tmp_path / "model"
+    model.mkdir()
+    assert pretrained_fps(model) is None  # no train_config.json
+    cfg = model / "train_config.json"
+    cfg.write_text(json.dumps({"env": {"fps": 15}, "dataset": {"repo_id": "test/home"}}))
+    assert pretrained_fps(model)[0] == 15
+    home_dataset(tmp_path / "ds", image=False)
+    cfg.write_text(json.dumps({"env": None, "dataset": {"repo_id": "test/home", "root": str(tmp_path / "ds")}}))
+    assert pretrained_fps(model) == (FPS, str(tmp_path / "ds" / "meta" / "info.json"))
+    monkeypatch.setenv("HF_LEROBOT_HOME", str(tmp_path / "cache"))
+    cfg.write_text(json.dumps({"env": None, "dataset": {"repo_id": "test/home", "root": None}}))
+    assert pretrained_fps(model) is None  # dataset not in the cache
+    (tmp_path / "cache" / "test").mkdir(parents=True)
+    (tmp_path / "ds").rename(tmp_path / "cache" / "test" / "home")
+    assert pretrained_fps(model)[0] == FPS
+
+
+def test_unknown_policy_fps_needs_an_explicit_fps():
+    class Unknown(Policy):
+        fps = None
+
+    with pytest.raises(ValueError, match="--fps"):
+        PolicyRunner(None, Unknown())
+    assert PolicyRunner(None, Unknown(), fps=15).fps == 15
+
+
 def test_replay_round_trip(arm, tmp_path):
     """Recorder dataset -> replay through armd -> recorder observes the arm -> same trajectory."""
     actions = home_dataset(tmp_path / "a")

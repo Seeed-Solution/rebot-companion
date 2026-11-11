@@ -702,7 +702,7 @@ rebot-companion 安装到已装有 lerobot 的 Python 环境（例如训练环�
 | 选项 | 含义 |
 |---|---|
 | `--policy` | LeRobot 预训练目录或 Hub repo id；`replay:<数据集根目录>:<episode>`（该 episode 的 `action` 列）；`sine:<关节>:<振幅 rad>:<周期 s>`（关节 1..7 或关节名，振幅 <= 0.5 rad）；可加 `scripted:` 前缀；其他 `<词>:` 前缀会被拒绝（不当作 Hub repo id 查找）。运行时输出学习策略来自本地目录还是 Hub |
-| `--fps` | 每秒策略步数（`replay` 默认取数据集 fps，其余默认 30）；应与训练数据集的 fps 一致 |
+| `--fps` | 每秒策略步数。默认：`replay` 取数据集 fps；学习策略取其 `train_config.json` 中的 fps（`env.fps`、`dataset.fps`，否则读训练数据集的 `meta/info.json`，路径为 `dataset.root` 或 `$HF_LEROBOT_HOME/<dataset.repo_id>`），都找不到时必须传 `--fps`；`sine` 为 30。传入的 `--fps` 与其不同时输出警告 |
 | `--servo-hz` | servo 帧率（默认 50，即 armd 控制频率） |
 | `--max-seconds` | 运行时长（默认 60） |
 | `--max-steps` | 运行这么多个策略步后停止（默认不限） |
