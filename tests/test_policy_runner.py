@@ -228,6 +228,41 @@ def test_stop_on_policy_stall(arm):
     assert res.parked
 
 
+def test_interrupt_during_torque_on_parks_and_releases(arm, monkeypatch):
+    real = ArmSession.torque
+
+    def torque_then_ctrl_c(self, enable):
+        real(self, enable)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(ArmSession, "torque", torque_then_ctrl_c)
+    res = runner(arm, SinePolicy(0, 0.05, 1.0), max_seconds=5).run()
+    assert res.reason == "interrupted" and res.steps == 0 and arm.servo_log == []
+    assert res.parked, res
+    assert arm.commands[0] == "/api/v1/torque" and arm.commands[-1] == "/api/v1/motion/unload"
+    assert not arm.is_torqued and arm.lease is None
+
+
+def test_interrupt_before_torque_on_only_releases(arm, monkeypatch):
+    def ctrl_c(self):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(PolicyRunner, "_resolve_obs_age", ctrl_c)
+    arm.state, arm.is_torqued = "Armed", True  # nothing to switch on
+    res = runner(arm, SinePolicy(0, 0.05, 1.0), max_seconds=5).run()
+    assert res.reason == "interrupted"
+    assert arm.commands == [] and arm.lease is None
+
+
+def test_cli_ctrl_c_before_the_run_returns_130(http_armd, capsys, monkeypatch):
+    def ctrl_c(self):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(PolicyRunner, "run", ctrl_c)
+    assert main(["--armd", http_armd.http_url, "--policy", "sine:1:0.05:1"]) == 130
+    assert "interrupted" in capsys.readouterr().err
+
+
 def test_stop_on_bad_action(arm):
     class Short(Policy):
         def select(self, obs, step, t):

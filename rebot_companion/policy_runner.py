@@ -567,6 +567,7 @@ class PolicyRunner:
         self._log_file = None
         self._last_seq: Any = None
         self._streaming = False
+        self._torque_sent = False  # torque-on was sent: the arm may be armed, so cleanup stops and parks
 
     # ---- stop bookkeeping ----------------------------------------------------
 
@@ -824,7 +825,7 @@ class PolicyRunner:
                 self._stop.set()
                 sender_done = self._stop_sender()
                 self.result.duration_s = round(time.monotonic() - t_start, 3)
-                if self._streaming and sender_done:
+                if (self._streaming or self._torque_sent) and sender_done:
                     self._finish()
         finally:
             if self.session is not None:
@@ -892,6 +893,7 @@ class PolicyRunner:
         if obs.collision and obs.collision.get("active"):
             raise RunnerError("arm is holding after a collision; wait until it resumes")
         if not obs.is_torqued or not obs.is_operational:
+            self._torque_sent = True  # before the call: an interrupt can arrive after armd applied it
             s.torque(True)
             deadline = time.monotonic() + self.connect_timeout
             while not (obs.is_torqued and obs.is_operational):
@@ -1018,7 +1020,8 @@ class PolicyRunner:
         if not self.result.reason:
             self.result.reason = "stopped"
         try:
-            obs = s.latest_observation()
+            # a fresh observation: after an interrupt during torque-on the latest one predates the ack
+            obs = s.wait_for_observation(1.0)
         except RebotError as exc:
             self.result.park_detail = f"not parked: {exc}"
             return
@@ -1148,6 +1151,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (RunnerError, ValueError, ImportError, RebotError, OSError) as exc:
         print(f"rebot-policy: {exc}", file=sys.stderr)
         return 1
+    except KeyboardInterrupt:  # before the stream started (loading the policy, connecting)
+        print("rebot-policy: interrupted", file=sys.stderr)
+        return 130
     _print_summary(result)
     if result.reason == "interrupted":
         return 130

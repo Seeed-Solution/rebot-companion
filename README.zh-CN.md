@@ -736,7 +736,7 @@ schema 没有给出 7 个有限且 min < max 的关节限位时，运行器在�
 `MOTION_BUSY`）、连接断开、策略停滞、相机帧过旧、动作非有限值或长度不对、策略异常、回放的 episode
 结束、`--max-steps`、`--max-seconds`、Ctrl+C 或 SIGTERM。之后结束 servo 流，机械臂保持（`motion/stop`）并停靠
 （`unload`），`--no-park` 时不停靠；Fault、急停、碰撞保持或租约丢失后不停靠（汇总写明原因）。请求停止后不再发送 servo 帧；每次 socket 发送最长 1 s。停止 2 s 后（`sender_join_s`，至少为发送超时的 1.5 倍）发送线程仍未结束时，运行器
-发送无需租约的 REST 急停且不停靠。运行器不会
+发送无需租约的 REST 急停且不停靠。准备阶段（上力矩、预热）在已发送上力矩命令后按 Ctrl+C，同样停止并停靠；在此之前只释放租约。运行器不会
 清除故障。退出码：`max_seconds`、`max_steps` 或回放结束为 0，Ctrl+C 为 130，其余为 1。Python API：
 `PolicyRunner(ArmdClient(url), parse_policy(spec), camera).run()` 返回 `RunResult`。
 
