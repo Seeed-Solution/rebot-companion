@@ -677,6 +677,16 @@ CLI。`LeRobotDataset(repo_id, root=...)` 能加载结果并读出图像、动�
 解码）和 0.7.0（torchcodec 解码），Linux aarch64。该测试在 `REBOT_LEROBOT_PYTHON` 指向装有
 `lerobot[dataset]` 的 Python 时运行，否则跳过。尚未在真实 armd 和 reCamera 上运行。
 
+**在仿真器中。** armd 的 `sim` 从动臂和 `rebot-sim` 的仿真腕部相机（见 [rebot-armd](https://github.com/Seeed-Solution/rebot-armd) 的 `docs/simulation.zh-CN.md`）可代替机械臂和 reCamera：仿真器在 `ws://127.0.0.1:8001/` 以 reCamera 格式输出 H.264 视频流，armd 监听 `127.0.0.1:8765`。在 rebot-armd 仓库中：
+
+```bash
+cd sim/mujoco && uv run rebot-sim --camera --objects cube,cup --seed 3   # 终端 1
+ARMD_DETECTOR_URL=http://127.0.0.1:8090 cargo run --bin armd -- --follower sim \
+  --config kits/recamera-b601dm/profile/rebot-b601dm.json --log-dir off --blackbox-dir off   # 终端 2
+```
+
+`/userdata` 不存在时把 `ARMD_POSES`、`ARMD_KEEPOUT`、`ARMD_GRASP_SETUP` 设为可写路径。然后用 `--armd 127.0.0.1 --camera 127.0.0.1` 录制。仿真相机默认 15 fps（`rebot-sim --fps`，1..30）；录制器为 30 fps 时每隔一行重复一帧相机画面。在 spark 上运行（Linux aarch64，2026-11-11，rebot-armd b3ff997）：`--no-prompt` 录制一段 3 s 的 episode，得到 91 行、1280x720 的 `observation.images.recamera` 视频，迟到 tick 0 次，相机帧重复 45 次。rebot-armd 的 `sim/mujoco/tests/test_camera.py` 也用 rebot-companion 的 `snapshot` 解码器解码该视频流。
+
 ---
 
 ## 运行学习策略
@@ -747,7 +757,9 @@ servo 被拒、策略停滞、错误动作和策略异常时停止；结束时�
 初始化的 ACT 策略（lerobot 0.7.0，按录制器的合成特征构建：7 关节状态与动作、一个 64x48 相机）以 reCamera
 格式的 H.264 WebSocket 流为图像输入运行 10 步；该测试在 lerobot 可导入或
 `REBOT_LEROBOT_PYTHON` 指向装有 `lerobot[dataset]`、PyAV、pyarrow 和 scipy 的 Python 时运行，否则跳过。
-相同的 lerobot 调用在 0.6.1 中也存在（读过源码，未运行）。尚未在真实 armd、仿真器或训练过的策略上运行。
+相同的 lerobot 调用在 0.6.1 中也存在（读过源码，未运行）。
+
+在仿真器中（环境搭建同[录制 LeRobot 数据集](#录制-lerobot-数据集)；armd 报告的从动臂为 `sim`，因此不需要 `--i-am-at-the-arm`；图像策略加 `--camera 127.0.0.1`）：在 spark 上（2026-11-11，rebot-armd b3ff997），对从仿真器录制的 3 s episode 运行 `--policy replay:<dataset>:0`，执行 91 步、154 个 servo 帧，迟到 0 次，结束后收纳；`--policy sine:1:0.05:4 --max-seconds 5` 执行 150 步、250 个 servo 帧，迟到 0 次，以 `max_seconds` 停止。尚未在真实 armd 上运行，未在仿真器中运行学习策略，也未运行训练过的策略。
 
 ---
 
