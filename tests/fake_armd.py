@@ -130,6 +130,7 @@ class FakeArmd:
         self.collision_bodies: list[dict] = []
         self.collision_next_actions = 0  # trip halfway through each of the next N actions (resume after 0.2 s)
         self.trigger_bodies: list = []
+        self.ack_delays: dict[str, float] = {}  # command path -> seconds the ack is held (persisted commands)
         self._stop = threading.Event()
         self._next_conn = 1
 
@@ -485,7 +486,12 @@ class FakeArmd:
                     reply, local_gen, label, last_seq, last_req = self.handle(
                         conn, msg, kind, local_gen, label, last_seq, last_req
                     )
-                if reply is not None:
+                delay = self.ack_delays.get(msg.get("path", "")) if kind == "command" else None
+                if reply is not None and delay:
+                    # armd acks persisted commands after the disk write: the ack (with the epoch at
+                    # processing time) can arrive after newer telemetry and after later requests' acks
+                    threading.Timer(delay, self.send, (conn, json.dumps(reply))).start()
+                elif reply is not None:
                     self.send(conn, json.dumps(reply))
         except ConnectionClosed:
             pass

@@ -591,3 +591,54 @@ def test_timed_out_lookups_do_not_pile_up_resolver_threads(monkeypatch):
         assert len(lookups) <= 2
     finally:
         gate.set()
+
+
+def test_a_delayed_ack_never_lowers_the_epoch(armd):
+    armd.devplat = True
+    armd.ack_delays["/api/v1/poses/save"] = 0.4
+    with armd.client.session(client_id="persist", safe_exit="off") as s:
+        s.torque(True)
+        n = s.epoch_id
+        saver = threading.Thread(target=s.save_pose, args=("scan",))
+        saver.start()
+        time.sleep(0.1)  # armd processed the save at epoch N; its ack is still on the way
+        with armd.lock:
+            armd.epoch += 1  # e.g. a fault cleared elsewhere: telemetry now carries N + 1
+        deadline = time.monotonic() + 2.0
+        while s.epoch_id != n + 1 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert s.epoch_id == n + 1
+        saver.join(2.0)  # the ack with epoch N arrives now
+        assert s.epoch_id == n + 1
+        assert s.stop()["type"] == "command_ack"  # sent with N + 1, not rejected as EPOCH_MISMATCH
+
+
+def test_acks_arriving_out_of_request_order_are_matched(armd):
+    armd.devplat = True
+    armd.ack_delays["/api/v1/poses/save"] = 0.4
+    with armd.client.session(client_id="order", safe_exit="off") as s:
+        s.torque(True)
+        replies = {}
+
+        def save():
+            replies["save"] = s.command("/api/v1/poses/save", {"name": "bin_a"})
+
+        saver = threading.Thread(target=save)
+        saver.start()
+        time.sleep(0.1)
+        replies["stop"] = s.command("/api/v1/motion/stop")  # later request, answered first
+        assert "save" not in replies
+        saver.join(2.0)
+        assert replies["save"]["type"] == replies["stop"]["type"] == "command_ack"
+        assert replies["save"]["request_id"] < replies["stop"]["request_id"]
+        assert armd.poses["bin_a"]["name"] == "bin_a"
+
+
+def test_an_older_lease_grant_never_replaces_the_generation(armd):
+    with armd.client.session(client_id="gen", safe_exit="off") as s:
+        current = s.generation
+        stale = {"type": "lease_granted", "generation": current - 1, "seq": 99}
+        s._request = lambda *a, **kw: stale
+        with pytest.raises(LeaseError):
+            s._acquire_lease()
+        assert s.generation == current

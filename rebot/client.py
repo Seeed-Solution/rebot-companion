@@ -520,6 +520,7 @@ class ArmSession:
         self._lease_seqs = itertools.count(1)
         self._servo_seq = 0
         self._generation: int | None = None
+        self._last_generation = 0  # highest generation granted on this session
         self._epoch: int | None = None
         self._obs: ArmStatus | None = None
         self._frames = 0
@@ -755,12 +756,14 @@ class ArmSession:
             if kind is None:
                 if "positions" in msg and "safety_state" in msg:
                     self._obs = ArmStatus.from_dict(msg)
-                    self._epoch = self._obs.epoch_id
+                    self._advance_epoch(self._obs.epoch_id)
                     self._frames += 1
                     self._state.notify_all()
                 return
             if isinstance(msg.get("epoch_id"), int):
-                self._epoch = msg["epoch_id"]
+                # armd acks persisted commands (poses, keep-out, collision, grasp setup) after the
+                # disk write, so an ack can carry an epoch older than telemetry already received.
+                self._advance_epoch(msg["epoch_id"])
             pending: _Pending | None = None
             if kind in ("command_ack", "command_reject"):
                 pending = self._pending.pop(("command", msg.get("request_id")), None)
@@ -783,6 +786,11 @@ class ArmSession:
         if pending is not None:
             pending.reply = msg
             pending.event.set()
+
+    def _advance_epoch(self, epoch: int) -> None:
+        """Epochs only move forward: a delayed message never lowers the epoch (caller holds _state)."""
+        if self._epoch is None or epoch > self._epoch:
+            self._epoch = epoch
 
     def _heartbeat_loop(self) -> None:
         while not self._stop.wait(self.heartbeat_interval):
@@ -851,7 +859,9 @@ class ArmSession:
             extra = f" (retry in {reply['remaining_ms']} ms)" if "remaining_ms" in reply else ""
             raise LeaseError(f"armd rejected the lease: {reason}{extra}", reason=reason, raw=reply)
         with self._state:
-            self._generation = reply["generation"]
+            if reply["generation"] < self._last_generation:  # armd's lease generations only increase
+                raise LeaseError("armd answered with an older lease generation", reason="stale", raw=reply)
+            self._generation = self._last_generation = reply["generation"]
             self._lease_lost = None
             self._servo_seq = 0
 
