@@ -460,14 +460,16 @@ def test_act_policy_runs_10_steps(http_armd, camera_server, tmp_path):
     assert res.returncode == 0, res.stderr[-3000:]
     log_path = tmp_path / "act.jsonl"
     cmd = [python, "-m", "rebot_companion.policy_runner", "--armd", http_armd.http_url, "--camera", camera_server]
-    cmd += ["--policy", str(tmp_path / "act"), "--fps", str(FPS), "--max-seconds", str(10 / FPS)]
+    # end on the step count, not a wall-clock window: a late step (ACT chunk inference) re-anchors the
+    # schedule and would leave fewer than 10 steps in a 10-period max_seconds
+    cmd += ["--policy", str(tmp_path / "act"), "--fps", str(FPS), "--max-steps", "10", "--max-seconds", "30"]
     cmd += ["--device", "cpu", "--task", "pick the cup", "--log", str(log_path)]
     res = subprocess.run(cmd, capture_output=True, text=True, timeout=300, env=env)
     print(res.stdout)
     assert res.returncode == 0, res.stdout[-2000:] + res.stderr[-3000:]
     lines = [json.loads(x) for x in log_path.read_text().splitlines()]
     summary = lines[-1]["summary"]
-    assert summary["reason"] == "max_seconds" and summary["steps"] == 10, summary
+    assert summary["reason"] == "max_steps" and summary["steps"] == 10, summary
     assert summary["policy"].startswith("lerobot:act:")
     assert summary["frames"] > 0 and summary["parked"]
     steps = lines[:-1]
@@ -655,6 +657,17 @@ def test_malformed_telemetry_stops_the_sender(positions):
     r.session = StubSession(r, obs=obs_status(positions))
     r._send_loop()
     assert r.session.sent == [] and r.result.reason == "bad_observation"
+
+
+def test_max_steps_ends_the_run_after_that_many_steps(arm):
+    res = runner(arm, SinePolicy(0, 0.05, 1.0), max_seconds=30, max_steps=4, park=False).run()
+    assert res.reason == "max_steps" and res.ok and res.steps == 4, res
+
+
+@pytest.mark.parametrize("value", [0, -1, 1.5, True])
+def test_max_steps_is_validated(value):
+    with pytest.raises(ValueError, match="max_steps"):
+        PolicyRunner(None, SinePolicy(0, 0.05, 1.0), max_steps=value)
 
 
 @pytest.mark.parametrize("value", [float("nan"), 0, -0.1])

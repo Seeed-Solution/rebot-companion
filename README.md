@@ -762,6 +762,7 @@ The runner imports them only for a learned policy.
 | `--fps` | policy steps per second (default: the dataset fps for `replay`, else 30); use the fps of the training dataset |
 | `--servo-hz` | servo frame rate (default 50, armd's control rate) |
 | `--max-seconds` | run length (default 60) |
+| `--max-steps` | stop after this many policy steps (default: no limit) |
 | `--task` | task text passed to the policy (language-conditioned policies) |
 | `--device` | torch device (default `cuda` when available, else `cpu`) |
 | `--no-park` | hold position at the end instead of parking |
@@ -799,12 +800,12 @@ does not extend the run. Timing options must be finite and > 0.
 Stops: a joint measured so far beyond its limit that the intersection is empty, stale or malformed
 armd observation (not 7 finite positions), E-stop, Fault, collision hold, servo `blocked` hold, torque off, lease loss, servo rejection
 (for example `MOTION_BUSY`), connection loss, policy stall, stale camera frame, a non-finite or
-wrong-sized action, policy exception, end of a replayed episode, `--max-seconds`, Ctrl+C or
+wrong-sized action, policy exception, end of a replayed episode, `--max-steps`, `--max-seconds`, Ctrl+C or
 SIGTERM. Then the stream ends, the arm holds (`motion/stop`) and parks (`unload`) unless
 `--no-park`; no park after a Fault, E-stop, collision hold or lease loss (the summary says why).
 No servo frame is sent once a stop is requested; each socket send is bounded to 1 s. If the
 sender thread has not ended 2 s after a stop (`sender_join_s`, at least 1.5 × the send timeout), the runner sends the lease-free REST e-stop and does
-not park. The runner never clears a fault. Exit code 0 after `max_seconds` or the end of a replay, 130 after
+not park. The runner never clears a fault. Exit code 0 after `max_seconds`, `max_steps` or the end of a replay, 130 after
 Ctrl+C, else 1. Python API: `PolicyRunner(ArmdClient(url), parse_policy(spec), camera).run()`
 returns a `RunResult`.
 

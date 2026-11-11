@@ -705,6 +705,7 @@ rebot-companion 安装到已装有 lerobot 的 Python 环境（例如训练环�
 | `--fps` | 每秒策略步数（`replay` 默认取数据集 fps，其余默认 30）；应与训练数据集的 fps 一致 |
 | `--servo-hz` | servo 帧率（默认 50，即 armd 控制频率） |
 | `--max-seconds` | 运行时长（默认 60） |
+| `--max-steps` | 运行这么多个策略步后停止（默认不限） |
 | `--task` | 传给策略的任务文本（语言条件策略） |
 | `--device` | torch 设备（默认有 CUDA 时用 `cuda`，否则 `cpu`） |
 | `--no-park` | 结束时保持位置，不停靠 |
@@ -733,10 +734,10 @@ schema 没有给出 7 个有限且 min < max 的关节限位时，运行器在�
 
 停止条件：关节实测位置超出限位过多以致交集为空、armd 观测过旧或格式错误（不是 7 个有限值位置）、急停、Fault、碰撞保持、servo `blocked` 保持、力矩关闭、租约丢失、servo 被拒（如
 `MOTION_BUSY`）、连接断开、策略停滞、相机帧过旧、动作非有限值或长度不对、策略异常、回放的 episode
-结束、`--max-seconds`、Ctrl+C 或 SIGTERM。之后结束 servo 流，机械臂保持（`motion/stop`）并停靠
+结束、`--max-steps`、`--max-seconds`、Ctrl+C 或 SIGTERM。之后结束 servo 流，机械臂保持（`motion/stop`）并停靠
 （`unload`），`--no-park` 时不停靠；Fault、急停、碰撞保持或租约丢失后不停靠（汇总写明原因）。请求停止后不再发送 servo 帧；每次 socket 发送最长 1 s。停止 2 s 后（`sender_join_s`，至少为发送超时的 1.5 倍）发送线程仍未结束时，运行器
 发送无需租约的 REST 急停且不停靠。运行器不会
-清除故障。退出码：`max_seconds` 或回放结束为 0，Ctrl+C 为 130，其余为 1。Python API：
+清除故障。退出码：`max_seconds`、`max_steps` 或回放结束为 0，Ctrl+C 为 130，其余为 1。Python API：
 `PolicyRunner(ArmdClient(url), parse_policy(spec), camera).run()` 返回 `RunResult`。
 
 已验证（`tests/test_policy_runner.py`，fake armd）：servo 帧按顺序以约 50 Hz 到达且无丢帧；策略步之间的插值；

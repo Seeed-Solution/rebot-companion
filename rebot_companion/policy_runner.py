@@ -25,7 +25,8 @@ field, default 0.2 rad), so armd's lead cap does not have to act.
 
 Stop conditions: E-stop, Fault, collision hold, servo ``blocked`` hold, torque off, lease loss,
 servo rejection, connection loss, policy stall (no new target for ``stall_s``), stale camera frame,
-non-finite or wrong-sized action, end of a replayed episode, ``max_seconds``, Ctrl-C / SIGTERM.
+non-finite or wrong-sized action, end of a replayed episode, ``max_steps``, ``max_seconds``,
+Ctrl-C / SIGTERM.
 After a stop the stream ends, the arm holds (``motion/stop``) and parks (``unload``) unless
 ``park=False`` or armd cannot park (Fault, E-stop, collision hold, lease lost).
 
@@ -292,7 +293,7 @@ def _stats_ms(values: Sequence[float]) -> dict | None:
 
 @dataclass
 class RunResult:
-    reason: str  # max_seconds | policy_done | interrupted | estop | fault | collision_hold | blocked | ...
+    reason: str  # max_seconds | max_steps | policy_done | interrupted | estop | fault | collision_hold | blocked | ...
     detail: str = ""
     policy: str = ""
     follower: str | None = None
@@ -314,7 +315,7 @@ class RunResult:
 
     @property
     def ok(self) -> bool:
-        return self.reason in ("max_seconds", "policy_done")
+        return self.reason in ("max_seconds", "max_steps", "policy_done")
 
     def to_dict(self) -> dict:
         return {k: getattr(self, k) for k in self.__dataclass_fields__}
@@ -392,6 +393,7 @@ class PolicyRunner:
         fps: int | None = None,
         servo_hz: float = 50.0,
         max_seconds: float = 60.0,
+        max_steps: int | None = None,
         park: bool = True,
         operator_present: bool = False,
         stall_s: float = 1.0,
@@ -411,6 +413,9 @@ class PolicyRunner:
         if self.servo_hz < 10:
             raise ValueError("servo_hz must be >= 10 (armd drops a stream 200 ms after its last frame)")
         self.max_seconds = _positive("max_seconds", max_seconds)
+        if max_steps is not None and (isinstance(max_steps, bool) or not isinstance(max_steps, int) or max_steps < 1):
+            raise ValueError(f"max_steps must be a whole number >= 1, got {max_steps!r}")
+        self.max_steps = max_steps
         self.stall_s = _positive("stall_s", stall_s)
         self.max_frame_age_s = _positive("max_frame_age_s", max_frame_age_s)
         # None: max(0.1 s, 3 observation periods) at the rate armd actually sends, resolved at start
@@ -900,6 +905,9 @@ class PolicyRunner:
                     + "\n"
                 )
             k += 1
+            if self.max_steps is not None and k >= self.max_steps:
+                self.request_stop("max_steps", f"{k} steps")
+                break
 
     def _finish(self) -> None:
         s = self.session
@@ -971,6 +979,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--fps", type=int, help="policy steps per second (default: dataset fps for replay, else 30)")
     p.add_argument("--servo-hz", type=float, default=50.0, help="servo frame rate (default 50)")
     p.add_argument("--max-seconds", type=float, default=60.0)
+    p.add_argument("--max-steps", type=int, help="stop after this many policy steps")
     p.add_argument("--task", default="", help="task text for language-conditioned policies")
     p.add_argument("--device", help="torch device (default cuda if available, else cpu)")
     p.add_argument("--no-park", action="store_true", help="hold position at the end instead of parking")
@@ -1013,6 +1022,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             fps=args.fps,
             servo_hz=args.servo_hz,
             max_seconds=args.max_seconds,
+            max_steps=args.max_steps,
             park=not args.no_park,
             operator_present=args.i_am_at_the_arm,
             stall_s=args.stall_s,
