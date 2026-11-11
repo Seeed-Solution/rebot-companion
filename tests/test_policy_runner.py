@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -26,22 +27,53 @@ from websockets.sync.server import serve
 pytest.importorskip("av")
 pytest.importorskip("pyarrow")
 
-from rebot.client import ArmSession  # noqa: E402
-from rebot_companion.lerobot_recorder import LeRobotRecorder  # noqa: E402
+import rebot_companion.policy_runner as pr  # noqa: E402
+from rebot.client import ArmSession, ArmStatus  # noqa: E402
+from rebot_companion.lerobot_recorder import EXTRAS, LeRobotRecorder  # noqa: E402
 from rebot_companion.policy_runner import (  # noqa: E402
+    EXTRA_KEYS,
     Policy,
     PolicyRunner,
     ReplayPolicy,
     RunnerError,
     SinePolicy,
+    _Segment,
     main,
     parse_policy,
+    pretrained_fps,
 )
 
 REPO = Path(__file__).resolve().parent.parent
 FPS = 30
 CAM = "observation.images.recamera"
 W, H = 64, 48
+
+
+def sine() -> SinePolicy:
+    return SinePolicy(0, 0.05, 1.0)
+
+
+def hold(obs) -> np.ndarray:
+    """Target = the measured position."""
+    return np.array(obs["observation.state"], dtype=float)
+
+
+class Img(Policy):
+    image_key, image_size = CAM, (H, W)
+
+    def select(self, obs, step, t):
+        return hold(obs)
+
+
+class EStopClient:
+    """REST client stand-in that records e-stops."""
+
+    def __init__(self):
+        self.calls = []
+
+    def e_stop(self):
+        self.calls.append("e_stop")
+        return {}
 
 
 @pytest.fixture
@@ -182,7 +214,7 @@ def test_the_deadline_during_the_final_hold_reports_max_seconds(arm, kw):
 
 
 def test_no_park_holds(arm):
-    res = runner(arm, SinePolicy(0, 0.05, 1.0), park=False).run()
+    res = runner(arm, sine(), park=False).run()
     assert res.reason == "max_seconds"
     assert "/api/v1/motion/unload" not in arm.commands
     assert arm.state == "Armed" and arm.is_torqued
@@ -191,7 +223,7 @@ def test_no_park_holds(arm):
 
 def test_torques_on_an_idle_arm(arm):
     assert arm.state == "Idle"
-    runner(arm, SinePolicy(0, 0.05, 1.0), max_seconds=0.2).run()
+    runner(arm, sine(), max_seconds=0.2).run()
     assert arm.commands[0] == "/api/v1/torque"
 
 
@@ -221,7 +253,7 @@ def test_joint_limit_clip_on_the_gripper(arm):
 
 
 def test_stop_on_fault_does_not_park(arm):
-    res = run_with(arm, SinePolicy(0, 0.05, 1.0), lambda: arm.trigger_fault("FollowingError"), max_seconds=5)
+    res = run_with(arm, sine(), lambda: arm.trigger_fault("FollowingError"), max_seconds=5)
     assert res.reason == "fault" and res.detail == "FOLLOWING_ERROR"
     assert not res.parked and "Fault" in res.park_detail
     assert "/api/v1/motion/unload" not in arm.commands
@@ -229,13 +261,13 @@ def test_stop_on_fault_does_not_park(arm):
 
 
 def test_stop_on_estop(arm):
-    res = run_with(arm, SinePolicy(0, 0.05, 1.0), arm.do_estop, max_seconds=5)
+    res = run_with(arm, sine(), arm.do_estop, max_seconds=5)
     assert res.reason == "estop" and not res.parked
 
 
 def test_stop_on_collision_hold(arm):
     arm.collision_cfg["enabled"] = True
-    res = run_with(arm, SinePolicy(0, 0.05, 1.0), lambda: arm.trip_collision(resume_after_s=5), max_seconds=5)
+    res = run_with(arm, sine(), lambda: arm.trip_collision(resume_after_s=5), max_seconds=5)
     assert res.reason == "collision_hold"
     assert not res.parked and "collision" in res.park_detail
 
@@ -244,7 +276,7 @@ def test_stop_on_blocked_hold(arm):
     def block():
         arm.motion_limit = {"reason": "blocked", "joint": 1, "since_ms": 1}
 
-    res = run_with(arm, SinePolicy(0, 0.05, 1.0), block, max_seconds=5)
+    res = run_with(arm, sine(), block, max_seconds=5)
     assert res.reason == "blocked"
 
 
@@ -254,7 +286,7 @@ def test_stop_on_lease_loss(arm):
     def preempt():
         other["s"] = ArmSession(arm.client, client_id="cockpit", force=True).open()
 
-    res = run_with(arm, SinePolicy(0, 0.05, 1.0), preempt, max_seconds=5)
+    res = run_with(arm, sine(), preempt, max_seconds=5)
     other["s"].close()
     assert res.reason == "lease_lost"
     assert not res.parked and "lease" in res.park_detail
@@ -264,7 +296,7 @@ def test_stop_on_servo_rejection_then_parks(arm):
     def busy():
         arm.motion_gate = lambda targets, servo=False: (409, "MOTION_BUSY") if servo else None
 
-    res = run_with(arm, SinePolicy(0, 0.05, 1.0), busy, max_seconds=5)
+    res = run_with(arm, sine(), busy, max_seconds=5)
     assert res.reason == "servo_rejected" and "MOTION_BUSY" in res.detail
     assert res.parked
 
@@ -276,7 +308,7 @@ def test_stop_on_policy_stall(arm):
         def select(self, obs, step, t):
             if step == 3:
                 release.wait(10)  # held until the runner has given up on it
-            return np.array(obs["observation.state"], dtype=float)
+            return hold(obs)
 
     try:
         res = runner(arm, Slow(), max_seconds=5, stall_s=0.3).run()
@@ -294,7 +326,7 @@ def test_interrupt_during_torque_on_parks_and_releases(arm, monkeypatch):
         raise KeyboardInterrupt
 
     monkeypatch.setattr(ArmSession, "torque", torque_then_ctrl_c)
-    res = runner(arm, SinePolicy(0, 0.05, 1.0), max_seconds=5).run()
+    res = runner(arm, sine(), max_seconds=5).run()
     assert res.reason == "interrupted" and res.steps == 0 and arm.servo_log == []
     assert res.parked, res
     assert arm.commands[0] == "/api/v1/torque" and arm.commands[-1] == "/api/v1/motion/unload"
@@ -307,24 +339,21 @@ def test_interrupt_before_torque_on_only_releases(arm, monkeypatch):
 
     monkeypatch.setattr(PolicyRunner, "_resolve_obs_age", ctrl_c)
     arm.state, arm.is_torqued = "Armed", True  # nothing to switch on
-    res = runner(arm, SinePolicy(0, 0.05, 1.0), max_seconds=5).run()
+    res = runner(arm, sine(), max_seconds=5).run()
     assert res.reason == "interrupted"
     assert arm.commands == [] and arm.lease is None
 
 
 def test_cli_a_second_signal_during_cleanup_does_not_abort_stop_and_park(http_armd, capfd, monkeypatch):
     """Ctrl-C mid-run, then Ctrl-C and SIGTERM again during motion/stop and unload: cleanup completes."""
-    import signal
-
     if threading.current_thread() is not threading.main_thread():
         pytest.skip("signals are delivered to the main thread")
-    import rebot_companion.policy_runner as pr
 
     class CtrlC(Policy):
         def select(self, obs, step, t):
             if step == 3:
                 os.kill(os.getpid(), signal.SIGINT)
-            return np.array(obs["observation.state"], dtype=float)
+            return hold(obs)
 
     def again(real, *sigs):
         def wrapper(self, *a, **k):
@@ -370,7 +399,7 @@ def test_policy_exception_still_parks(arm):
         def select(self, obs, step, t):
             if step == 2:
                 raise RuntimeError("cuda out of memory")
-            return np.array(obs["observation.state"], dtype=float)
+            return hold(obs)
 
     res = runner(arm, Boom(), max_seconds=5).run()
     assert res.reason == "error" and "cuda" in res.detail
@@ -382,29 +411,17 @@ def test_stale_camera_stops():
         def latest(self):
             return (time.monotonic() - 2.0, np.zeros((H, W, 3), np.uint8))
 
-    class Img(Policy):
-        image_key, image_size = CAM, (H, W)
-
-        def select(self, obs, step, t):
-            return obs["observation.state"]
-
     r = PolicyRunner(None, Img(), Cam())
     assert r._camera_image(time.monotonic()) is None
     assert r.result.reason == "camera_stale"
 
 
 def test_extra_inputs_match_the_recorder_features():
-    from rebot_companion.lerobot_recorder import EXTRAS
-    from rebot_companion.policy_runner import EXTRA_KEYS
-
     assert EXTRA_KEYS == {"observation.velocity": "velocities", "observation.effort": "torques"}
     assert set(EXTRA_KEYS) == {key for key, _ in EXTRAS.values()}
 
 
 def test_image_policy_needs_a_camera():
-    class Img(Policy):
-        image_key, image_size = CAM, (H, W)
-
     with pytest.raises(RunnerError, match="camera"):
         PolicyRunner(None, Img())
 
@@ -415,22 +432,22 @@ def test_image_policy_needs_a_camera():
 def test_real_follower_needs_the_operator_flag(arm, monkeypatch):
     monkeypatch.setattr(arm.client, "get_safety_describe", lambda: {"device": {"follower": "rebot-dm"}})
     with pytest.raises(RunnerError, match="i-am-at-the-arm"):
-        runner(arm, SinePolicy(0, 0.05, 1.0)).run()
+        runner(arm, sine()).run()
     assert arm.acquires == []  # refused before taking the lease
-    res = runner(arm, SinePolicy(0, 0.05, 1.0), operator_present=True, max_seconds=0.2).run()
+    res = runner(arm, sine(), operator_present=True, max_seconds=0.2).run()
     assert res.reason == "max_seconds" and res.follower == "rebot-dm"
 
 
 def test_unknown_follower_needs_the_operator_flag(armd):
     armd.devplat = False  # no safety_describe -> follower unknown
     with pytest.raises(RunnerError, match="unknown"):
-        runner(armd, SinePolicy(0, 0.05, 1.0)).run()
+        runner(armd, sine()).run()
 
 
 def test_refuses_an_arm_in_fault(arm):
     arm.trigger_fault("FollowingError")
     with pytest.raises(RunnerError, match="Fault"):
-        runner(arm, SinePolicy(0, 0.05, 1.0)).run()
+        runner(arm, sine()).run()
     assert arm.servo_log == []
 
 
@@ -493,8 +510,6 @@ def test_replay_data_path_stays_inside_the_dataset(tmp_path, data_path, match):
 
 
 def test_unknown_prefix_is_not_sent_to_the_hub(monkeypatch):
-    import rebot_companion.policy_runner as pr
-
     loaded = []
     monkeypatch.setattr(pr, "LeRobotPolicy", lambda spec, **kw: loaded.append(spec))
     with pytest.raises(ValueError, match="unknown policy prefix"):
@@ -504,8 +519,6 @@ def test_unknown_prefix_is_not_sent_to_the_hub(monkeypatch):
 
 
 def test_pretrained_fps_from_train_config(tmp_path, monkeypatch):
-    from rebot_companion.policy_runner import pretrained_fps
-
     model = tmp_path / "model"
     model.mkdir()
     assert pretrained_fps(model) is None  # no train_config.json
@@ -539,16 +552,12 @@ def test_pretrained_fps_from_train_config(tmp_path, monkeypatch):
     ],
 )
 def test_malformed_train_config_fps_is_refused(tmp_path, cfg, match):
-    from rebot_companion.policy_runner import pretrained_fps
-
     (tmp_path / "train_config.json").write_text(json.dumps(cfg))  # json writes inf/nan as Infinity/NaN
     with pytest.raises(ValueError, match=match):
         pretrained_fps(tmp_path)
 
 
 def test_malformed_dataset_info_fps_is_refused(tmp_path):
-    from rebot_companion.policy_runner import pretrained_fps
-
     (tmp_path / "ds" / "meta").mkdir(parents=True)
     (tmp_path / "ds" / "meta" / "info.json").write_text(json.dumps({"fps": 29.97}))
     (tmp_path / "train_config.json").write_text(json.dumps({"dataset": {"root": str(tmp_path / "ds")}}))
@@ -632,11 +641,6 @@ def test_cli_sine(http_armd, tmp_path, capsys):
 
 
 def test_cli_rejects_without_camera(http_armd, capsys, monkeypatch):
-    class Img(Policy):
-        image_key, image_size = CAM, (H, W)
-
-    import rebot_companion.policy_runner as pr
-
     monkeypatch.setattr(pr, "parse_policy", lambda *a, **k: Img())
     assert main(["--armd", http_armd.http_url, "--policy", "x"]) == 1
     assert "--camera" in capsys.readouterr().err
@@ -741,8 +745,6 @@ def test_act_policy_runs_10_steps(http_armd, camera_server, tmp_path):
 
 
 def obs_status(positions=None, state="Moving"):
-    from rebot.client import ArmStatus
-
     return ArmStatus.from_dict(
         {
             "positions": list(HOME if positions is None else positions),
@@ -781,9 +783,7 @@ class StubSession:
 
 
 def stub_runner(policy=None, **kw):
-    from rebot_companion.policy_runner import _Segment
-
-    r = PolicyRunner(None, policy or SinePolicy(0, 0.05, 1.0), **kw)
+    r = PolicyRunner(None, policy or sine(), **kw)
     r.limits = list(LIMITS)
     r.result.lead_clips_per_joint = [0] * 7
     home = np.array(HOME)
@@ -804,20 +804,15 @@ def test_no_servo_frame_after_a_stop_requested_during_the_tick():
     assert r.result.reason == "fault"
 
 
-def test_request_stop_sets_the_event_before_anything_else():
+def test_request_stop_sets_the_event_before_anything_else(monkeypatch):
     r = stub_runner()
     seen = {}
-    import rebot_companion.policy_runner as pr
 
     def spy(*a, **k):
         seen["stop_set"] = r._stop.is_set()
 
-    old = pr.log.warning
-    pr.log.warning = spy
-    try:
-        r.request_stop("fault", "x")
-    finally:
-        pr.log.warning = old
+    monkeypatch.setattr(pr.log, "warning", spy)
+    r.request_stop("fault", "x")
     assert seen["stop_set"] is True
 
 
@@ -827,20 +822,13 @@ def test_a_hung_sender_fails_closed_with_e_stop():
     release = threading.Event()
     r._sender = threading.Thread(target=release.wait, daemon=True)
     r._sender.start()
-    calls = []
-
-    class Client:
-        def e_stop(self):
-            calls.append("e_stop")
-            return {}
-
-    r.client = Client()
+    r.client = EStopClient()
     r.session = StubSession(r)
     try:
         assert r._stop_sender() is False
     finally:
         release.set()
-    assert calls == ["e_stop"]
+    assert r.client.calls == ["e_stop"]
     assert "sender" in r.result.park_detail
 
 
@@ -870,7 +858,7 @@ def test_request_stop_does_not_wait_forever_for_a_stuck_send():
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), 0, -1])
 def test_timing_parameters_must_be_finite_and_positive(name, value):
     with pytest.raises(ValueError, match=name):
-        PolicyRunner(None, SinePolicy(0, 0.05, 1.0), **{name: value})
+        PolicyRunner(None, sine(), **{name: value})
 
 
 def test_the_sender_enforces_the_deadline():
@@ -889,7 +877,7 @@ def test_max_seconds_holds_while_inference_blocks(arm):
         def select(self, obs, step, t):
             if step == 1:
                 holder["r"]._stop.wait(5.0)  # released by the sender's deadline stop
-            return np.array(obs["observation.state"], dtype=float)
+            return hold(obs)
 
     r = runner(arm, Blocking(), max_seconds=0.1, stall_s=10, park=False)
     holder["r"] = r
@@ -920,20 +908,20 @@ def test_malformed_telemetry_stops_the_sender(positions):
 
 
 def test_max_steps_ends_the_run_after_that_many_steps(arm):
-    res = runner(arm, SinePolicy(0, 0.05, 1.0), max_seconds=30, max_steps=4, park=False).run()
+    res = runner(arm, sine(), max_seconds=30, max_steps=4, park=False).run()
     assert res.reason == "max_steps" and res.ok and res.steps == 4, res
 
 
 @pytest.mark.parametrize("value", [0, -1, 1.5, True])
 def test_max_steps_is_validated(value):
     with pytest.raises(ValueError, match="max_steps"):
-        PolicyRunner(None, SinePolicy(0, 0.05, 1.0), max_steps=value)
+        PolicyRunner(None, sine(), max_steps=value)
 
 
 @pytest.mark.parametrize("value", [float("nan"), 0, -0.1])
 def test_max_obs_age_is_validated(value):
     with pytest.raises(ValueError, match="max_obs_age_s"):
-        PolicyRunner(None, SinePolicy(0, 0.05, 1.0), max_obs_age_s=value)
+        PolicyRunner(None, sine(), max_obs_age_s=value)
 
 
 def test_fresh_telemetry_keeps_streaming():
@@ -949,8 +937,6 @@ def test_fresh_telemetry_keeps_streaming():
 def test_a_new_segment_starts_from_the_last_sent_frame():
     """After lead clipping the last sent frame lags the nominal path; the next segment starts there,
     not at the nominal point, so it does not keep pushing toward the old target."""
-    from rebot_companion.policy_runner import _Segment
-
     r = stub_runner()
     home = np.array(HOME)
     old_target = home.copy()
@@ -971,7 +957,7 @@ def test_the_first_segment_starts_from_the_measured_position(arm):
     """Before any frame is sent the reference is the measured position."""
     arm.positions = list(HOME)
     arm.positions[0] = 0.05
-    r = runner(arm, SinePolicy(0, 0.05, 1.0), max_seconds=0.05, park=False)
+    r = runner(arm, sine(), max_seconds=0.05, park=False)
     r.run()
     first = arm.servo_log[0][1]
     assert first[0] == pytest.approx(0.05, abs=0.02)
@@ -1017,7 +1003,7 @@ def test_bad_schema_limits_are_refused_before_torque(arm, monkeypatch, limits):
 
     monkeypatch.setattr(fake_armd, "LIMITS", limits)
     with pytest.raises(RunnerError, match="limits"):
-        runner(arm, SinePolicy(0, 0.05, 1.0)).run()
+        runner(arm, sine()).run()
     assert arm.commands == [] and arm.acquires == []
 
 
@@ -1032,14 +1018,7 @@ def test_stop_reaches_the_e_stop_within_its_bound_while_a_send_is_stuck():
             entered.set()
             release.wait()
 
-    calls = []
-
-    class Client:
-        def e_stop(self):
-            calls.append("e_stop")
-            return {}
-
-    r.session, r.client = Stuck(r), Client()
+    r.session, r.client = Stuck(r), EStopClient()
     r._sender = threading.Thread(target=r._send_loop, daemon=True)
     r._sender.start()
     assert entered.wait(5)
@@ -1054,7 +1033,7 @@ def test_stop_reaches_the_e_stop_within_its_bound_while_a_send_is_stuck():
     threading.Thread(target=stopper, daemon=True).start()
     try:
         assert done.wait(1.0), "request_stop/_stop_sender blocked behind the stuck send"
-        assert calls == ["e_stop"] and r.result.reason == "fault"
+        assert r.client.calls == ["e_stop"] and r.result.reason == "fault"
     finally:
         release.set()
 
@@ -1073,7 +1052,7 @@ def test_inference_that_never_returns_still_stops_parks_and_releases(arm, kw, re
         def select(self, obs, step, t):
             if step == 2:
                 never.wait()  # blocks until the test ends
-            return np.array(obs["observation.state"], dtype=float)
+            return hold(obs)
 
     out = {}
     t = threading.Thread(target=lambda: out.setdefault("res", runner(arm, Forever(), **kw).run()), daemon=True)
@@ -1088,7 +1067,7 @@ def test_inference_that_never_returns_still_stops_parks_and_releases(arm, kw, re
 
 
 def test_the_inference_thread_ends_with_the_run_and_a_runner_runs_once(arm):
-    policy = SinePolicy(0, 0.05, 1.0)
+    policy = sine()
     r = runner(arm, policy, max_steps=3, park=False)
     assert r.run().reason == "max_steps"
     t = policy._inference_thread
@@ -1105,7 +1084,7 @@ def test_a_policy_with_an_abandoned_inference_is_not_reused(arm):
         def select(self, obs, step, t):
             if step == 2:
                 never.wait(10)
-            return np.array(obs["observation.state"], dtype=float)
+            return hold(obs)
 
     policy = Forever()
     try:
@@ -1124,9 +1103,9 @@ def test_a_policy_with_an_abandoned_inference_is_not_reused(arm):
 @pytest.mark.parametrize("join", [0.5, 1.0, 1.49, float("nan")])
 def test_sender_join_must_exceed_the_send_timeout(join):
     with pytest.raises(ValueError, match="sender_join_s"):
-        PolicyRunner(None, SinePolicy(0, 0.05, 1.0), sender_join_s=join)  # default send timeout 1 s
-    PolicyRunner(None, SinePolicy(0, 0.05, 1.0), sender_join_s=1.5)
-    PolicyRunner(None, SinePolicy(0, 0.05, 1.0), send_timeout_s=0.02, sender_join_s=0.05)
+        PolicyRunner(None, sine(), sender_join_s=join)  # default send timeout 1 s
+    PolicyRunner(None, sine(), sender_join_s=1.5)
+    PolicyRunner(None, sine(), send_timeout_s=0.02, sender_join_s=0.05)
 
 
 # --------------------------------------------------------------------------- observation rate
@@ -1134,7 +1113,7 @@ def test_sender_join_must_exceed_the_send_timeout(join):
 
 def test_low_rate_telemetry_does_not_trip_the_default_age_check(arm):
     arm.obs_hz_cap = 5  # armd sends 5 observations per second
-    r = runner(arm, SinePolicy(0, 0.05, 1.0), max_seconds=1.0, park=False)
+    r = runner(arm, sine(), max_seconds=1.0, park=False)
     res = r.run()
     assert res.reason == "max_seconds", res
     assert r.max_obs_age_s >= 3 / 5 - 1e-6
@@ -1142,5 +1121,5 @@ def test_low_rate_telemetry_does_not_trip_the_default_age_check(arm):
 
 def test_an_explicit_obs_age_still_applies_to_low_rate_telemetry(arm):
     arm.obs_hz_cap = 5
-    res = runner(arm, SinePolicy(0, 0.05, 1.0), max_seconds=2.0, park=False, max_obs_age_s=0.05).run()
+    res = runner(arm, sine(), max_seconds=2.0, park=False, max_obs_age_s=0.05).run()
     assert res.reason == "stale_observation"
