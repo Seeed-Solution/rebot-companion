@@ -109,7 +109,7 @@ def test_interpolates_between_policy_steps(arm):
     j1 = [round(t[0], 4) for _, t, _ in arm.servo_log]
     rising = [v for v in j1 if 0.001 < v < 0.099]
     assert len(rising) >= 5, j1
-    assert j1 == sorted(j1)
+    assert j1 == sorted(j1), j1
 
 
 def test_no_park_holds(arm):
@@ -669,3 +669,37 @@ def test_fresh_telemetry_keeps_streaming():
     r.session = StubSession(r, max_frames=3)
     r._send_loop()
     assert len(r.session.sent) == 3 and r.result.reason == "test_done"
+
+
+# --------------------------------------------------------------------------- interpolation start
+
+
+def test_a_new_segment_starts_from_the_last_sent_frame():
+    """After lead clipping the last sent frame lags the nominal path; the next segment starts there,
+    not at the nominal point, so it does not keep pushing toward the old target."""
+    from rebot_companion.policy_runner import _Segment
+
+    r = stub_runner()
+    home = np.array(HOME)
+    old_target = home.copy()
+    old_target[0] = 1.0
+    r._segment = _Segment(home, old_target, time.monotonic() - 1.0, 0.1)  # nominal point: 1.0 rad
+    sent = home.copy()
+    sent[0] = 0.19  # what the lead clip let through
+    r._last_sent = sent
+    new_target = home.copy()
+    new_target[0] = 0.2
+    r._publish(new_target)
+    np.testing.assert_allclose(r._segment.start, sent)
+    frames = [r._segment.at(r._segment.t0 + f * r._segment.duration) for f in np.linspace(0, 1, 6)]
+    assert all(0.19 - 1e-9 <= f[0] <= 0.2 + 1e-9 for f in frames)
+
+
+def test_the_first_segment_starts_from_the_measured_position(arm):
+    """Before any frame is sent the reference is the measured position."""
+    arm.positions = list(HOME)
+    arm.positions[0] = 0.05
+    r = runner(arm, SinePolicy(0, 0.05, 1.0), max_seconds=0.05, park=False)
+    r.run()
+    first = arm.servo_log[0][1]
+    assert first[0] == pytest.approx(0.05, abs=0.02)

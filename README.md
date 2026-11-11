@@ -781,8 +781,8 @@ step; ACT-style policies return the next action of their chunk). Policies with m
 or other inputs are refused.
 
 Timing: policy steps run at `--fps` on the main thread. A sender thread streams servo frames at
-`--servo-hz`: each new target is reached by linear interpolation from the last sent frame over one
-policy period, then held. Every frame is clipped to the joint limits and, for joints 1..6, to
+`--servo-hz`: each new target is reached by linear interpolation from the last sent frame (after clipping;
+the measured position before the first frame) over one policy period, then held. Every frame is clipped to the joint limits and, for joints 1..6, to
 measured position ± 0.95 × `servo_max_lead_rad` (armd schema, default 0.2 rad); the summary counts
 clipped frames per joint and the `observation.motion_limit` reasons armd reported. A step that is
 more than one period late is counted and the schedule restarts from it (no burst of catch-up steps).

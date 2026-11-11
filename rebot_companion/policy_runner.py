@@ -384,7 +384,7 @@ class PolicyRunner:
         self.limits: list[tuple[float, float]] = []
         self.result = RunResult(reason="", policy=policy.name, fps=self.fps, servo_hz=self.servo_hz)
         self._stop = threading.Event()
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         # Held across "stop requested?" + servo send, and by request_stop: once request_stop returns, no
         # further frame is sent (a frame already in the socket finishes, bounded by SEND_TIMEOUT_S).
         self._send_lock = threading.RLock()
@@ -554,17 +554,18 @@ class PolicyRunner:
                     self.request_stop(*stop)
                     break
                 with self._lock:
-                    seg, last_target = self._segment, self._last_target_t
+                    last_target = self._last_target_t
                 if now - last_target > self.stall_s:
                     self.request_stop("policy_stall", f"no new target for {now - last_target:.2f} s")
                     break
-                frame = self._shape(seg.at(now), obs.positions)
-                with self._send_lock:
+                # Lock order send_lock -> lock (as in request_stop). Holding _lock from reading the segment
+                # until _last_sent is updated keeps _publish from starting a segment at an older frame.
+                with self._send_lock, self._lock:
                     if self._stop.is_set() or time.monotonic() >= self._deadline:
                         break
+                    frame = self._shape(self._segment.at(now), obs.positions)
                     s.servo(frame.tolist())
-                    with self._lock:
-                        self._last_sent = frame
+                    self._last_sent = frame
                 self.result.frames += 1
                 next_t += period
                 delay = next_t - time.monotonic()
@@ -590,7 +591,11 @@ class PolicyRunner:
     def _publish(self, target: np.ndarray) -> None:
         now = time.monotonic()
         with self._lock:
-            start = self._segment.at(now) if self._segment is not None else target
+            # start from what armd last received (after clipping), not from the nominal path
+            if self._last_sent is not None:
+                start = self._last_sent.copy()
+            else:
+                start = self._segment.at(now) if self._segment is not None else target
             self._segment = _Segment(np.asarray(start, dtype=np.float64), target, now, 1.0 / self.fps)
             self._last_target_t = now
 
@@ -702,6 +707,7 @@ class PolicyRunner:
         here = np.asarray(s.latest_observation().positions, dtype=np.float64)
         with self._lock:
             self._segment = _Segment(here, here, time.monotonic(), 0.0)
+            self._last_sent = here.copy()  # reference for the first segment: the measured position
             self._last_target_t = time.monotonic()
         self._sender = threading.Thread(target=self._send_loop, name="policy-servo", daemon=True)
         # absolute end of the stream, enforced by the sender whatever the policy's inference time
