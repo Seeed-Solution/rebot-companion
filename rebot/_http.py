@@ -69,6 +69,25 @@ class HttpStatusError(HttpError):
         super().__init__(f"HTTP {response.status}" + (f": {detail}" if detail else ""))
 
 
+def host_url(scheme: str, host: str, default_port: int, port: Optional[int] = None) -> str:
+    """``scheme://host:port`` from ``host``, ``host:port``, an IPv6 literal (``fe80::1``,
+    ``[fe80::1]`` or ``[fe80::1]:9000``) or a full URL (passed through without a trailing ``/``)."""
+    host = host.strip()
+    if "://" in host:
+        return host.rstrip("/")
+    if host.startswith("["):  # bracketed IPv6, maybe with a port
+        if port is None and "]:" in host:
+            return f"{scheme}://{host}"
+        return f"{scheme}://{host.split(']', 1)[0]}]:{port or default_port}"
+    if host.count(":") == 1:  # "host:port"
+        if port is None:
+            return f"{scheme}://{host}"
+        host = host.split(":", 1)[0]
+    elif ":" in host:  # bare IPv6 literal
+        host = f"[{host}]"
+    return f"{scheme}://{host}:{port or default_port}"
+
+
 Transport = Callable[[str, str, Optional[bytes], Dict[str, str], float], HttpResponse]
 
 
@@ -251,7 +270,6 @@ def socket_transport(
 
 
 default_transport = socket_transport
-urllib_transport = socket_transport
 
 
 def request(

@@ -304,6 +304,10 @@ def test_base_url(monkeypatch):
     assert _base_url("10.0.0.2:9000", None) == "http://10.0.0.2:9000"
     assert _base_url("10.0.0.2", 9000) == "http://10.0.0.2:9000"
     assert _base_url("http://h:1/", None) == "http://h:1"
+    assert _base_url("fe80::1", None) == "http://[fe80::1]:8765"
+    assert _base_url("fe80::1", 9000) == "http://[fe80::1]:9000"
+    assert _base_url("[fe80::1]", None) == "http://[fe80::1]:8765"
+    assert _base_url("[fe80::1]:9000", None) == "http://[fe80::1]:9000"
     monkeypatch.setenv("REBOT_HOST", "10.1.1.1")
     assert _base_url(None, None) == "http://10.1.1.1:8765"
 

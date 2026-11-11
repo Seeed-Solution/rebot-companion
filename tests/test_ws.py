@@ -235,3 +235,43 @@ def test_protocol_violations_close_with_an_error_code(frame, close_code):
     assert code == close_code
     with pytest.raises(_ws.WebSocketClosed):  # later calls see the closed connection
         ws.recv(timeout=0.1)
+
+
+def test_tls_socket_is_never_read_and_written_at_once():
+    """An ssl.SSLSocket (it has pending()) must not see recv and sendall from two threads together."""
+    a, b = socket.socketpair()
+    overlap = []
+    state = {"in_recv": False}
+
+    class FakeTls:
+        def pending(self):
+            return 2
+
+        def recv(self, n):
+            state["in_recv"] = True
+            time.sleep(0.2)
+            state["in_recv"] = False
+            return b"\x81\x00"  # empty text message
+
+        def sendall(self, data):
+            if state["in_recv"]:
+                overlap.append(len(data))
+
+        def fileno(self):
+            return a.fileno()
+
+        def shutdown(self, how):
+            pass
+
+        def close(self):
+            a.close()
+            b.close()
+
+    ws = _ws.WebSocket(FakeTls())
+    t = threading.Thread(target=ws.recv, kwargs={"timeout": 2})
+    t.start()
+    time.sleep(0.05)
+    ws.send("heartbeat")
+    t.join(2)
+    ws.close()
+    assert overlap == []

@@ -52,6 +52,7 @@ from typing import Any
 import numpy as np
 
 from rebot import _ws
+from rebot._http import host_url
 from rebot.client import ArmStatus
 
 log = logging.getLogger(__name__)
@@ -82,17 +83,15 @@ class RecorderError(RuntimeError):
 
 
 def armd_url(host: str) -> str:
-    """``192.168.16.1`` -> ``http://192.168.16.1:8765``; full URLs pass through."""
-    if "://" in host:
-        return host.rstrip("/")
-    return f"http://{host}" if ":" in host else f"http://{host}:{ARMD_PORT}"
+    """``192.168.16.1`` -> ``http://192.168.16.1:8765``; IPv6 literals are bracketed; full URLs pass through."""
+    return host_url("http", host, ARMD_PORT)
 
 
 def camera_url(host: str) -> str:
-    """``192.168.16.1`` -> ``ws://192.168.16.1:8001/``; full URLs pass through."""
+    """``192.168.16.1`` -> ``ws://192.168.16.1:8001/``; IPv6 literals are bracketed; full URLs pass through."""
     if "://" in host:
         return host
-    return f"ws://{host}/" if ":" in host else f"ws://{host}:{CAMERA_PORT}/"
+    return host_url("ws", host, CAMERA_PORT) + "/"
 
 
 # --------------------------------------------------------------------------- sources

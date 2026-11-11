@@ -28,6 +28,8 @@ from rebot_companion.lerobot_recorder import (  # noqa: E402
     LeRobotRecorder,
     ObservationStream,
     RecorderError,
+    armd_url,
+    camera_url,
 )
 
 FPS = 30
@@ -432,3 +434,13 @@ def test_cli_enter_driven(armd, tmp_path, monkeypatch, capsys):
     assert "discarded" in out
     info = json.loads((root / "meta/info.json").read_text())
     assert info["total_episodes"] == 2
+
+
+def test_host_urls_bracket_ipv6_literals():
+    assert armd_url("192.168.16.1") == "http://192.168.16.1:8765"
+    assert armd_url("h:9000") == "http://h:9000"
+    assert armd_url("fd00::2") == "http://[fd00::2]:8765"
+    assert armd_url("[fd00::2]:9000") == "http://[fd00::2]:9000"
+    assert camera_url("fd00::2") == "ws://[fd00::2]:8001/"
+    assert camera_url("192.168.16.1") == "ws://192.168.16.1:8001/"
+    assert camera_url("ws://x/y") == "ws://x/y"

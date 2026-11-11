@@ -26,6 +26,7 @@ import threading
 import time
 from typing import Any, Callable, List, Optional, Sequence, Union
 
+from ._http import host_url
 from ._log import _log
 from .client import ACTION_MAX_TIMEOUT_S, ActionResult, ArmdClient, ArmSession, ArmStatus, ObservationSchema
 from .detection import PIPELINES, Detection, DetectionClient, parse_detections
@@ -70,12 +71,7 @@ def _collision_message(exc: ActionFailed) -> str:
 
 
 def _base_url(host: Optional[str], port: Optional[int]) -> str:
-    host = (host or os.environ.get("REBOT_HOST") or "127.0.0.1").strip()
-    if "://" in host:
-        return host.rstrip("/")
-    if port is None and host.count(":") == 1:  # "host:port"
-        return f"http://{host}"
-    return f"http://{host}:{port or DEFAULT_PORT}"
+    return host_url("http", host or os.environ.get("REBOT_HOST") or "127.0.0.1", DEFAULT_PORT, port)
 
 
 def _fmt(xyz: Sequence[float]) -> str:

@@ -359,17 +359,6 @@ class DetectionClient:
         }
 
 
-PIPELINES = ("yolo", "aruco")
-
-
-def _ran(body: dict) -> list[str] | None:
-    """Pipelines that ran on a result frame (rebot-vision ``pipelines.*.ran``), else ``None``."""
-    p = body.get("pipelines")
-    if not isinstance(p, dict):
-        return None
-    return [k for k in PIPELINES if isinstance(p.get(k), dict) and p[k].get("ran") is True]
-
-
 def _ran(body: dict) -> list[str] | None:
     """Pipelines that ran on a result frame (rebot-vision ``pipelines.*.ran``), else ``None``."""
     p = body.get("pipelines")

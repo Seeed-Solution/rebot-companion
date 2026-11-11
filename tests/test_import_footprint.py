@@ -183,3 +183,31 @@ def test_http_socket_transport_delete_and_timeout():
 
     t.join(timeout=2.0)
     srv.close()
+
+
+def test_rebot_modules_define_each_top_level_name_once():
+    import ast
+
+    root = pathlib.Path(__file__).resolve().parent.parent / "rebot"
+    dups = []
+    for path in sorted(root.glob("*.py")):
+        seen = set()
+        for node in ast.parse(path.read_text()).body:
+            if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+                names = [node.name]
+            elif isinstance(node, ast.Assign):
+                names = [t.id for t in node.targets if isinstance(t, ast.Name)]
+            else:
+                continue
+            for name in names:
+                if name in seen and name != "__all__":
+                    dups.append(f"{path.name}:{node.lineno} {name}")
+                seen.add(name)
+    assert not dups, dups
+
+
+def test_http_has_no_urllib_named_transport():
+    from rebot import _http
+
+    assert _http.default_transport is _http.socket_transport
+    assert not hasattr(_http, "urllib_transport")  # the transport uses raw sockets, not urllib

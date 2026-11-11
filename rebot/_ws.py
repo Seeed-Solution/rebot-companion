@@ -7,12 +7,16 @@ messages, fragmentation, ping -> pong, close, and receive timeouts. No extension
 frames, fragmented or oversized control frames, bad close payloads, invalid UTF-8) close the
 connection with 1002 (1007 for UTF-8, 1009 for max_size) and raise :class:`WebSocketProtocolError`.
 
-One thread may call :meth:`WebSocket.recv` while others call :meth:`WebSocket.send`.
+One thread may call :meth:`WebSocket.recv` while others call :meth:`WebSocket.send`. On ``wss://``
+an ``ssl.SSLSocket`` must not be read and written at the same time, so socket reads and writes
+share one lock there (a read holds it only after ``select`` reports data, or while TLS has
+buffered bytes).
 """
 
 from __future__ import annotations
 
 import binascii
+import contextlib
 import hashlib
 import os
 import select
@@ -62,6 +66,8 @@ class WebSocket:
         self.max_size = max_size
         self._buf = bytearray(buffered)
         self._send_lock = threading.Lock()
+        # SSLSocket (has pending()) is not safe for concurrent recv/send: serialise socket I/O on it.
+        self._io_lock = threading.Lock() if hasattr(sock, "pending") else contextlib.nullcontext()
         self._closed: Optional[WebSocketClosed] = None
         self._close_sent = False
         self._fragments: list = []
@@ -79,7 +85,7 @@ class WebSocket:
             header = struct.pack("!BBQ", 0x80 | opcode, 0x80 | 127, n)
         mask = os.urandom(4)
         masked = _mask(payload, mask)
-        with self._send_lock:
+        with self._send_lock, self._io_lock:
             try:
                 self.sock.sendall(header + mask + masked)
             except OSError as exc:
@@ -101,7 +107,8 @@ class WebSocket:
 
     def _fill(self, deadline: Optional[float]) -> None:
         """Read more bytes into the buffer; raise WebSocketTimeout at ``deadline``."""
-        pending = hasattr(self.sock, "pending") and self.sock.pending() > 0
+        with self._io_lock:
+            pending = hasattr(self.sock, "pending") and self.sock.pending() > 0
         if not pending:
             remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
             try:
@@ -111,7 +118,8 @@ class WebSocket:
             if not ready:
                 raise WebSocketTimeout("no message within the timeout")
         try:
-            chunk = self.sock.recv(65536)
+            with self._io_lock:
+                chunk = self.sock.recv(65536)
         except (OSError, ValueError) as exc:
             raise WebSocketClosed(None, f"recv failed: {exc}") from exc
         if not chunk:
