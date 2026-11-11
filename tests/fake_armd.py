@@ -88,6 +88,9 @@ class FakeArmd:
         self.dropped_servo_frames = 0
         self.traj: tuple[list[float], list[float], float, float] | None = None
         self.servo_target: list[float] | None = None
+        self.servo_log: list[tuple[int, list[float], list[float]]] = []  # accepted (sequence_id, target, positions)
+        self.servo_max_lead_rad: float | None = None  # published in the schema when set
+        self.motion_limit: dict | None = None  # observation.motion_limit (devplat)
         self.last_motion_frame = time.monotonic()
         self.last_heartbeat = time.monotonic()
         self.lease: dict | None = None  # {conn, generation, acquired_at}
@@ -179,6 +182,7 @@ class FakeArmd:
             "previous_action": self._public(prev),
             "residual_torques": [0.0] * 6,
             "collision": self.collision_field(),
+            "motion_limit": self.motion_limit,
         }
 
     def collision_field(self) -> dict | None:
@@ -698,6 +702,7 @@ class FakeArmd:
                 self.servo_target = None
                 return None, local_gen, label, last_seq, last_req
             self.servo_target = target
+            self.servo_log.append((seq, target, list(self.positions)))
             self.last_motion_frame = self.last_heartbeat = time.monotonic()
             self.state = "Moving"
             return None, local_gen, label, last_seq, last_req
@@ -829,6 +834,7 @@ class FakeArmd:
                         "joint_names": [f"joint_{i + 1}" for i in range(DOF)],
                         "fields": [],
                         "capabilities": self.capabilities(),
+                        **({"servo_max_lead_rad": self.servo_max_lead_rad} if self.servo_max_lead_rad else {}),
                         "limits": [
                             {
                                 "name": f"joint_{i + 1}",
