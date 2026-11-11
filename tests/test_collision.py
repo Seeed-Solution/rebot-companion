@@ -6,14 +6,11 @@ import threading
 import time
 
 import pytest
+from fake_armd import open_arm
 
-from rebot import Arm, ArmCommandRejected, ArmFaultError, MotionTimeout, UnsupportedError
+from rebot import ArmCommandRejected, ArmFaultError, MotionTimeout, UnsupportedError
 from rebot.client import ArmStatus
 from rebot.errors import ActionFailed
-
-
-def open_arm(armd, **kw) -> Arm:
-    return Arm(armd.url, transport=armd.transport, **kw)
 
 
 def test_status_parses_collision():

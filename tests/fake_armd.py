@@ -51,6 +51,7 @@ from http_mock import MockTransport, Request, Response
 from websockets.exceptions import ConnectionClosed
 from websockets.sync.server import serve
 
+from rebot import Arm
 from rebot.client import ArmdClient
 
 DOF = 7
@@ -876,6 +877,10 @@ class FakeArmd:
 
     def stop(self) -> None:
         self._stop.set()
+
+
+def open_arm(armd, **kw) -> Arm:
+    return Arm(armd.url, transport=armd.transport, **kw)
 
 
 @pytest.fixture

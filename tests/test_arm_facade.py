@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 
 import pytest
-from fake_armd import HOME
+from fake_armd import HOME, open_arm
 
 from rebot import (
     Arm,
@@ -18,10 +18,6 @@ from rebot import (
     UnsupportedError,
 )
 from rebot.arm import _base_url
-
-
-def open_arm(armd, **kw) -> Arm:
-    return Arm(armd.url, transport=armd.transport, **kw)
 
 
 def test_lifecycle_enable_move_park_release(armd):
@@ -396,19 +392,17 @@ def test_sigterm_not_installed_off_main_thread(armd):
 
 
 def test_safety_description(armd):
-    from rebot import UnsupportedError
-
-    with Arm(armd.url, transport=armd.transport) as arm:
+    with open_arm(armd) as arm:
         with pytest.raises(UnsupportedError):  # armd without devplat
             arm.safety()
     armd.devplat = True
-    with Arm(armd.url, transport=armd.transport) as arm:
+    with open_arm(armd) as arm:
         d = arm.safety()
     assert d["hardware"]["physical_estop"] is False
     assert d["limits"]["action_speed_max"]["linear_mps"] == 0.15
     assert any(f["code"] == "WATCHDOG_TIMEOUT" and f["recoverable"] for f in d["faults"])
     armd.describe_cap = False
-    with Arm(armd.url, transport=armd.transport) as arm:
+    with open_arm(armd) as arm:
         with pytest.raises(UnsupportedError):
             arm.safety()
 
