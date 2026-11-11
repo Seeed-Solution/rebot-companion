@@ -245,7 +245,8 @@ def _sample_at(src: Any, due: float, prev: tuple[float, Any] | None) -> tuple[fl
 
     Sources without ``at_or_before`` give their latest item when it is not newer than ``due``.
     When nothing old enough is left (the sampler stalled longer than the history), the previous
-    row's item is held.
+    row's item is held; for the first tick that is the item read just before the sampler clock
+    started.
     """
     pick = getattr(src, "at_or_before", None)
     item = pick(due) if pick is not None else src.latest()
@@ -801,11 +802,15 @@ class LeRobotRecorder:
         ep = self._ep
         s = ep.summary
         period = 1.0 / self.fps
+        # Seed the held items before the clock starts: every seed was received before t0, so the first
+        # tick has an item at or before its due time even when a latest()-only source updates between
+        # here and the first read.
+        prev_obs = self.obs_source.latest()
+        prev_cam = self.frame_source.latest() if self.frame_source is not None else None
         t0 = time.monotonic()
         k = 0
         obs_ages, cam_ages = [], []
         last_seq = None
-        prev_obs = prev_cam = None
         try:
             while not self._stop_sampling.is_set():
                 due = t0 + k * period

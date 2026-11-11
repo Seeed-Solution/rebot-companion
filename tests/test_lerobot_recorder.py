@@ -285,6 +285,24 @@ def test_overdue_ticks_never_use_samples_received_after_their_due_time(tmp_path)
     assert summary.obs_age_ms_mean >= 0
 
 
+def test_latest_only_source_updating_before_the_first_read_does_not_stop_the_sampler(tmp_path):
+    class AlwaysFresh:
+        """latest()-only source whose newest item always arrived just now, i.e. after any due time
+        computed before the call (deterministic form of an update between clock start and first read)."""
+
+        def latest(self):
+            now = time.monotonic()
+            return now, obs(now)
+
+    rec = LeRobotRecorder(tmp_path / "fresh", "t/fresh", fps=FPS, task="t", obs_source=AlwaysFresh(), camera_url=None)
+    rec.start_episode()
+    time.sleep(0.2)
+    summary = rec.stop_episode()
+    assert rec.check_sources() is None
+    assert summary.frames > 0 and summary.obs_age_ms_mean >= 0
+    rec.discard()
+
+
 def test_failed_open_closes_the_sources_it_started(tmp_path):
     class Source:
         def __init__(self, fail: str = "") -> None:
