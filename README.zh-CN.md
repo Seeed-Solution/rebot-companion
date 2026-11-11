@@ -729,7 +729,8 @@ rebot-companion 安装到已装有 lerobot 的 Python 环境（例如训练环�
 停止条件：急停、Fault、碰撞保持、servo `blocked` 保持、力矩关闭、租约丢失、servo 被拒（如
 `MOTION_BUSY`）、连接断开、策略停滞、相机帧过旧、动作非有限值或长度不对、策略异常、回放的 episode
 结束、`--max-seconds`、Ctrl+C 或 SIGTERM。之后结束 servo 流，机械臂保持（`motion/stop`）并停靠
-（`unload`），`--no-park` 时不停靠；Fault、急停、碰撞保持或租约丢失后不停靠（汇总写明原因）。运行器不会
+（`unload`），`--no-park` 时不停靠；Fault、急停、碰撞保持或租约丢失后不停靠（汇总写明原因）。请求停止后不再发送 servo 帧；每次 socket 发送最长 1 s。停止 2 s 后发送线程仍未结束时，运行器
+发送无需租约的 REST 急停且不停靠。运行器不会
 清除故障。退出码：`max_seconds` 或回放结束为 0，Ctrl+C 为 130，其余为 1。Python API：
 `PolicyRunner(ArmdClient(url), parse_policy(spec), camera).run()` 返回 `RunResult`。
 

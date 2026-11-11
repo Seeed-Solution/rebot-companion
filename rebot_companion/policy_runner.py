@@ -72,6 +72,7 @@ SIM_FOLLOWERS = ("mock", "sim")
 DEFAULT_LEAD_RAD = 0.2  # armd's servo_max_lead_rad default (control_safety_contract.md)
 LEAD_FRACTION = 0.95  # clip inside armd's lead: the observation the clip uses is a few ms old
 LIMIT_MARGIN = 1e-3  # rad inside the joint limits
+SEND_TIMEOUT_S = 1.0  # bound on one blocking WebSocket send (servo frame)
 STATE_KEY = "observation.state"
 EXTRA_KEYS = {"observation.velocity": "velocities", "observation.effort": "torques"}
 ROBOT_TYPE = "rebot_b601_dm"
@@ -341,6 +342,7 @@ class PolicyRunner:
         log_path: str | Path | None = None,
         client_id: str | None = None,
         connect_timeout: float = 5.0,
+        sender_join_s: float = 2 * SEND_TIMEOUT_S,
     ) -> None:
         if servo_hz < 10:
             raise ValueError("servo_hz must be >= 10 (armd drops a stream 200 ms after its last frame)")
@@ -359,6 +361,7 @@ class PolicyRunner:
         self.log_path = Path(log_path) if log_path else None
         self.client_id = client_id
         self.connect_timeout = connect_timeout
+        self.sender_join_s = float(sender_join_s)
         if policy.image_key and camera is None:
             raise RunnerError(f"policy reads {policy.image_key}: a camera is required")
 
@@ -368,6 +371,9 @@ class PolicyRunner:
         self.result = RunResult(reason="", policy=policy.name, fps=self.fps, servo_hz=self.servo_hz)
         self._stop = threading.Event()
         self._lock = threading.Lock()
+        # Held across "stop requested?" + servo send, and by request_stop: once request_stop returns, no
+        # further frame is sent (a frame already in the socket finishes, bounded by SEND_TIMEOUT_S).
+        self._send_lock = threading.RLock()
         self._segment: _Segment | None = None
         self._last_sent: np.ndarray | None = None
         self._last_target_t = 0.0
@@ -386,12 +392,21 @@ class PolicyRunner:
     # ---- stop bookkeeping ----------------------------------------------------
 
     def request_stop(self, reason: str, detail: str = "") -> None:
-        """First reason wins."""
-        with self._lock:
-            if not self.result.reason:
-                self.result.reason, self.result.detail = reason, detail
-                log.warning("stop: %s %s", reason, detail)
+        """First reason wins. Cancels the stream first; returns after any in-flight frame has been written."""
         self._stop.set()
+        # Wait for an in-flight frame (bounded by the send timeout). If the lock is not free within
+        # sender_join_s the sender is stuck; _stop_sender then fails closed.
+        locked = self._send_lock.acquire(timeout=self.sender_join_s)
+        try:
+            with self._lock:
+                first = not self.result.reason
+                if first:
+                    self.result.reason, self.result.detail = reason, detail
+        finally:
+            if locked:
+                self._send_lock.release()
+        if first:
+            log.warning("stop: %s %s", reason, detail)
 
     def _check(self, obs: ArmStatus, count: bool = False) -> tuple[str, str] | None:
         if obs.safety_state == "EStop":
@@ -509,9 +524,12 @@ class PolicyRunner:
                     self.request_stop("policy_stall", f"no new target for {now - last_target:.2f} s")
                     break
                 frame = self._shape(seg.at(now), obs.positions)
-                s.servo(frame.tolist())
-                with self._lock:
-                    self._last_sent = frame
+                with self._send_lock:
+                    if self._stop.is_set():
+                        break
+                    s.servo(frame.tolist())
+                    with self._lock:
+                        self._last_sent = frame
                 self.result.frames += 1
                 next_t += period
                 delay = next_t - time.monotonic()
@@ -563,6 +581,7 @@ class PolicyRunner:
                 safe_exit="off",
                 connect_timeout=self.connect_timeout,
                 obs_hz=int(max(self.servo_hz, 50)),
+                send_timeout=SEND_TIMEOUT_S,
             ).open()
             try:
                 self._prepare()
@@ -580,10 +599,9 @@ class PolicyRunner:
                 self.request_stop("error", f"{type(exc).__name__}: {exc}")
             finally:
                 self._stop.set()
-                if self._sender is not None:
-                    self._sender.join(timeout=2.0)
+                sender_done = self._stop_sender()
                 self.result.duration_s = round(time.monotonic() - t_start, 3)
-                if self._streaming:
+                if self._streaming and sender_done:
                     self._finish()
         finally:
             if self.session is not None:
@@ -598,6 +616,24 @@ class PolicyRunner:
                 self._log_file.write(json.dumps({"summary": self.result.to_dict()}) + "\n")
                 self._log_file.close()
         return self.result
+
+    def _stop_sender(self) -> bool:
+        """Wait for the sender thread; True when it has ended. A sender still alive after ``sender_join_s``
+        is stuck in a socket send, so the WebSocket cannot carry ``motion/stop``: fail closed with the
+        lease-free REST e-stop (latched; a person clears it in the cockpit)."""
+        t = self._sender
+        if t is None:
+            return True
+        t.join(self.sender_join_s)
+        if not t.is_alive():
+            return True
+        log.error("servo sender did not stop within %.1f s; sending e-stop", self.sender_join_s)
+        try:
+            self.client.e_stop()
+            self.result.park_detail = "not parked: the servo sender did not stop; e-stop sent"
+        except Exception as exc:
+            self.result.park_detail = f"not parked: the servo sender did not stop; e-stop failed: {exc}"
+        return False
 
     def _prepare(self) -> None:
         s = self.session

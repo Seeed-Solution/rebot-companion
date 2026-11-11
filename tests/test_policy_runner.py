@@ -477,3 +477,128 @@ def test_act_policy_runs_10_steps(http_armd, camera_server, tmp_path):
     assert "camera observation.images.recamera (48, 64)" in res.stdout
     assert_in_order(http_armd)
     assert http_armd.dropped_servo_frames == 0
+
+
+# --------------------------------------------------------------------------- sender unit tests (stub session)
+
+
+def obs_status(positions=None, state="Moving"):
+    from rebot.client import ArmStatus
+
+    return ArmStatus.from_dict(
+        {
+            "positions": list(HOME if positions is None else positions),
+            "safety_state": state,
+            "is_torqued": True,
+            "epoch_id": 1,
+        }
+    )
+
+
+class StubSession:
+    """Synchronous stand-in for ArmSession: the sender loop runs in the test thread."""
+
+    lease_lost = None
+    has_lease = True
+
+    def __init__(self, runner, obs=None, age=0.0, on_obs=None, max_frames=5):
+        self.runner, self.obs, self.age, self.on_obs = runner, obs or obs_status(), age, on_obs
+        self.max_frames = max_frames
+        self.sent: list[list[float]] = []
+        self.reads = 0
+
+    def latest_observation_timed(self):
+        self.reads += 1
+        if self.on_obs is not None:
+            self.on_obs(self)
+        return (time.monotonic() - self.age, self.obs)
+
+    def latest_observation(self):
+        return self.obs
+
+    def servo(self, positions):
+        self.sent.append(list(positions))
+        if len(self.sent) >= self.max_frames:
+            self.runner.request_stop("test_done")
+
+
+def stub_runner(policy=None, **kw):
+    from rebot_companion.policy_runner import _Segment
+
+    r = PolicyRunner(None, policy or SinePolicy(0, 0.05, 1.0), **kw)
+    r.limits = list(LIMITS)
+    r.result.lead_clips_per_joint = [0] * 7
+    home = np.array(HOME)
+    now = time.monotonic()
+    r._segment = _Segment(home, home, now, 0.0)
+    r._last_target_t = now + 3600  # no stall
+    r._deadline = now + 3600
+    return r
+
+
+def test_no_servo_frame_after_a_stop_requested_during_the_tick():
+    """A stop that arrives after the loop-boundary check (here: while reading telemetry) sends no frame."""
+    r = stub_runner()
+    r.session = StubSession(r, on_obs=lambda s: r.request_stop("fault", "injected"))
+    r._send_loop()
+    assert r.session.sent == []
+    assert r.result.reason == "fault"
+
+
+def test_request_stop_sets_the_event_before_anything_else():
+    r = stub_runner()
+    seen = {}
+    import rebot_companion.policy_runner as pr
+
+    def spy(*a, **k):
+        seen["stop_set"] = r._stop.is_set()
+
+    old = pr.log.warning
+    pr.log.warning = spy
+    try:
+        r.request_stop("fault", "x")
+    finally:
+        pr.log.warning = old
+    assert seen["stop_set"] is True
+
+
+def test_a_hung_sender_fails_closed_with_e_stop():
+    """If the sender does not end within sender_join_s (a send stuck in the socket), the runner e-stops over REST."""
+    r = stub_runner(sender_join_s=0.05)
+    release = threading.Event()
+    r._sender = threading.Thread(target=release.wait, daemon=True)
+    r._sender.start()
+    calls = []
+
+    class Client:
+        def e_stop(self):
+            calls.append("e_stop")
+            return {}
+
+    r.client = Client()
+    r.session = StubSession(r)
+    try:
+        assert r._stop_sender() is False
+    finally:
+        release.set()
+    assert calls == ["e_stop"]
+    assert "sender" in r.result.park_detail
+
+
+def test_request_stop_does_not_wait_forever_for_a_stuck_send():
+    r = stub_runner(sender_join_s=0.05)
+    held, release = threading.Event(), threading.Event()
+
+    def stuck():
+        with r._send_lock:
+            held.set()
+            release.wait()
+
+    t = threading.Thread(target=stuck, daemon=True)
+    t.start()
+    held.wait()
+    try:
+        r.request_stop("fault", "x")  # returns after sender_join_s instead of blocking
+        assert r._stop.is_set() and r.result.reason == "fault"
+    finally:
+        release.set()

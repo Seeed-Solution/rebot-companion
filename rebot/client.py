@@ -496,6 +496,7 @@ class ArmSession:
         safe_exit: str = "error",
         safe_exit_timeout: float = 30.0,
         obs_hz: int | None = None,
+        send_timeout: float = 10.0,
     ) -> None:
         if safe_exit not in SAFE_EXIT_POLICIES:
             raise ValueError(f"safe_exit must be one of {SAFE_EXIT_POLICIES}")
@@ -511,6 +512,7 @@ class ArmSession:
         self.safe_exit_timeout = safe_exit_timeout
         self.safe_exit_outcome: SafeExitOutcome | None = None
         self.obs_hz = None if obs_hz is None else max(1, int(obs_hz))
+        self.send_timeout = float(send_timeout)  # bounds one blocking socket send
 
         self._ws = None
         # Reentrant: _request() holds it while it allocates a request_id, registers the reply and sends,
@@ -551,7 +553,7 @@ class ArmSession:
             return self
         try:
             # Origin http://<host>:<port> equals Host, which armd's same-origin guard accepts.
-            self._ws = _ws.connect(self.ws_url, timeout=self.connect_timeout)
+            self._ws = _ws.connect(self.ws_url, timeout=self.connect_timeout, send_timeout=self.send_timeout)
         except Exception as exc:
             raise ArmConnectionError(f"Cannot open {self.ws_url}: {exc}") from exc
         self._stop.clear()

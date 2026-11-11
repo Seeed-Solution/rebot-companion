@@ -793,7 +793,9 @@ Stops: E-stop, Fault, collision hold, servo `blocked` hold, torque off, lease lo
 wrong-sized action, policy exception, end of a replayed episode, `--max-seconds`, Ctrl+C or
 SIGTERM. Then the stream ends, the arm holds (`motion/stop`) and parks (`unload`) unless
 `--no-park`; no park after a Fault, E-stop, collision hold or lease loss (the summary says why).
-The runner never clears a fault. Exit code 0 after `max_seconds` or the end of a replay, 130 after
+No servo frame is sent once a stop is requested; each socket send is bounded to 1 s. If the
+sender thread has not ended 2 s after a stop, the runner sends the lease-free REST e-stop and does
+not park. The runner never clears a fault. Exit code 0 after `max_seconds` or the end of a replay, 130 after
 Ctrl+C, else 1. Python API: `PolicyRunner(ArmdClient(url), parse_policy(spec), camera).run()`
 returns a `RunResult`.
 
