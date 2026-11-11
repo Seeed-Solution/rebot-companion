@@ -191,7 +191,7 @@ class ObservationStream(_Stream):
     name = "armd"
 
     def __init__(self, armd: str, obs_hz: int | None = None, connect_timeout: float = 5.0) -> None:
-        base = armd_url(armd).replace("https://", "wss://").replace("http://", "ws://")
+        base = armd_url(armd).replace("http://", "ws://")
         super().__init__(f"{base}/api/v1/ws" + (f"?obs_hz={int(obs_hz)}" if obs_hz else ""), connect_timeout)
 
     def parse(self, msg: Any) -> ArmStatus | None:

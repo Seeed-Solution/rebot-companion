@@ -537,9 +537,7 @@ class ArmSession:
     @property
     def ws_url(self) -> str:
         base = self.client.base_url
-        if base.startswith("https://"):
-            base = "wss://" + base[len("https://") :]
-        elif base.startswith("http://"):
+        if base.startswith("http://"):
             base = "ws://" + base[len("http://") :]
         query = f"?obs_hz={self.obs_hz}" if self.obs_hz else ""
         return f"{base}/api/v1/ws{query}"
