@@ -221,6 +221,7 @@ class ArmStatus:
     fault: dict | None = None  # {"code", "message", "recoverable"} (capability fault_codes)
     residual_torques: list[float] | None = None  # capability residual_torques
     collision: dict | None = None  # capability collision_guard; None while the guard is off or unavailable
+    motion_limit: dict | None = None  # capability servo_guard: {"reason", "joint", "since_ms"} or None
 
     @classmethod
     def from_dict(cls, d: dict) -> ArmStatus:
@@ -252,6 +253,7 @@ class ArmStatus:
             fault=dict(d["fault"]) if isinstance(d.get("fault"), dict) else None,
             residual_torques=floats("residual_torques") if isinstance(d.get("residual_torques"), list) else None,
             collision=dict(d["collision"]) if isinstance(d.get("collision"), dict) else None,
+            motion_limit=dict(d["motion_limit"]) if isinstance(d.get("motion_limit"), dict) else None,
         )
 
     @property
@@ -523,6 +525,7 @@ class ArmSession:
         self._last_generation = 0  # highest generation granted on this session
         self._epoch: int | None = None
         self._obs: ArmStatus | None = None
+        self._obs_rx: float | None = None  # time.monotonic() when self._obs arrived
         self._frames = 0
         self._lease_lost: dict | None = None
         self._servo_error: dict | None = None
@@ -694,6 +697,14 @@ class ArmSession:
                 raise ArmConnectionError(self._closed_reason)
             return self._obs
 
+    def latest_observation_timed(self) -> tuple[float, ArmStatus] | None:
+        """``(time.monotonic() at receipt, observation)`` of the newest observation, or None before the
+        first. Raises :class:`ArmConnectionError` once the connection has closed."""
+        with self._state:
+            if self._closed_reason is not None:
+                raise ArmConnectionError(self._closed_reason)
+            return None if self._obs is None else (self._obs_rx, self._obs)
+
     def wait_for_observation(self, timeout: float = 2.0) -> ArmStatus:
         """Block until the next telemetry frame arrives; :class:`ArmConnectionError` when closed."""
         with self._state:
@@ -756,6 +767,7 @@ class ArmSession:
             if kind is None:
                 if "positions" in msg and "safety_state" in msg:
                     self._obs = ArmStatus.from_dict(msg)
+                    self._obs_rx = time.monotonic()
                     self._advance_epoch(self._obs.epoch_id)
                     self._frames += 1
                     self._state.notify_all()
