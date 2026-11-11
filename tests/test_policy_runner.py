@@ -146,6 +146,41 @@ def test_the_last_segment_completes_before_policy_done(arm):
     assert sum(abs(v - (HOME[0] + 0.05)) < 1e-9 for v in j1) >= 2, j1  # held at the target
 
 
+def test_a_stale_camera_during_the_final_hold_stops(arm):
+    """The hold after the last step keeps the camera freshness check."""
+    gone = threading.Event()
+
+    class Cam:
+        def latest(self):
+            return (time.monotonic() - (2.0 if gone.is_set() else 0.0), np.zeros((H, W, 3), np.uint8))
+
+    class ImgOneStep(Policy):
+        fps, image_key, image_size = 5, CAM, (H, W)
+
+        def select(self, obs, step, t):
+            if step == 0:
+                return np.array(HOME) + np.array([0.05, 0, 0, 0, 0, 0, 0])
+            gone.set()  # the camera stops right as the policy ends
+            return None
+
+    res = runner(arm, ImgOneStep(), camera=Cam(), max_seconds=5, park=False).run()
+    assert res.reason == "camera_stale", res
+
+
+@pytest.mark.parametrize("kw", [{}, {"max_steps": 2}])
+def test_the_deadline_during_the_final_hold_reports_max_seconds(arm, kw):
+    """Policy ends at 0.5 s; its hold would last to 1.0 s, past the 0.8 s deadline: max_seconds, every time."""
+
+    class TwoHz(Policy):
+        fps = 2
+
+        def select(self, obs, step, t):
+            return np.array(HOME) + np.array([0.02, 0, 0, 0, 0, 0, 0]) if step == 0 or kw else None
+
+    res = runner(arm, TwoHz(), max_seconds=0.8, stall_s=5, park=False, **kw).run()
+    assert res.reason == "max_seconds", res
+
+
 def test_no_park_holds(arm):
     res = runner(arm, SinePolicy(0, 0.05, 1.0), park=False).run()
     assert res.reason == "max_seconds"

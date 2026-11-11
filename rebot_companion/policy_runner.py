@@ -703,6 +703,19 @@ class PolicyRunner:
                 out[key] = np.asarray(getattr(obs, attr), dtype=np.float32)
         return out
 
+    def _camera_stale(self, now: float, age: float | None = None) -> bool:
+        """True (and a ``camera_stale`` stop) when the newest frame is older than ``max_frame_age_s``."""
+        if age is None:
+            item = self.camera.latest()
+            if item is None:
+                self.request_stop("camera_stale", "no camera frame")
+                return True
+            age = now - item[0]
+        if age > self.max_frame_age_s:
+            self.request_stop("camera_stale", f"newest frame is {age * 1000:.0f} ms old")
+            return True
+        return False
+
     def _camera_image(self, now: float) -> np.ndarray | None:
         if not self.policy.image_key:
             return None
@@ -712,8 +725,7 @@ class PolicyRunner:
         rx, frame = item
         age = now - rx
         self._lat["camera_age"].append(age)
-        if age > self.max_frame_age_s:
-            self.request_stop("camera_stale", f"newest frame is {age * 1000:.0f} ms old")
+        if self._camera_stale(now, age):
             return None
         seq = getattr(frame, "seq", None)
         if seq is not None and seq == self._last_seq:
@@ -1048,14 +1060,24 @@ class PolicyRunner:
 
     def _end_of_policy(self, reason: str, detail: str) -> None:
         """No further target: keep streaming until the last segment has reached its target, plus one
-        policy period of hold (bounded by the deadline), then stop. Any stop meanwhile wins."""
+        policy period of hold, then stop. During the hold the camera must stay fresh (``camera_stale``); reaching
+        the deadline ends it as ``max_seconds``; any other stop meanwhile wins."""
         with self._lock:
             seg_end = self._segment.t0 + self._segment.duration
-        now = time.monotonic()
-        left = min(max(seg_end - now, 0.0) + 1.0 / self.fps, self._deadline - now)
-        if left > 0:
-            self._stop.wait(left)
-        self.request_stop(reason, detail)
+        hold_end = max(seg_end, time.monotonic()) + 1.0 / self.fps
+        tick = 1.0 / self.servo_hz
+        while not self._stop.is_set():
+            now = time.monotonic()
+            # the deadline outranks the end of the policy: a hold that reaches it ends as max_seconds
+            if now >= self._deadline:
+                self.request_stop("max_seconds", f"{self.max_seconds:g} s")
+                return
+            if now >= hold_end:
+                self.request_stop(reason, detail)
+                return
+            if self.policy.image_key and self._camera_stale(now):  # same freshness rule as a policy step
+                return
+            self._stop.wait(min(hold_end, self._deadline, now + tick) - now)
 
     def _finish(self) -> None:
         s = self.session

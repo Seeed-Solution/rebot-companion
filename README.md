@@ -790,6 +790,8 @@ returns is abandoned; the warm-up call may take up to 120 s). A sender thread st
 `--servo-hz`: each new target is reached by linear interpolation from the last sent frame (after clipping;
 the measured position before the first frame) over one policy period, then held. When the policy ends (end of a replay, `--max-steps`) the stream
 continues until the last segment has reached its target, plus one policy period, before the stop.
+During that hold the camera freshness check still applies (`camera_stale`), and a hold that reaches
+`--max-seconds` ends as `max_seconds`.
 Every frame is clipped per joint to the intersection of the joint limits and, for joints 1..6,
 measured position ± 0.95 × `servo_max_lead_rad` (armd schema, default 0.2 rad); the summary counts
 clipped frames per joint and the `observation.motion_limit` reasons armd reported. A step that is
