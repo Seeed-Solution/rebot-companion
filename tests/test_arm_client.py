@@ -467,3 +467,32 @@ def test_http_timeout_bounds_the_whole_request_not_each_read():
     with pytest.raises(_http.HttpTimeout):
         _http.request("GET", f"http://127.0.0.1:{port}/x", timeout=0.5)
     assert time.monotonic() - t0 < 1.5
+
+
+def test_concurrent_commands_reach_armd_with_increasing_request_ids(armd):
+    with armd.client.session(client_id="race", safe_exit="off") as s:
+        s.torque(True)
+        real_send = s._send
+        first = threading.Event()
+
+        def slow_send(message):
+            if message.get("type") == "command" and not first.is_set():
+                first.set()
+                time.sleep(0.3)  # the first command stalls between taking its id and sending
+            real_send(message)
+
+        s._send = slow_send
+        results = {}
+
+        def motion():
+            try:
+                results["a"] = s.command("/api/v1/motion/stop")
+            except Exception as exc:
+                results["a"] = exc
+
+        t = threading.Thread(target=motion)
+        t.start()
+        assert first.wait(1.0)
+        results["b"] = s.stop()  # e.g. MCP stop while a motion tool runs
+        t.join(2.0)
+        assert all(isinstance(r, dict) and r["type"] == "command_ack" for r in results.values()), results

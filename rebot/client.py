@@ -511,7 +511,9 @@ class ArmSession:
         self.obs_hz = None if obs_hz is None else max(1, int(obs_hz))
 
         self._ws = None
-        self._send_lock = threading.Lock()
+        # Reentrant: _request() holds it while it allocates a request_id, registers the reply and sends,
+        # so ids reach armd in increasing order (armd rejects a request_id lower than the last one).
+        self._send_lock = threading.RLock()
         self._state = threading.Condition()
         self._pending: dict[tuple[str, int], _Pending] = {}
         self._request_ids = itertools.count(1)
@@ -811,18 +813,23 @@ class ArmSession:
 
     # ---- request/response ----------------------------------------------------
 
-    def _request(self, kind: str, key: Any, message: dict, timeout: float) -> dict:
+    def _request(self, kind: str, key: Any, message: dict, timeout: float, id_field: str | None = None) -> dict:
+        """Send ``message`` and wait for its reply. With ``id_field``, ``key`` is ignored and the next
+        request id is allocated under the send lock and written to ``message[id_field]``."""
         p = _Pending()
-        with self._state:
-            if self._closed_reason:
-                raise ArmConnectionError(self._closed_reason)
-            self._pending[(kind, key)] = p
-        try:
-            self._send(message)
-        except ArmdError:
+        with self._send_lock:
+            if id_field is not None:
+                key = message[id_field] = next(self._request_ids)
             with self._state:
-                self._pending.pop((kind, key), None)
-            raise
+                if self._closed_reason:
+                    raise ArmConnectionError(self._closed_reason)
+                self._pending[(kind, key)] = p
+            try:
+                self._send(message)
+            except ArmdError:
+                with self._state:
+                    self._pending.pop((kind, key), None)
+                raise
         if not p.event.wait(timeout):
             with self._state:
                 self._pending.pop((kind, key), None)
@@ -873,13 +880,12 @@ class ArmSession:
         the command to that epoch instead of the latest one seen.
         """
         generation = self._check_lease()
-        request_id = next(self._request_ids)
         reply = self._request(
             "command",
-            request_id,
+            None,
             {
                 "type": "command",
-                "request_id": request_id,
+                "request_id": None,  # allocated under the send lock
                 "path": path,
                 "body": body or {},
                 "generation": generation,
@@ -887,6 +893,7 @@ class ArmSession:
                 "client_id": self.client_id,
             },
             timeout=timeout or self.command_timeout,
+            id_field="request_id",
         )
         if reply.get("type") != "command_ack":
             if reply.get("code") == "LEASE_LOST":
