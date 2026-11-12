@@ -521,12 +521,15 @@ claude mcp add rebot -- uv run --directory /path/to/rebot-companion --extra agen
   `reBot-DevArm_gripper.urdf`（rebot-armd `assets/`，副本在 `tests/fixtures/`）中的 URDF 链
   `base_link` → `joint1`..`joint6` → `end_joint` → `end_link`。返回 SE(3) TCP 位姿，x 轴 = 工具轴。
   手眼标定使用此 FK，因此样本中 J5、J6 可以取任意值。测试将其与独立的 URDF 解析器对比：< 0.1 mm、< 0.01 deg。
-- URDF joint5 = 腕部摆动（在停靠位 J1..J5 = 0、J6 = pi/2 时轴竖直；+0.2 rad 使 TCP 沿 -y 移动约 36 mm），
+- URDF joint5 = 腕部摆动（在停靠位、电机 J1..J5 = 0、J6 = pi/2 时轴竖直；+0.2 rad 使 TCP 沿 -y 移动约 36 mm），
   joint6 = 工具滚转（绕工具轴；TCP 位置不变）。Web 驾驶舱界面使用相同的标注（J5 腕摆，J6 滚转）。
 - 电机 → URDF 映射：armd 下标 0..3 → URDF joint1..joint4，`model = (motor - offset) / sign`（Web
   `toModel` / `CFG.cart.sign` / `CFG.cart.off`，默认 sign `1,1,1,1`、offset `0`；与 Web 的
-  `?iksign=` / `?ikoff=` 覆盖参数相同；向导接受 `--iksign` / `--ikoff`）。下标 4 → joint5、下标 5 →
-  joint6，1:1。下标 6（夹爪）不参与 FK。
+  `?iksign=` / `?ikoff=` 覆盖参数相同；向导接受 `--iksign` / `--ikoff`）。下标 4 → joint5，1:1；下标 5 →
+  joint6，URDF joint6 = 电机 − pi/2（`kinematics.JointMap`，默认 `B601DM_JOINT_MAP`；`JointMap.from_schema`
+  读取 armd `GET /api/v1/observation/schema` 中的 `model_joint_map`，MCP 服务和手眼标定向导使用它）。依据：
+  2026-11-12 静置位姿（电机 J6 = pi/2）下的真机照片，夹爪左右张合、相机支架（end_link +z）在上方，URDF FK
+  在 joint6 = 0 时得到这一姿态。下标 6（夹爪）不参与 FK。
 - 平面 FK/IK，`fk(q)` / `solve_ik(target, prev)`：逐行移植自 rebot-armd Web 驾驶舱（`src/api/index.html`，
   `IK.fk` / `IK.solve`），J1 偏航 + J2/J3/J4 俯仰链，J5 = 0。测试将其与用 node 运行 JS 代码得到的值对比
   （`tools/gen_web_fixtures.mjs`）。J5 = 0 时其 TCP 位置与完整 FK 相差 < 0.2 mm（Web 常数有舍入，

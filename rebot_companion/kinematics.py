@@ -13,10 +13,14 @@ Two models, both in the URDF base frame (metres, radians, x forward / y left / z
   joint1 x offset (-0.084 mm) ignored, so its TCP position differs from the full FK by < 0.2 mm.
   ``pitch`` is the angle of the J4->TCP vector below horizontal, i.e. ``Ry`` angle minus ``DW``.
 
-Motor -> URDF mapping (armd joint vector index 0..6): J1..J4 ``model = (motor - offset) / sign``
-(Web ``CFG.cart.sign`` / ``CFG.cart.off``, defaults 1 / 0, i.e. motor = URDF angle); index 4 =
-URDF joint5 and index 5 = URDF joint6, 1:1 (checked on the arm: +0.2 rad on index 4 swings the
-wrist sideways, on index 5 rolls the tool); index 6 is the gripper and is not part of the FK.
+Motor -> URDF mapping (armd joint vector index 0..6), armd's ``model_joint_map``
+(``GET /api/v1/observation/schema``): URDF angle = ``sign * motor + offset_rad`` per joint
+(:class:`JointMap`). B601-DM (:data:`B601DM_JOINT_MAP`): J1..J5 motor = URDF angle, J6 URDF angle =
+motor - pi/2. Directions checked on the arm 2026-11-09 (+0.2 rad on index 4 swings the wrist sideways,
+on index 5 rolls the tool); the J6 zero from photos of the arm at the rest pose 2026-11-12 (motor J6 =
+pi/2: jaws open left-right, camera holder on top, which FK gives at URDF J6 = 0). J1..J4 can also go
+through the Web ``CFG.cart.sign`` / ``CFG.cart.off`` overrides (``model = (motor - offset) / sign``,
+defaults 1 / 0). Index 6 is the gripper and is not part of the FK.
 """
 
 from __future__ import annotations
@@ -80,9 +84,56 @@ _CHAIN = tuple(
     for _, xyz, rpy, axis in URDF_CHAIN
 )
 
-# Web defaults for CFG.cart.sign / CFG.cart.off (motor rad = sign * model rad + offset).
+# Web defaults for CFG.cart.sign / CFG.cart.off (motor rad = sign * model rad + offset), J1..J4.
 DEFAULT_SIGN = (1.0, 1.0, 1.0, 1.0)
 DEFAULT_OFFSET = (0.0, 0.0, 0.0, 0.0)
+
+# armd kinematics::B601DM_MODEL_OFFSETS_RAD: URDF angle = motor angle + offset, J1..J6.
+B601DM_MODEL_OFFSETS_RAD = (0.0, 0.0, 0.0, 0.0, 0.0, -math.pi / 2)
+
+
+@dataclass(frozen=True)
+class JointMap:
+    """armd joint -> URDF joint angle, J1..J6: ``model = sign[i] * motor + offset_rad[i]``.
+
+    Same convention as armd's ``model_joint_map`` (observation schema) and ``chain.joints[]``.
+    """
+
+    sign: tuple[float, ...] = (1.0,) * 6
+    offset_rad: tuple[float, ...] = B601DM_MODEL_OFFSETS_RAD
+
+    def to_model(self, positions: Sequence[float]) -> list[float]:
+        """Motor positions (index 0..5; missing = 0) -> URDF angles J1..J6."""
+        return [
+            self.sign[i] * (float(positions[i]) if i < len(positions) else 0.0) + self.offset_rad[i] for i in range(6)
+        ]
+
+    def to_motor(self, q: Sequence[float]) -> list[float]:
+        """URDF angles J1..J6 -> motor positions."""
+        return [(float(q[i]) - self.offset_rad[i]) / self.sign[i] for i in range(6)]
+
+    @classmethod
+    def from_schema(cls, schema) -> JointMap:
+        """From an observation schema (dict or :class:`rebot.client.ObservationSchema`).
+
+        Falls back to :data:`B601DM_JOINT_MAP` when the schema has no ``model_joint_map``
+        (armd before 2026-11-12) or a malformed one.
+        """
+        entries = (
+            schema.get("model_joint_map") if isinstance(schema, dict) else getattr(schema, "model_joint_map", None)
+        )
+        try:
+            if entries and len(entries) >= 6:
+                sign = tuple(float(e["sign"]) for e in entries[:6])
+                off = tuple(float(e["offset_rad"]) for e in entries[:6])
+                if all(s in (1.0, -1.0) for s in sign) and all(math.isfinite(o) for o in off):
+                    return cls(sign, off)
+        except (KeyError, TypeError, ValueError):
+            pass
+        return B601DM_JOINT_MAP
+
+
+B601DM_JOINT_MAP = JointMap()
 
 
 @dataclass(frozen=True)
@@ -169,13 +220,18 @@ def tcp_pose_from_joints(
     positions: Sequence[float],
     sign: Sequence[float] = DEFAULT_SIGN,
     offset: Sequence[float] = DEFAULT_OFFSET,
+    joint_map: JointMap = B601DM_JOINT_MAP,
 ) -> Transform:
     """Raw motor positions (as returned by armd observation) -> ``T_base_tcp``.
 
-    J1..J4 go through ``sign`` / ``offset`` (:func:`to_model`); J5 / J6 (indices 4, 5) map 1:1 to
-    URDF joint5 / joint6 and are 0 when absent; the gripper (index 6) is ignored.
+    J1..J4 go through ``joint_map`` and then the Web ``sign`` / ``offset`` overrides
+    (:func:`to_model`; defaults leave them unchanged); J5 / J6 (indices 4, 5) through ``joint_map``
+    (B601-DM: URDF joint6 = motor - pi/2), 0 motor when absent; the gripper (index 6) is ignored.
     """
-    return tcp_pose(to_model(positions, sign, offset) + [float(v) for v in positions[4:6]])
+    if len(positions) < 4:
+        raise ValueError(f"need at least 4 joint positions, got {len(positions)}")
+    q = joint_map.to_model(positions)
+    return tcp_pose(to_model(q[:4], sign, offset) + q[4:6])
 
 
 def reach(p: TcpPoint) -> float:

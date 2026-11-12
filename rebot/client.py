@@ -308,6 +308,9 @@ class ObservationSchema:
     fields: list[dict]
     capabilities: dict = field(default_factory=dict)  # empty on armd without capabilities
     speed_cap: dict | None = None
+    # armd joint -> URDF angle per arm joint, [{sign, offset_rad}] (model = sign * motor + offset_rad);
+    # empty on armd before 2026-11-12 (rebot_companion.kinematics.JointMap.from_schema falls back)
+    model_joint_map: list[dict] = field(default_factory=list)
 
     @property
     def capabilities_version(self) -> int:
@@ -328,6 +331,7 @@ class ObservationSchema:
             fields=list(d.get("fields") or []),
             capabilities=dict(d.get("capabilities") or {}),
             speed_cap=d.get("speed_cap") if isinstance(d.get("speed_cap"), dict) else None,
+            model_joint_map=[m for m in d.get("model_joint_map") or [] if isinstance(m, dict)],
         )
 
 

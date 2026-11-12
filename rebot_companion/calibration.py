@@ -79,26 +79,29 @@ class HandEyeResult:
         joints: Sequence[float] | None = None,
         sign: Sequence[float] = kinematics.DEFAULT_SIGN,
         offset: Sequence[float] = kinematics.DEFAULT_OFFSET,
+        joint_map: kinematics.JointMap = kinematics.B601DM_JOINT_MAP,
     ) -> Transform:
         """``T_cam_to_base``. For eye_in_hand, ``joints`` are the raw armd positions when the image was taken."""
         if self.setup == "eye_to_hand":
             return self.transform
         if joints is None:
             raise ValueError("eye_in_hand calibration needs the arm joints at detection time")
-        return gripper_pose(joints, sign, offset) @ self.transform
+        return gripper_pose(joints, sign, offset, joint_map) @ self.transform
 
 
 def gripper_pose(
     joints: Sequence[float],
     sign: Sequence[float] = kinematics.DEFAULT_SIGN,
     offset: Sequence[float] = kinematics.DEFAULT_OFFSET,
+    joint_map: kinematics.JointMap = kinematics.B601DM_JOINT_MAP,
 ) -> Transform:
     """``T_base_gripper`` from raw armd joint positions (J1..J6 via the URDF chain; gripper ignored).
 
     Single FK entry point for calibration samples and eye_in_hand. Motor indices 4 / 5 are URDF
-    joint5 (wrist swing) / joint6 (tool roll), 1:1.
+    joint5 (wrist swing) / joint6 (tool roll) through ``joint_map`` (B601-DM: joint6 = motor - pi/2;
+    armd publishes its map as ``model_joint_map``, :meth:`kinematics.JointMap.from_schema`).
     """
-    return kinematics.tcp_pose_from_joints(joints, sign, offset)
+    return kinematics.tcp_pose_from_joints(joints, sign, offset, joint_map)
 
 
 class CalibrationError(ValueError):
@@ -150,6 +153,7 @@ class CalibrationSample:
         d: dict[str, Any],
         sign: Sequence[float] = kinematics.DEFAULT_SIGN,
         offset: Sequence[float] = kinematics.DEFAULT_OFFSET,
+        joint_map: kinematics.JointMap = kinematics.B601DM_JOINT_MAP,
     ) -> CalibrationSample:
         """Parse an SDK sample or a rebot-armd Web export sample.
 
@@ -160,7 +164,9 @@ class CalibrationSample:
         if d.get("T_base_gripper") is not None:
             G = Transform.from_matrix(d["T_base_gripper"])
         elif joints is not None and len(joints) >= 4:
-            G = Transform.from_rot_trans(kinematics.tcp_pose_from_joints(joints, sign, offset).rotation, d["p_base"])
+            G = Transform.from_rot_trans(
+                kinematics.tcp_pose_from_joints(joints, sign, offset, joint_map).rotation, d["p_base"]
+            )
         else:
             G = Transform.from_rot_trans(np.eye(3), d["p_base"])
         has_rot = True
@@ -499,13 +505,14 @@ class HandEyeCalibration:
         mode: str | None = None,
         sign: Sequence[float] = kinematics.DEFAULT_SIGN,
         offset: Sequence[float] = kinematics.DEFAULT_OFFSET,
+        joint_map: kinematics.JointMap = kinematics.B601DM_JOINT_MAP,
     ) -> HandEyeCalibration:
         """Create a calibration populated with the samples of an SDK file or Web export (not solved)."""
         data = cls._read(filepath)
         mode = mode or data.get("setup") or data.get("mode") or "eye_to_hand"
         calib = cls(mode=mode, method=method)
         calib.marker_id = data.get("marker_id")
-        calib.samples = [CalibrationSample.from_dict(s, sign, offset) for s in data.get("samples", [])]
+        calib.samples = [CalibrationSample.from_dict(s, sign, offset, joint_map) for s in data.get("samples", [])]
         return calib
 
 
