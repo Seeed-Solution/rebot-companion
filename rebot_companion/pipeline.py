@@ -45,6 +45,8 @@ class PipelineConfig:
     # Motor sign/offset for FK (eye_in_hand), same as kinematics.to_model.
     kinematics_sign: tuple[float, ...] = kinematics.DEFAULT_SIGN
     kinematics_offset: tuple[float, ...] = kinematics.DEFAULT_OFFSET
+    # Motor -> URDF map of J1..J6 (armd schema model_joint_map; kinematics.JointMap.from_schema).
+    kinematics_joint_map: kinematics.JointMap = kinematics.B601DM_JOINT_MAP
 
 
 @dataclass
@@ -166,7 +168,9 @@ class DeterministicPickPlacePipeline:
                         stage="frame_transform",
                         error_message=f"Arm moved during eye_in_hand detection (max joint change {drift:.4f} rad)",
                     )
-            cam_to_base = self.hand_eye.cam_to_base(arm_status.positions, cfg.kinematics_sign, cfg.kinematics_offset)
+            cam_to_base = self.hand_eye.cam_to_base(
+                arm_status.positions, cfg.kinematics_sign, cfg.kinematics_offset, cfg.kinematics_joint_map
+            )
         except Exception as e:
             return PipelineResult(success=False, stage="frame_transform", error_message=f"Camera pose unavailable: {e}")
         target_in_base = cam_to_base @ target_marker.pose

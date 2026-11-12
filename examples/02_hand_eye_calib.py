@@ -123,7 +123,8 @@ def capture(args, arm: ArmdClient, cam: ReCameraClient, calib: HandEyeCalibratio
     if any(abs(v) > args.vel_threshold for v in velocities_of(obs2)):
         return "rejected: arm is moving; hold it still and retry"
 
-    G = kinematics.tcp_pose_from_joints(pos, sign, offset)
+    # armd's motor -> URDF map (B601-DM: URDF joint6 = motor - pi/2)
+    G = kinematics.tcp_pose_from_joints(pos, sign, offset, kinematics.JointMap.from_schema(arm.get_schema()))
     for i, s in enumerate(calib.samples):
         if np.linalg.norm(s.p_base - G.translation) < 0.01:
             return f"rejected: TCP within 10 mm of sample #{i + 1}; move further"

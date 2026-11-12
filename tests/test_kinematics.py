@@ -93,13 +93,17 @@ def test_to_model_sign_offset():
     sign, off = (1, -1, -1, 1), (0.0, 0.1, 0.0, -0.2)
     q = K.to_model(pos, sign, off)
     assert K.to_motor(q, sign, off) == pytest.approx(pos[:4])
-    np.testing.assert_allclose(K.tcp_pose_from_joints(pos, sign, off).matrix, K.tcp_pose(q).matrix)
+    # motor J6 0 is URDF joint6 -pi/2 on the B601-DM
+    np.testing.assert_allclose(
+        K.tcp_pose_from_joints(pos, sign, off).matrix, K.tcp_pose(q + [0.0, -math.pi / 2]).matrix
+    )
     with pytest.raises(ValueError):
         K.to_model([0.0, 0.0])
-    # J5 / J6 (indices 4, 5) map 1:1, the gripper (index 6) is ignored
+    # J5 maps 1:1, J6 = motor - pi/2 (B601DM_JOINT_MAP), the gripper (index 6) is ignored
     pos = [0.1, -0.5, -1.0, 0.3, 0.4, -0.7, 0.02]
     np.testing.assert_allclose(
-        K.tcp_pose_from_joints(pos, sign, off).matrix, K.tcp_pose(K.to_model(pos, sign, off) + [0.4, -0.7]).matrix
+        K.tcp_pose_from_joints(pos, sign, off).matrix,
+        K.tcp_pose(K.to_model(pos, sign, off) + [0.4, -0.7 - math.pi / 2]).matrix,
     )
     np.testing.assert_allclose(
         K.tcp_pose_from_joints(pos).matrix, K.tcp_pose_from_joints(pos[:6] + [-5.7]).matrix, atol=1e-15
@@ -170,3 +174,40 @@ def test_park_pose_wrist_motion():
     assert abs(d[2]) < 1e-5 and abs(d[0]) < 5e-3
     R = K.tcp_pose(PARK[:5] + [PARK[5] + 0.2]).rotation.T @ K.tcp_pose(PARK).rotation
     assert Rotation.from_matrix(R).magnitude() == pytest.approx(0.2, abs=1e-9)
+
+
+# ------------------------------------------------------------- joint map ---
+def test_home_pose_jaws_horizontal_and_camera_side_up():
+    # profile home (motor J6 = pi/2): the real arm's jaws open left-right, camera holder on top
+    T = K.tcp_pose_from_joints([0.0, 0.0, 0.0, 0.0, 0.0, 1.5707963, 0.0])
+    R = T.rotation
+    assert abs(R[2, 1]) < 1e-3 and R[1, 1] > 0.9999, R[:, 1]  # jaw axis (end_link y) along world +y
+    assert R[2, 2] > 0.9999, R[:, 2]  # end_link +z (camera side) up
+    # URDF joint6 there is 0
+    assert K.B601DM_JOINT_MAP.to_model([0.0, 0.0, 0.0, 0.0, 0.0, math.pi / 2])[5] == pytest.approx(0.0)
+
+
+def test_joint_map_from_schema_and_fallback():
+    m = K.JointMap.from_schema(
+        {"model_joint_map": [{"sign": 1.0, "offset_rad": 0.0}] * 5 + [{"sign": -1.0, "offset_rad": 0.25}]}
+    )
+    assert m.sign[5] == -1.0 and m.offset_rad[5] == 0.25
+    q = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
+    assert m.to_motor(m.to_model(q)) == pytest.approx(q)
+    assert m.to_model(q)[5] == pytest.approx(-0.6 + 0.25)
+    for bad in (
+        {},
+        {"model_joint_map": []},
+        {"model_joint_map": [{"sign": 2.0, "offset_rad": 0.0}] * 6},
+        {"model_joint_map": [{"sign": 1.0}] * 6},
+    ):
+        assert K.JointMap.from_schema(bad) is K.B601DM_JOINT_MAP
+    # armd's published B601-DM map round-trips through the client schema type
+    from rebot.client import ObservationSchema
+
+    s = ObservationSchema.from_dict(
+        {"dof": 7, "model_joint_map": [{"sign": 1.0, "offset_rad": o} for o in K.B601DM_MODEL_OFFSETS_RAD]}
+    )
+    assert K.JointMap.from_schema(s) == K.B601DM_JOINT_MAP
+    T = K.tcp_pose_from_joints([0.0, 0.0, 0.0, 0.0, 0.0, 1.5707963], joint_map=m)
+    np.testing.assert_allclose(T.matrix, K.tcp_pose([0.0, 0.0, 0.0, 0.0, 0.0, -1.5707963 + 0.25]).matrix)

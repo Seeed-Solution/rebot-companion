@@ -240,11 +240,11 @@ def _r(v: float, nd: int = 4) -> float:
     return round(float(v), nd)
 
 
-def tcp_dict(positions: list[float]) -> dict | None:
+def tcp_dict(positions: list[float], joint_map: kinematics.JointMap = kinematics.B601DM_JOINT_MAP) -> dict | None:
     """Host FK of ``end_link`` (``kinematics.tcp_pose_from_joints``): xyz m, rpy deg, quat [w, x, y, z]."""
     if len(positions) < 6:
         return None
-    T = kinematics.tcp_pose_from_joints(positions)
+    T = kinematics.tcp_pose_from_joints(positions, joint_map=joint_map)
     x, y, z, w = Rotation.from_matrix(T.rotation).as_quat()
     return {
         "xyz_m": [_r(v) for v in T.translation],
@@ -276,6 +276,19 @@ class Controller:
         self.session: ArmSession | None = None
         self.released = False  # release_control was called: no automatic re-acquire
         self._lock = threading.RLock()
+        self._joint_map: kinematics.JointMap | None = None
+
+    def joint_map(self) -> kinematics.JointMap:
+        """armd's motor -> URDF map (schema ``model_joint_map``), read once; the B601-DM map when
+        armd is unreachable or does not publish one."""
+        if self._joint_map is None:
+            try:
+                schema = self.client.get_schema()
+            except Exception as exc:  # noqa: BLE001 - FK still works with the B601-DM default
+                log.warning("observation schema unavailable, using the B601-DM joint map: %s", exc)
+                return kinematics.B601DM_JOINT_MAP
+            self._joint_map = kinematics.JointMap.from_schema(schema)
+        return self._joint_map
 
     # ---- lease ---------------------------------------------------------------
 
@@ -387,7 +400,7 @@ class Controller:
                 "temperatures": [_r(v, 1) for v in obs.temperatures],
             },
             "fault": obs.fault,
-            "tcp": tcp_dict(obs.positions),
+            "tcp": tcp_dict(obs.positions, self.joint_map()),
             "gripper": None if grip is None else {"rad": _r(grip), "fraction": _r(gripper_fraction(grip), 3)},
             "action": obs.action.to_dict() if obs.action else None,
             "feedback_valid": obs.feedback_valid,
@@ -395,15 +408,14 @@ class Controller:
             "collision": obs.collision,
         }
 
-    @staticmethod
-    def _action_dict(res: ActionResult) -> dict:
+    def _action_dict(self, res: ActionResult) -> dict:
         a = res.action
         return {
             "action_id": a.id if a else None,
             "kind": a.kind if a else None,
             "state": a.state if a else "done",
             "settled": a.settled if a else None,
-            "tcp_after": tcp_dict(res.status.positions),
+            "tcp_after": tcp_dict(res.status.positions, self.joint_map()),
             "duration_s": _r(res.duration_s, 3),
             "safety_state": res.status.safety_state,
             "is_torqued": res.status.is_torqued,
@@ -427,7 +439,9 @@ class Controller:
             raise ToolFail("INVALID_ARGUMENT", "give roll/pitch/yaw or quat, not both")
         if any(v is not None for v in (roll_deg, pitch_deg, yaw_deg)):
             obs = s.latest_observation()
-            cur = (tcp_dict(obs.commanded_positions or obs.positions) or {}).get("rpy_deg", [0.0, 0.0, 0.0])
+            cur = (tcp_dict(obs.commanded_positions or obs.positions, self.joint_map()) or {}).get(
+                "rpy_deg", [0.0, 0.0, 0.0]
+            )
             rpy = [math.radians(v if v is not None else c) for v, c in zip((roll_deg, pitch_deg, yaw_deg), cur)]
         res = s.move_pose([x, y, z], rpy=rpy, quat=quat, linear_speed=speed_mps, timeout=timeout_s)
         return self._action_dict(res)

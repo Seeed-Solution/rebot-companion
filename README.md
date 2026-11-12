@@ -553,13 +553,18 @@ z up, metres / radians):
   `reBot-DevArm_gripper.urdf` (rebot-armd `assets/`, copy in `tests/fixtures/`). Returns the
   SE(3) TCP pose, x axis = tool axis. Hand-eye calibration uses this FK, so J5 and J6 may take
   any value in the samples. Tests compare it with an independent URDF parser: < 0.1 mm, < 0.01 deg.
-- URDF joint5 = wrist swing (axis vertical at the park pose J1..J5 = 0, J6 = pi/2; +0.2 rad
+- URDF joint5 = wrist swing (axis vertical at the park pose, motor J1..J5 = 0, J6 = pi/2; +0.2 rad
   moves the TCP ~36 mm in -y), joint6 = tool roll (about the tool axis; the TCP position does
   not change). The Web cockpit UI uses the same labels (J5 swing, J6 roll).
 - Motor → URDF mapping: armd index 0..3 → URDF joint1..joint4 with `model = (motor - offset) / sign`
   (Web `toModel` / `CFG.cart.sign` / `CFG.cart.off`, defaults sign `1,1,1,1`, offset `0`; same as
   the Web `?iksign=` / `?ikoff=` overrides; the wizard takes `--iksign` / `--ikoff`). Index 4 →
-  joint5 and index 5 → joint6, 1:1. Index 6 (gripper) is not part of the FK.
+  joint5 1:1; index 5 → joint6 with URDF joint6 = motor − pi/2 (`kinematics.JointMap`, default
+  `B601DM_JOINT_MAP`; `JointMap.from_schema` reads armd's `model_joint_map` from
+  `GET /api/v1/observation/schema`, which the MCP server and the hand-eye wizard use). Evidence:
+  photos of the arm at the rest pose (motor J6 = pi/2), 2026-11-12: the jaws open left-right and
+  the camera holder (end_link +z) is on top, which the URDF FK gives at joint6 = 0. Index 6
+  (gripper) is not part of the FK.
 - Planar FK/IK, `fk(q)` / `solve_ik(target, prev)`: line-by-line port of the rebot-armd Web
   cockpit (`src/api/index.html`, `IK.fk` / `IK.solve`), J1 yaw + J2/J3/J4 pitch chain, J5 = 0.
   Tests compare it against values computed by running the JS code with node
