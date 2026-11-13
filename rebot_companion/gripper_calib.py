@@ -199,6 +199,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         is_pass = res.passed
         print(f"Zero check result: stop_rad={stop_rad:.4f} rad, offset_rad={offset_rad:.4f} rad, pass={is_pass}")
 
+        if not is_pass:
+            print(
+                "WARNING: the offset exceeds 0.10 rad. Check the jaws for debris and the gripper mounting"
+                " before storing it; armd refuses offsets beyond 0.5 rad."
+            )
         ans = input("Store this offset? [y/N]: ").strip().lower()
         if ans in ("y", "yes"):
             chosen_offset = offset_rad

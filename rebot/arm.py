@@ -435,7 +435,8 @@ class Arm:
                 timeout=timeout,
             ),
             "gripper zero check",
-            timeout=timeout or 15.0,
+            # 0.3 rad/s from fully open to the stall takes about 20 s
+            timeout=timeout or 30.0,
         )
 
     def gripper_calibration(self) -> dict:
