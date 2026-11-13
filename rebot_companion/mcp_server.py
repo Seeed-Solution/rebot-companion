@@ -56,7 +56,12 @@ from rebot.client import (
     LeaseError,
     MotionTimeout,
 )
-from rebot.detection import DetectionClient, DetectorUnavailable, parse_detections
+from rebot.detection import (
+    DEFAULT_TRIGGER_PIPELINES,
+    DetectionClient,
+    DetectorUnavailable,
+    parse_detections,
+)
 from rebot.errors import UnsupportedError
 
 from . import kinematics
@@ -635,7 +640,7 @@ class Controller:
         return [Image(data=snap.jpeg, format="jpeg"), json.dumps(meta)]
 
     def detect(self, wait_ms: int, min_score: float, pipelines: str | None = None) -> dict:
-        wanted = None if pipelines is None else (["yolo", "aruco"] if pipelines == "both" else [pipelines])
+        wanted = None if pipelines is None else (list(DEFAULT_TRIGGER_PIPELINES) if pipelines == "both" else [pipelines])
         res = self.detector.detect_once(wait_ms=wait_ms, pipelines=wanted)
         dets = [d for d in parse_detections(res["raw"]) if d.score >= min_score]
         out = {

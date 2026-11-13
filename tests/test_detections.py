@@ -374,6 +374,134 @@ def test_parse_detections_nested_detail_and_metrics():
     assert d_nest.length_m == pytest.approx(0.05)
 
 
+def test_parse_detections_huge_integers_no_overflow():
+    huge = 10**400
+    # Huge integer in box coordinates causes box to be dropped without OverflowError
+    raw_bad_box = {
+        "detections": [
+            {
+                "format": "xywh_center",
+                "cx": huge,
+                "cy": 0.5,
+                "w": 0.2,
+                "h": 0.4,
+                "score": 0.8,
+            }
+        ]
+    }
+    assert parse_detections(raw_bad_box) == []
+
+    # Huge integer in depth_m is cleanly converted to None without OverflowError
+    raw_bad_depth = {
+        "detections": [
+            {
+                "format": "xywh_center",
+                "cx": 0.5,
+                "cy": 0.5,
+                "w": 0.2,
+                "h": 0.4,
+                "score": 0.85,
+                "depth_m": huge,
+            }
+        ]
+    }
+    (d,) = parse_detections(raw_bad_depth)
+    assert d.depth_m is None
+    assert d.score == pytest.approx(0.85)
+
+
+def test_parse_detections_metric_bounds_and_disparity():
+    # 0.0 and negative values for depth_m, height_m, width_m, length_m return None,
+    # while disp_fg = 0.0, disp_bg = -0.5 still parse as floats.
+    raw = {
+        "detections": [
+            {
+                "format": "xywh_center",
+                "cx": 0.5,
+                "cy": 0.5,
+                "w": 0.2,
+                "h": 0.4,
+                "score": 0.9,
+                "depth_m": 0.0,
+                "height_m": -0.1,
+                "width_m": 0.0,
+                "length_m": -0.05,
+                "disp_fg": 0.0,
+                "disp_bg": -0.5,
+            }
+        ]
+    }
+    (d,) = parse_detections(raw)
+    assert d.depth_m is None
+    assert d.height_m is None
+    assert d.width_m is None
+    assert d.length_m is None
+    assert d.disp_fg == pytest.approx(0.0)
+    assert d.disp_bg == pytest.approx(-0.5)
+
+
+def test_parse_detections_depth_conf_bounds():
+    # depth_conf = 1.5 -> 1.0, depth_conf = -0.2 -> 0.0, depth_conf = "-inf" -> None
+    raw_high = {
+        "detections": [
+            {"format": "xywh_center", "cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.4, "score": 0.8, "depth_conf": 1.5}
+        ]
+    }
+    (d_high,) = parse_detections(raw_high)
+    assert d_high.depth_conf == pytest.approx(1.0)
+
+    raw_low = {
+        "detections": [
+            {"format": "xywh_center", "cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.4, "score": 0.8, "depth_conf": -0.2}
+        ]
+    }
+    (d_low,) = parse_detections(raw_low)
+    assert d_low.depth_conf == pytest.approx(0.0)
+
+    raw_inf = {
+        "detections": [
+            {"format": "xywh_center", "cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.4, "score": 0.8, "depth_conf": "-inf"}
+        ]
+    }
+    (d_inf,) = parse_detections(raw_inf)
+    assert d_inf.depth_conf is None
+
+
+def test_parse_detections_nested_fallback_on_invalid_top_level():
+    # Top-level "depth_m": "nan" with nested "detail": {"depth_m": 0.28} resolves to 0.28
+    raw = {
+        "detections": [
+            {
+                "format": "xywh_center",
+                "cx": 0.5,
+                "cy": 0.5,
+                "w": 0.2,
+                "h": 0.4,
+                "score": 0.9,
+                "depth_m": "nan",
+                "detail": {
+                    "depth_m": 0.28,
+                },
+            }
+        ]
+    }
+    (d,) = parse_detections(raw)
+    assert d.depth_m == pytest.approx(0.28)
+
+
+def test_find_field_backwards_compatible_and_parse_fallback():
+    from rebot.detection import _find_field, _opt_pos_float
+
+    item = {"a": 1, "detail": {"b": 2}}
+    assert _find_field(item, "a") == 1
+    assert _find_field(item, "b") == 2
+    assert _find_field(item, "c") is None
+
+    # Top-level invalid value falls back to detail when parse provided
+    item2 = {"depth_m": "nan", "detail": {"depth_m": 0.28}}
+    assert _find_field(item2, "depth_m", _opt_pos_float) == 0.28
+
+
 def test_detect_once_keeps_the_old_trigger_for_api1_and_older_providers():
     for routes in (_v2_routes([], per_request=False), {}):
         bodies = []

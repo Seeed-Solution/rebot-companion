@@ -7,7 +7,7 @@ Standard library only. :func:`parse_detections` reads the same payload formats a
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from . import _http
 from ._log import _log
@@ -28,15 +28,15 @@ class Detection:
     corners_norm: list[tuple[float, float]] | None = None  # marker corners (not clamped)
     frame_id: int | None = None  # detector frame the box comes from (set by Arm.detect)
     ts_ms: float | None = None
-    length_px: float | None = None
-    disp_fg: float | None = None
-    disp_bg: float | None = None
-    depth_conf: float | None = None
-    jaw_clear: bool | None = None
-    depth_m: float | None = None
-    height_m: float | None = None
-    width_m: float | None = None
-    length_m: float | None = None
+    length_px: float | None = None  # major-axis length in pixels (> 0)
+    disp_fg: float | None = None  # foreground disparity
+    disp_bg: float | None = None  # background disparity
+    depth_conf: float | None = None  # depth confidence in [0, 1]
+    jaw_clear: bool | None = None  # gripper jaw clearance flag
+    depth_m: float | None = None  # object distance/depth in metres (> 0)
+    height_m: float | None = None  # 3D bounding height in metres (> 0)
+    width_m: float | None = None  # 3D bounding width in metres (> 0)
+    length_m: float | None = None  # 3D bounding length in metres (> 0)
 
     def to_dict(self) -> dict:
         d = {
@@ -68,7 +68,7 @@ class Detection:
 def _num(v: Any) -> float | None:
     try:
         f = float(v)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return f if f == f and abs(f) != float("inf") else None
 
@@ -84,12 +84,34 @@ def _opt_pos_float(v: Any) -> float | None:
     return f if f is not None and f > 0.0 else None
 
 
+def _opt_unit_float(v: Any) -> float | None:
+    f = _opt_float(v)
+    return max(0.0, min(1.0, f)) if f is not None else None
+
+
 def _opt_bool(v: Any) -> bool | None:
     return v if isinstance(v, bool) else None
 
 
-def _find_field(item: Any, key: str) -> Any:
+def _find_field(item: Any, key: str, parse: Callable[[Any], Any] | None = None) -> Any:
     if not isinstance(item, dict):
+        return None
+    if parse is not None:
+        try:
+            val = parse(item.get(key))
+        except (TypeError, ValueError, OverflowError):
+            val = None
+        if val is not None:
+            return val
+        for sub in ("detail", "depth", "metrics"):
+            nested = item.get(sub)
+            if isinstance(nested, dict):
+                try:
+                    nval = parse(nested.get(key))
+                except (TypeError, ValueError, OverflowError):
+                    nval = None
+                if nval is not None:
+                    return nval
         return None
     val = item.get(key)
     if val is not None:
@@ -293,15 +315,15 @@ def parse_detections(raw: Any, ref_res: tuple[int, int] | None = None) -> list[D
                 track_id=track,
                 center_norm=(clamp(cx / sx), clamp(cy / sy)),
                 corners_norm=[(u / sx, v / sy) for u, v in corners] if corners else None,
-                length_px=_opt_pos_float(_find_field(item, "length_px")),
-                disp_fg=_opt_float(_find_field(item, "disp_fg")),
-                disp_bg=_opt_float(_find_field(item, "disp_bg")),
-                depth_conf=_opt_float(_find_field(item, "depth_conf")),
-                jaw_clear=_opt_bool(_find_field(item, "jaw_clear")),
-                depth_m=_opt_float(_find_field(item, "depth_m")),
-                height_m=_opt_float(_find_field(item, "height_m")),
-                width_m=_opt_float(_find_field(item, "width_m")),
-                length_m=_opt_float(_find_field(item, "length_m")),
+                length_px=_find_field(item, "length_px", _opt_pos_float),
+                disp_fg=_find_field(item, "disp_fg", _opt_float),
+                disp_bg=_find_field(item, "disp_bg", _opt_float),
+                depth_conf=_find_field(item, "depth_conf", _opt_unit_float),
+                jaw_clear=_find_field(item, "jaw_clear", _opt_bool),
+                depth_m=_find_field(item, "depth_m", _opt_pos_float),
+                height_m=_find_field(item, "height_m", _opt_pos_float),
+                width_m=_find_field(item, "width_m", _opt_pos_float),
+                length_m=_find_field(item, "length_m", _opt_pos_float),
             )
         )
     return out
