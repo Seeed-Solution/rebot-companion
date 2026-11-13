@@ -52,6 +52,7 @@ Python SDK and stdio [MCP](https://modelcontextprotocol.io) server bridging **Se
 - [Arm control](#arm-control)
 - [MCP server (agent control)](#mcp-server-agent-control)
 - [Hand-eye calibration](#hand-eye-calibration)
+- [Gripper calibration](#gripper-calibration)
 - [Camera intrinsics](#camera-intrinsics)
 - [Record a LeRobot dataset](#record-a-lerobot-dataset)
 - [Run a learned policy](#run-a-learned-policy)
@@ -233,8 +234,12 @@ ssh <user>@192.168.42.1 'cd ~/arm && python3 main.py'
 | `move_relative(dx, dy, dz, frame="base", droll, dpitch, dyaw, speed)` | relative move in the `base`, `tool` or `camera` frame |
 | `move_joints(positions, duration=None)` | joint-space move (7 values, radians) |
 | `gripper_open()`, `gripper_close()`, `gripper_move(fraction)` | gripper; `gripper_close().holding` reports a held object |
+| `gripper_zero_check(store_offset=False, threshold_rad=0.10)` | mechanical zero check; result has `stop_rad`, `offset_rad`, `pass_` (`.passed`) |
+| `gripper_calibration()`, `set_gripper_calibration(points, offset_rad=None)` | read calibration (GET); write opening table and/or offset (WS) |
 | `detect(label=None, pipelines=("yolo",), min_score=0.3)` | one detector run through armd; list of detections |
 | `grasp(detection)` or `grasp("cup", box=(x0, y0, x1, y1))` | armd's grasp action; `.holding` in the result |
+| `grasp_dry_run(detection)` | check reachability of a detection without moving or lease |
+| `grasp_any(label=None, min_score=0.3, max_candidates=5)` | detect, dry-run in order, grasp first reachable target |
 | `state()` | latest observation (`positions`, `safety_state`, `is_torqued`, `fault`, ...) |
 | `poses()`, `save_pose(name)`, `delete_pose(name)`, `move_to_pose(name, speed_scale=1.0)` | named poses stored in armd |
 | `place(pose=None, position=None, rpy=None, approach_height_m=0.08, release=True, retreat=True, speed_scale=1.0)` | put the held object down: lift, approach, descend, open, retreat (capability `place`) |
@@ -654,6 +659,25 @@ and can be solved with `method="point"` only. Their gripper rotation is recomput
 `joints` with the FK.
 
 ---
+
+## Gripper calibration
+
+`rebot-gripper-calib` measures the gripper on the real arm for armd's grasp (needs rebot-armd with the gripper calibration
+API). The arm body does not move; the gripper moves at low speed. Keep fingers out of the jaws; Ctrl+C stops; nothing is
+stored without confirmation.
+
+```bash
+REBOT_HOST=192.168.42.1 rebot-gripper-calib            # --points 6 (default), --dry-run measures without storing
+```
+
+1. Shows the stored calibration and `observation.gripper_zero`.
+2. Zero check: the jaws close slowly to the mechanical stop; prints the offset from `closed_rad` and asks whether to store it.
+3. Opening table: the gripper stops at each position from open to closed; enter the caliper opening at the jaw tips in mm
+   (`s` skips a point, `q` aborts).
+4. Checks that the openings are monotonic, prints the fit residuals (warns above 2 mm), the full opening and a suggested
+   `max_grasp_width_m` (full opening − 0.015 m), and asks whether to store the table.
+
+armd uses the stored table for the width-based pre-open (`pre_open: auto`) and to cap the `TOO_WIDE` limit.
 
 ## Camera intrinsics
 

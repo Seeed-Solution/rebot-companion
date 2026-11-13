@@ -24,7 +24,7 @@ import os
 import signal
 import threading
 import time
-from typing import Any, Callable, List, Optional, Sequence, Union
+from typing import Any, Callable, List, Optional, Sequence, Tuple, Union
 
 from ._http import host_url
 from ._log import _log
@@ -51,6 +51,7 @@ _HINTS = {
     "MOTION_BUSY": "cannot start while another motion runs; call arm.stop() first",
     "ESTOP_ACTIVE": "cannot be reached while the E-stop is latched",
     "COLLISION_HOLD": "is refused while the arm holds after a collision; call arm.wait_until_clear() first",
+    "OBJECT_HELD": "cannot run while an object is held; open the gripper first",
 }
 
 SENSITIVITIES = ("low", "medium", "high")
@@ -416,6 +417,44 @@ class Arm:
         """Open the gripper to ``fraction`` (0 closed .. 1 open)."""
         return self._motion(lambda: self.session.gripper("move", fraction=fraction), "gripper move")
 
+    def gripper_zero_check(
+        self,
+        store_offset: bool = False,
+        threshold_rad: float = 0.10,
+        timeout: Optional[float] = None,
+    ) -> ActionResult:
+        """Check mechanical zero of the gripper.
+
+        Closes the jaws until stall to measure the zero offset.
+        Returns an ActionResult with stop_rad, offset_rad, and pass_ (or .passed).
+        """
+        return self._motion(
+            lambda: self.session.gripper_zero_check(
+                store_offset=store_offset,
+                threshold_rad=threshold_rad,
+                timeout=timeout,
+            ),
+            "gripper zero check",
+            # 0.3 rad/s from fully open to the stall takes about 20 s
+            timeout=timeout or 30.0,
+        )
+
+    def gripper_calibration(self) -> dict:
+        """Read the current gripper calibration (GET /api/v1/gripper/calibration)."""
+        return self._run(self.client.get_gripper_calibration)
+
+    def set_gripper_calibration(
+        self,
+        points: Optional[Union[Sequence[Sequence[float]], dict]] = None,
+        offset_rad: Optional[float] = None,
+    ) -> dict:
+        """Write gripper calibration over WebSocket under the lease.
+
+        points: sequence of (j7_rad, opening_m) pairs or dict.
+        offset_rad: optional zero offset in radians.
+        """
+        return self._run(lambda: self.session.set_gripper_calibration(points=points, offset_rad=offset_rad))
+
     def grasp(
         self,
         target: Union[Detection, str],
@@ -443,6 +482,59 @@ class Arm:
             lambda: self.session.grasp(label, box_norm, frame_id=frame_id, ts_ms=ts_ms, timeout=timeout),
             f"grasp of '{label}'",
             timeout,
+        )
+
+    def grasp_dry_run(
+        self,
+        target: Union[Detection, str],
+        box: Optional[Sequence[float]] = None,
+        timeout: Optional[float] = None,
+    ) -> Tuple[bool, Optional[str], Optional[str]]:
+        """Check reachability of a detection without moving the arm.
+
+        Returns (reachable, code, message).
+        """
+        if isinstance(target, Detection):
+            label, box_norm, frame_id, ts_ms = target.label, target.box_norm, target.frame_id, target.ts_ms
+        else:
+            if box is None:
+                raise ValueError(
+                    "grasp_dry_run(label) needs box=(x0, y0, x1, y1); or pass a detection from arm.detect()"
+                )
+            label, box_norm, frame_id, ts_ms = str(target), tuple(box), None, None
+        return self._run(
+            lambda: self.session.grasp_dry_run(
+                label=label, box_norm=box_norm, frame_id=frame_id, ts_ms=ts_ms, timeout=timeout
+            )
+        )
+
+    def grasp_any(
+        self,
+        label: Optional[str] = None,
+        min_score: float = 0.3,
+        max_candidates: int = 5,
+        timeout: Optional[float] = None,
+    ) -> ActionResult:
+        """Detect objects, dry-run in score order, and grasp the first reachable one.
+
+        detect(), keep matching label and score, sort by score, dry-run each in order,
+        grasp the first reachable one; raise ActionFailed with code IK_UNREACHABLE (or
+        the last dry-run code) when none is reachable. Bounded loop.
+        """
+        candidates = self.detect(label=label, min_score=min_score)
+        bounded_candidates = candidates[:max(0, int(max_candidates))]
+        last_code: Optional[str] = None
+        last_message: Optional[str] = None
+        for d in bounded_candidates:
+            self.feed()
+            reachable, code, message = self.grasp_dry_run(d, timeout=timeout)
+            if reachable:
+                return self.grasp(d, timeout=timeout)
+            last_code = code
+            last_message = message
+        raise ActionFailed(
+            last_code or "IK_UNREACHABLE",
+            last_message or ("no reachable target found" if bounded_candidates else "no detections found"),
         )
 
     def place(

@@ -66,7 +66,11 @@ with Arm() as arm:  # $REBOT_HOST or 127.0.0.1; takes control, torque on
 | `place(pose=None, position=None, rpy=None, approach_height_m=0.08, release=True, retreat=True, speed_scale=1.0)` | exactly one of `pose` / `position`; capability `place` |
 | `detect(label=None, pipelines=("yolo",), min_score=0.3)` | list of `Detection` |
 | `grasp(detection)` | `result.holding` is True when an object is held |
+| `grasp_dry_run(detection)` | `(reachable, code, message)` without moving or lease |
+| `grasp_any(label=None, min_score=0.3, max_candidates=5)` | detect, dry-run in order, grasp first reachable; raises `ActionFailed` |
 | `gripper_open()`, `gripper_close(grasp=True)`, `gripper_move(fraction)` | 0 closed .. 1 open |
+| `gripper_zero_check(store_offset=False, threshold_rad=0.10)` | mechanical zero check; result has `stop_rad`, `offset_rad`, `pass_` (`.passed`) |
+| `gripper_calibration()`, `set_gripper_calibration(points, offset_rad=None)` | read calibration (GET); write opening table and/or offset (WS) |
 | `state()` | `positions`, `safety_state`, `is_torqued`, `fault`, `action`, `collision` |
 | `stop()`, `e_stop()` | stop and hold; latched emergency stop |
 | `recover()` | clears only faults armd marks recoverable, then torque on |
@@ -114,6 +118,9 @@ Every call blocks until armd reports the result and raises a `RebotError` subcla
 - Do not use `e_stop()` as part of normal program flow. Do not run two programs on one arm: only one
   client holds control at a time.
 - Do not use `force=True` in `Arm(...)`: it takes control from the web cockpit.
+- **Gripper calibration** (`rebot-gripper-calib`, `Arm.gripper_zero_check`, `Arm.set_gripper_calibration`) moves the gripper
+  and writes armd's stored calibration. Run it only when the user asks and is at the arm; never store without the user's
+  confirmation.
 
 ## Errors
 

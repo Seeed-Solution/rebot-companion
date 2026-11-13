@@ -52,6 +52,7 @@
 - [机械臂控制](#机械臂控制)
 - [MCP 服务器（agent 控制）](#mcp-服务器agent-控制)
 - [手眼标定](#手眼标定)
+- [夹爪标定](#夹爪标定)
 - [相机内参](#相机内参)
 - [录制 LeRobot 数据集](#录制-lerobot-数据集)
 - [运行学习策略](#运行学习策略)
@@ -225,8 +226,12 @@ ssh <user>@192.168.42.1 'cd ~/arm && python3 main.py'
 | `move_relative(dx, dy, dz, frame="base", droll, dpitch, dyaw, speed)` | 在 `base`、`tool` 或 `camera` 坐标系中相对运动 |
 | `move_joints(positions, duration=None)` | 关节空间运动（7 个值，弧度） |
 | `gripper_open()`、`gripper_close()`、`gripper_move(fraction)` | 夹爪；`gripper_close().holding` 表示是否夹住物体 |
+| `gripper_zero_check(store_offset=False, threshold_rad=0.10)` | 机械零位检查；结果带 `stop_rad`、`offset_rad`、`pass_`（`.passed`） |
+| `gripper_calibration()`、`set_gripper_calibration(points, offset_rad=None)` | 读取标定（GET）；写入开度表与零位偏差（WS） |
 | `detect(label=None, pipelines=("yolo",), min_score=0.3)` | 经 armd 运行一次检测，返回检测列表 |
 | `grasp(detection)` 或 `grasp("cup", box=(x0, y0, x1, y1))` | armd 的抓取动作；结果中的 `.holding` |
+| `grasp_dry_run(detection)` | 检查目标抓取可达性，不产生运动且无需租约 |
+| `grasp_any(label=None, min_score=0.3, max_candidates=5)` | 检测物体、按得分顺序 dry-run，抓取首个可达目标 |
 | `state()` | 最新 observation（`positions`、`safety_state`、`is_torqued`、`fault` 等） |
 | `poses()`、`save_pose(name)`、`delete_pose(name)`、`move_to_pose(name, speed_scale=1.0)` | 保存在 armd 中的命名位姿 |
 | `place(pose=None, position=None, rpy=None, approach_height_m=0.08, release=True, retreat=True, speed_scale=1.0)` | 放下手中物体：抬升、接近、下降、张开、撤离（能力 `place`） |
@@ -608,6 +613,21 @@ TCP 位姿，拒绝与已有样本距离小于 10 mm 的样本，并追加到 `c
 `joints` 经 FK 重新计算。
 
 ---
+
+## 夹爪标定
+
+`rebot-gripper-calib` 在真机上测量夹爪参数，供 armd 抓取使用（需要带夹爪标定接口的 rebot-armd）。机械臂本体不动，夹爪低速运动。手指不要放在夹爪之间；Ctrl+C 停止；未经确认不写入任何数据。
+
+```bash
+REBOT_HOST=192.168.42.1 rebot-gripper-calib            # --points 6（默认），--dry-run 只测量不写入
+```
+
+1. 显示已保存的标定和 `observation.gripper_zero`。
+2. 零位检查：夹爪慢速合拢到机械限位，显示相对 `closed_rad` 的偏差，询问是否保存。
+3. 开口表：夹爪从张开到闭合依次停在各个位置，每处输入卡尺量得的夹爪尖端开口（mm）（`s` 跳过该点，`q` 中止）。
+4. 检查开口是否单调，显示拟合残差（超过 2 mm 时警告）、最大开口和建议的 `max_grasp_width_m`（最大开口 − 0.015 m），询问是否保存。
+
+armd 用保存的开口表做按宽度预张口（`pre_open: auto`），并据此收紧 `TOO_WIDE` 的上限。
 
 ## 相机内参
 

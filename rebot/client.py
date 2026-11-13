@@ -143,10 +143,14 @@ class ActionStatus:
     gripper_gap_rad: float | None = None
     settled: bool | None = None
     phase: str | None = None  # grasp only
+    stop_rad: float | None = None
+    offset_rad: float | None = None
+    pass_: bool | None = None
 
     @classmethod
     def from_dict(cls, d: dict) -> ActionStatus:
         holding, settled = d.get("holding"), d.get("settled")
+        pass_val = d.get("pass") if "pass" in d else d.get("pass_")
         return cls(
             id=int(d.get("id", 0)),
             kind=str(d.get("kind", "")),
@@ -161,14 +165,23 @@ class ActionStatus:
             gripper_gap_rad=_opt_float(d.get("gripper_gap_rad")),
             settled=None if settled is None else bool(settled),
             phase=d.get("phase"),
+            stop_rad=_opt_float(d.get("stop_rad")),
+            offset_rad=_opt_float(d.get("offset_rad")),
+            pass_=None if pass_val is None else bool(pass_val),
         )
+
+    @property
+    def passed(self) -> bool | None:
+        return self.pass_
 
     @property
     def terminal(self) -> bool:
         return self.state in ACTION_TERMINAL_STATES
 
     def to_dict(self) -> dict:
-        return dict(self.__dict__)
+        d = dict(self.__dict__)
+        d["pass"] = self.pass_
+        return d
 
 
 @dataclass
@@ -188,6 +201,22 @@ class ActionResult:
     def holding(self) -> bool | None:
         """Gripper/grasp verdict: True when an object is held, None when the action does not report it."""
         return self.action.holding if self.action is not None else None
+
+    @property
+    def stop_rad(self) -> float | None:
+        return self.action.stop_rad if self.action is not None else None
+
+    @property
+    def offset_rad(self) -> float | None:
+        return self.action.offset_rad if self.action is not None else None
+
+    @property
+    def pass_(self) -> bool | None:
+        return self.action.pass_ if self.action is not None else None
+
+    @property
+    def passed(self) -> bool | None:
+        return self.action.pass_ if self.action is not None else None
 
     @property
     def ok(self) -> bool:
@@ -222,6 +251,7 @@ class ArmStatus:
     residual_torques: list[float] | None = None  # capability residual_torques
     collision: dict | None = None  # capability collision_guard; None while the guard is off or unavailable
     motion_limit: dict | None = None  # capability servo_guard: {"reason", "joint", "since_ms"} or None
+    gripper_zero: dict | None = None  # capability gripper_zero: {"state", "j7", "offset_rad"}
 
     @classmethod
     def from_dict(cls, d: dict) -> ArmStatus:
@@ -254,6 +284,7 @@ class ArmStatus:
             residual_torques=floats("residual_torques") if isinstance(d.get("residual_torques"), list) else None,
             collision=dict(d["collision"]) if isinstance(d.get("collision"), dict) else None,
             motion_limit=dict(d["motion_limit"]) if isinstance(d.get("motion_limit"), dict) else None,
+            gripper_zero=dict(d["gripper_zero"]) if isinstance(d.get("gripper_zero"), dict) else None,
         )
 
     @property
@@ -371,6 +402,42 @@ class ArmdClient:
         res = self.request("GET", path)
         res.raise_for_status()
         return res.json()
+
+    def _post(self, path: str, json: Any = None, timeout: float | None = None) -> Any:
+        res = self.request("POST", path, json=json, timeout=timeout)
+        res.raise_for_status()
+        return res.json()
+
+    def get_gripper_calibration(self) -> dict:
+        """``GET /api/v1/gripper/calibration`` (no lease required)."""
+        return dict(self._get("/api/v1/gripper/calibration") or {})
+
+    def grasp_dry_run(
+        self,
+        label: str,
+        box_norm: Sequence[float],
+        frame_id: int | None = None,
+        ts_ms: float | None = None,
+        overrides: dict | None = None,
+        tag: str | None = None,
+        timeout: float | None = None,
+    ) -> tuple[bool, str | None, str | None]:
+        """Check grasp reachability over REST (no lease required)."""
+        body: dict = {
+            "label": str(label),
+            "box_norm": [float(v) for v in box_norm],
+            "dry_run": True,
+        }
+        if frame_id is not None:
+            body["frame_id"] = int(frame_id)
+        if ts_ms is not None:
+            body["ts_ms"] = float(ts_ms)
+        if overrides is not None:
+            body["overrides"] = dict(overrides)
+        if tag is not None:
+            body["tag"] = str(tag)
+        data = self._post("/api/v1/action/grasp", json=body, timeout=timeout)
+        return bool(data.get("reachable", False)), data.get("code"), data.get("message")
 
     def get_observation(self) -> ArmStatus:
         """``GET /api/v1/observation`` (no lease required)."""
@@ -1160,6 +1227,22 @@ class ArmSession:
             timeout = float(timeout_s) + 5.0
         return self._action("/api/v1/action/gripper", body, timeout, legacy_wait=None)
 
+    def gripper_zero_check(
+        self,
+        store_offset: bool = False,
+        threshold_rad: float = 0.10,
+        tag: str | None = None,
+        timeout: float | None = None,
+    ) -> ActionResult:
+        """Run mechanical zero check of the gripper."""
+        body: dict = {
+            "store_offset": bool(store_offset),
+            "threshold_rad": float(threshold_rad),
+        }
+        if tag is not None:
+            body["tag"] = str(tag)
+        return self._action("/api/v1/action/gripper_zero_check", body, timeout, legacy_wait=None)
+
     def home_action(self, timeout: float | None = None) -> ActionResult:
         """:meth:`home` as an action (armd reports kind ``home``); falls back to the state-based wait."""
         return self._action(
@@ -1207,6 +1290,33 @@ class ArmSession:
         if tag is not None:
             body["tag"] = str(tag)
         return self._action("/api/v1/action/grasp", body, 120.0 if timeout is None else timeout, legacy_wait=None)
+
+    def grasp_dry_run(
+        self,
+        label: str,
+        box_norm: Sequence[float],
+        frame_id: int | None = None,
+        ts_ms: float | None = None,
+        overrides: dict | None = None,
+        tag: str | None = None,
+        timeout: float | None = None,
+    ) -> tuple[bool, str | None, str | None]:
+        """Check grasp reachability over WebSocket (returns (reachable, code, message))."""
+        body: dict = {
+            "label": str(label),
+            "box_norm": _vec(box_norm, 4, "box_norm"),
+            "dry_run": True,
+        }
+        if frame_id is not None:
+            body["frame_id"] = int(frame_id)
+        if ts_ms is not None:
+            body["ts_ms"] = float(ts_ms)
+        if overrides:
+            body["overrides"] = dict(overrides)
+        if tag is not None:
+            body["tag"] = str(tag)
+        ack = self.command("/api/v1/action/grasp", body, timeout=timeout)
+        return bool(ack.get("reachable", False)), ack.get("code"), ack.get("message")
 
     # ---- developer platform (capabilities version 6) -------------------------
 
@@ -1302,6 +1412,34 @@ class ArmSession:
         """Replace the runtime keep-out boxes (``[{name, min_m, max_m}]``, at most 16). Capability ``keepout``."""
         self.require("keepout", "Keep-out boxes")
         return self.command("/api/v1/workspace/keepout", {"boxes": [dict(b) for b in boxes]})
+
+    def set_gripper_calibration(
+        self,
+        points: Sequence[Sequence[float]] | dict | None = None,
+        offset_rad: float | None = None,
+    ) -> dict:
+        """Write gripper calibration over WS (requires lease)."""
+        body: dict = {}
+        if offset_rad is not None:
+            body["offset_rad"] = float(offset_rad)
+        if points is not None:
+            if isinstance(points, dict):
+                body["jaw_opening"] = points
+            else:
+                body["jaw_opening"] = {
+                    "points": [[float(p[0]), float(p[1])] for p in points],
+                    "calibrated": True,
+                }
+        else:
+            try:
+                cur = self.client.get_gripper_calibration()
+                jo = cur.get("jaw_opening") or (cur.get("policy") or {}).get("jaw_opening")
+            except Exception:
+                jo = None
+            if not jo:
+                jo = {"points": [[0.0, 0.0], [-5.7, 0.085]], "calibrated": False}
+            body["jaw_opening"] = jo
+        return self.command("/api/v1/gripper/calibration", body)
 
     def _action(self, path: str, body: dict | None, timeout: float | None, legacy_wait: Any) -> ActionResult:
         t0 = time.monotonic()
