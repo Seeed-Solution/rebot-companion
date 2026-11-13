@@ -14,7 +14,8 @@ from ._log import _log
 from .errors import DetectorUnavailable, RebotError
 
 PIXEL_UNIT_THRESHOLD = 1.05  # cx|cy|w|h above this means pixels (cockpit parseDetections)
-PIPELINES = ("yolo", "aruco")
+PIPELINES = ("yolo", "aruco", "depth")
+DEFAULT_TRIGGER_PIPELINES = ("yolo", "aruco")
 
 
 @dataclass
@@ -27,6 +28,15 @@ class Detection:
     corners_norm: list[tuple[float, float]] | None = None  # marker corners (not clamped)
     frame_id: int | None = None  # detector frame the box comes from (set by Arm.detect)
     ts_ms: float | None = None
+    length_px: float | None = None
+    disp_fg: float | None = None
+    disp_bg: float | None = None
+    depth_conf: float | None = None
+    jaw_clear: bool | None = None
+    depth_m: float | None = None
+    height_m: float | None = None
+    width_m: float | None = None
+    length_m: float | None = None
 
     def to_dict(self) -> dict:
         d = {
@@ -38,6 +48,20 @@ class Detection:
         }
         if self.corners_norm is not None:
             d["corners_norm"] = [[round(u, 4), round(v, 4)] for u, v in self.corners_norm]
+        for k in (
+            "length_px",
+            "disp_fg",
+            "disp_bg",
+            "depth_conf",
+            "jaw_clear",
+            "depth_m",
+            "height_m",
+            "width_m",
+            "length_m",
+        ):
+            v = getattr(self, k)
+            if v is not None:
+                d[k] = round(v, 4) if isinstance(v, float) and not isinstance(v, bool) else v
         return d
 
 
@@ -47,6 +71,36 @@ def _num(v: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return f if f == f and abs(f) != float("inf") else None
+
+
+def _opt_float(v: Any) -> float | None:
+    if isinstance(v, bool):
+        return None
+    return _num(v)
+
+
+def _opt_pos_float(v: Any) -> float | None:
+    f = _opt_float(v)
+    return f if f is not None and f > 0.0 else None
+
+
+def _opt_bool(v: Any) -> bool | None:
+    return v if isinstance(v, bool) else None
+
+
+def _find_field(item: Any, key: str) -> Any:
+    if not isinstance(item, dict):
+        return None
+    val = item.get(key)
+    if val is not None:
+        return val
+    for sub in ("detail", "depth", "metrics"):
+        nested = item.get(sub)
+        if isinstance(nested, dict):
+            nval = nested.get(key)
+            if nval is not None:
+                return nval
+    return None
 
 
 def _flatten_xy(v: Any) -> list[Any]:
@@ -239,6 +293,15 @@ def parse_detections(raw: Any, ref_res: tuple[int, int] | None = None) -> list[D
                 track_id=track,
                 center_norm=(clamp(cx / sx), clamp(cy / sy)),
                 corners_norm=[(u / sx, v / sy) for u, v in corners] if corners else None,
+                length_px=_opt_pos_float(_find_field(item, "length_px")),
+                disp_fg=_opt_float(_find_field(item, "disp_fg")),
+                disp_bg=_opt_float(_find_field(item, "disp_bg")),
+                depth_conf=_opt_float(_find_field(item, "depth_conf")),
+                jaw_clear=_opt_bool(_find_field(item, "jaw_clear")),
+                depth_m=_opt_float(_find_field(item, "depth_m")),
+                height_m=_opt_float(_find_field(item, "height_m")),
+                width_m=_opt_float(_find_field(item, "width_m")),
+                length_m=_opt_float(_find_field(item, "length_m")),
             )
         )
     return out
@@ -307,10 +370,11 @@ class DetectionClient:
     def detect_once(self, wait_ms: int = 2500, pipelines: Sequence[str] | None = None) -> dict:
         """One fresh inference result, normalised to ``{frame_id, ts_ms, raw, timeout, pipelines}``.
 
-        Uses ``POST /api/v1/detection/trigger``. ``pipelines`` (``"yolo"`` / ``"aruco"``) is sent
-        when the provider supports per-request pipelines (perception API 2); ``None`` then means
-        both. Older providers run their current mode and ``pipelines`` is ignored. ``pipelines``
-        in the result lists what ran on the frame when the provider reports it, else ``None``.
+        Uses ``POST /api/v1/detection/trigger``. ``pipelines`` (``"yolo"`` / ``"aruco"`` / ``"depth"``) is sent
+        when the provider supports per-request pipelines (perception API 2); ``None`` defaults to
+        ``DEFAULT_TRIGGER_PIPELINES`` (``"yolo"`` and ``"aruco"``). Older providers run their current mode and
+        ``pipelines`` is ignored. ``pipelines`` in the result lists what ran on the frame when the provider
+        reports it, else ``None``.
         Detector builds without the trigger answer 404; then inference is enabled, ``latest`` is
         long-polled for a newer frame, and inference is disabled again only if this call
         enabled it.
@@ -323,7 +387,8 @@ class DetectionClient:
         if self.trigger_supported is not False:
             kw: dict = {"params": {"wait_ms": wait_ms}}
             if self.supports_pipelines():
-                kw["json"] = {"pipelines": pipelines or list(PIPELINES)}
+                req_pipelines = list(pipelines) if pipelines is not None else list(DEFAULT_TRIGGER_PIPELINES)
+                kw["json"] = {"pipelines": req_pipelines}
             res = self._call("POST", "/api/v1/detection/trigger", wait_ms, **kw)
             if res.status_code != 404:
                 self.trigger_supported = True
@@ -367,4 +432,11 @@ def _ran(body: dict) -> list[str] | None:
     return [k for k in PIPELINES if isinstance(p.get(k), dict) and p[k].get("ran") is True]
 
 
-__all__ = ["Detection", "DetectionClient", "DetectorUnavailable", "parse_detections", "PIPELINES"]
+__all__ = [
+    "DEFAULT_TRIGGER_PIPELINES",
+    "Detection",
+    "DetectionClient",
+    "DetectorUnavailable",
+    "parse_detections",
+    "PIPELINES",
+]

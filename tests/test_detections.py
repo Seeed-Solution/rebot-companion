@@ -167,7 +167,7 @@ def _v2_routes(seen_bodies, per_request=True):
         body = json.loads(r.content) if r.content else None
         seen_bodies.append(body)
         p = (body or {}).get("pipelines", ["yolo"])
-        ran = {k: {"ran": k in p} for k in ("yolo", "aruco")}
+        ran = {k: {"ran": k in p} for k in ("yolo", "aruco", "depth")}
         return Response(200, json={"api_version": 2, "success": True, "frame_id": 12, "ts_ms": 7, "pipelines": ran})
 
     mode = {"api_version": 2 if per_request else 1, "mode": "off"}
@@ -185,16 +185,193 @@ def test_detect_once_sends_pipelines_to_api2_providers():
     client = DetectionClient("http://armd", transport=t)
     res = client.detect_once(wait_ms=800)
     assert bodies[-1] == {"pipelines": ["yolo", "aruco"]} and res["pipelines"] == ["yolo", "aruco"]
+    res_none = client.detect_once(wait_ms=800, pipelines=None)
+    assert bodies[-1] == {"pipelines": ["yolo", "aruco"]} and res_none["pipelines"] == ["yolo", "aruco"]
     res = client.detect_once(wait_ms=800, pipelines=["aruco"])
     assert bodies[-1] == {"pipelines": ["aruco"]} and res["pipelines"] == ["aruco"]
     client.detect_once(pipelines=("yolo", "yolo"))
     assert bodies[-1] == {"pipelines": ["yolo"]}
+    res_depth = client.detect_once(wait_ms=800, pipelines=("yolo", "depth"))
+    assert bodies[-1] == {"pipelines": ["yolo", "depth"]} and res_depth["pipelines"] == ["yolo", "depth"]
+    res_depth_only = client.detect_once(wait_ms=800, pipelines=("depth",))
+    assert bodies[-1] == {"pipelines": ["depth"]} and res_depth_only["pipelines"] == ["depth"]
     # the mode is read once and never written
     assert [c for c in calls if c[1] == "/api/v1/vision/mode"] == [("GET", "/api/v1/vision/mode", {})]
     with pytest.raises(ValueError):
         client.detect_once(pipelines=["video"])
     with pytest.raises(ValueError):
         client.detect_once(pipelines=[])
+
+
+def test_ran_helper_parses_executed_pipelines():
+    from rebot.detection import _ran
+
+    assert _ran({"pipelines": {"yolo": {"ran": True}, "depth": {"ran": True}}}) == ["yolo", "depth"]
+    assert _ran({"pipelines": {"yolo": {"ran": True}, "aruco": {"ran": True}, "depth": {"ran": True}}}) == [
+        "yolo",
+        "aruco",
+        "depth",
+    ]
+    assert _ran({"pipelines": {"depth": {"ran": True}}}) == ["depth"]
+    assert _ran({"pipelines": {"yolo": {"ran": False}, "aruco": {"ran": True}}}) == ["aruco"]
+    assert _ran({"pipelines": {}}) == []
+    assert _ran({}) is None
+    assert _ran({"pipelines": None}) is None
+
+
+def test_parse_detections_legacy_has_none_fields():
+    (d_arr,) = parse_detections([[0.5, 0.5, 0.2, 0.4, 0.9, "cup", 7]])
+    assert d_arr.length_px is None
+    assert d_arr.disp_fg is None
+    assert d_arr.disp_bg is None
+    assert d_arr.depth_conf is None
+    assert d_arr.jaw_clear is None
+    assert d_arr.depth_m is None
+    assert d_arr.height_m is None
+    assert d_arr.width_m is None
+    assert d_arr.length_m is None
+
+    raw = {"width": 640, "height": 480, "boxes": [{"format": "xyxy", "x1": 64, "x2": 192, "y1": 48, "y2": 240}]}
+    (d_box,) = parse_detections(raw)
+    assert d_box.length_px is None
+    assert d_box.disp_fg is None
+    assert d_box.disp_bg is None
+    assert d_box.depth_conf is None
+    assert d_box.jaw_clear is None
+    assert d_box.depth_m is None
+    assert d_box.height_m is None
+    assert d_box.width_m is None
+    assert d_box.length_m is None
+
+
+def test_parse_detections_depth_and_metric_fields():
+    raw = {
+        "detections": [
+            {
+                "format": "xywh_center",
+                "cx": 0.5,
+                "cy": 0.5,
+                "w": 0.2,
+                "h": 0.4,
+                "score": 0.85,
+                "label": "block",
+                "track_id": 42,
+                "length_px": 85.5,
+                "disp_fg": 15.3,
+                "disp_bg": 10.2,
+                "depth_conf": 0.94,
+                "jaw_clear": True,
+                "depth_m": 0.32,
+                "height_m": 0.08,
+                "width_m": 0.05,
+                "length_m": 0.06,
+            }
+        ]
+    }
+    (d,) = parse_detections(raw)
+    assert d.label == "block"
+    assert d.score == pytest.approx(0.85)
+    assert d.length_px == pytest.approx(85.5)
+    assert d.disp_fg == pytest.approx(15.3)
+    assert d.disp_bg == pytest.approx(10.2)
+    assert d.depth_conf == pytest.approx(0.94)
+    assert d.jaw_clear is True
+    assert d.depth_m == pytest.approx(0.32)
+    assert d.height_m == pytest.approx(0.08)
+    assert d.width_m == pytest.approx(0.05)
+    assert d.length_m == pytest.approx(0.06)
+
+    # jaw_clear = False
+    raw_false = {
+        "detections": [
+            {
+                "format": "xywh_center",
+                "cx": 0.5,
+                "cy": 0.5,
+                "w": 0.2,
+                "h": 0.4,
+                "score": 0.85,
+                "jaw_clear": False,
+            }
+        ]
+    }
+    assert parse_detections(raw_false)[0].jaw_clear is False
+
+
+def test_parse_detections_ignores_nan_and_bad_values():
+    raw_bad = {
+        "detections": [
+            {
+                "format": "xywh_center",
+                "cx": 0.5,
+                "cy": 0.5,
+                "w": 0.2,
+                "h": 0.4,
+                "score": 0.85,
+                "length_px": float("nan"),
+                "disp_fg": "nan",
+                "disp_bg": float("inf"),
+                "depth_conf": "-inf",
+                "jaw_clear": "yes",
+                "depth_m": None,
+                "height_m": "not-a-number",
+                "width_m": [1, 2],
+                "length_m": True,
+            }
+        ]
+    }
+    (d_bad,) = parse_detections(raw_bad)
+    assert d_bad.length_px is None
+    assert d_bad.disp_fg is None
+    assert d_bad.disp_bg is None
+    assert d_bad.depth_conf is None
+    assert d_bad.jaw_clear is None
+    assert d_bad.depth_m is None
+    assert d_bad.height_m is None
+    assert d_bad.width_m is None
+    assert d_bad.length_m is None
+
+    # length_px must be strictly positive (matches armd *l > 0.0)
+    raw_zero = {"detections": [{"format": "xywh_center", "cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.4, "score": 0.85, "length_px": 0.0}]}
+    assert parse_detections(raw_zero)[0].length_px is None
+    raw_neg = {"detections": [{"format": "xywh_center", "cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.4, "score": 0.85, "length_px": -5.0}]}
+    assert parse_detections(raw_neg)[0].length_px is None
+
+
+def test_parse_detections_nested_detail_and_metrics():
+    raw_nested = {
+        "detections": [
+            {
+                "format": "xywh_center",
+                "cx": 0.5,
+                "cy": 0.5,
+                "w": 0.2,
+                "h": 0.4,
+                "score": 0.88,
+                "detail": {
+                    "length_px": 50.0,
+                    "disp_fg": 12.0,
+                    "disp_bg": 8.0,
+                    "depth_conf": 0.9,
+                    "jaw_clear": True,
+                    "depth_m": 0.3,
+                    "height_m": 0.05,
+                    "width_m": 0.04,
+                    "length_m": 0.05,
+                },
+            }
+        ]
+    }
+    (d_nest,) = parse_detections(raw_nested)
+    assert d_nest.length_px == pytest.approx(50.0)
+    assert d_nest.disp_fg == pytest.approx(12.0)
+    assert d_nest.disp_bg == pytest.approx(8.0)
+    assert d_nest.depth_conf == pytest.approx(0.9)
+    assert d_nest.jaw_clear is True
+    assert d_nest.depth_m == pytest.approx(0.3)
+    assert d_nest.height_m == pytest.approx(0.05)
+    assert d_nest.width_m == pytest.approx(0.04)
+    assert d_nest.length_m == pytest.approx(0.05)
 
 
 def test_detect_once_keeps_the_old_trigger_for_api1_and_older_providers():
