@@ -225,8 +225,12 @@ ssh <user>@192.168.42.1 'cd ~/arm && python3 main.py'
 | `move_relative(dx, dy, dz, frame="base", droll, dpitch, dyaw, speed)` | 在 `base`、`tool` 或 `camera` 坐标系中相对运动 |
 | `move_joints(positions, duration=None)` | 关节空间运动（7 个值，弧度） |
 | `gripper_open()`、`gripper_close()`、`gripper_move(fraction)` | 夹爪；`gripper_close().holding` 表示是否夹住物体 |
+| `gripper_zero_check(store_offset=False, threshold_rad=0.10)` | 机械零位检查；结果带 `stop_rad`、`offset_rad`、`pass_`（`.passed`） |
+| `gripper_calibration()`、`set_gripper_calibration(points, offset_rad=None)` | 读取标定（GET）；写入开度表与零位偏差（WS） |
 | `detect(label=None, pipelines=("yolo",), min_score=0.3)` | 经 armd 运行一次检测，返回检测列表 |
 | `grasp(detection)` 或 `grasp("cup", box=(x0, y0, x1, y1))` | armd 的抓取动作；结果中的 `.holding` |
+| `grasp_dry_run(detection)` | 检查目标抓取可达性，不产生运动且无需租约 |
+| `grasp_any(label=None, min_score=0.3, max_candidates=5)` | 检测物体、按得分顺序 dry-run，抓取首个可达目标 |
 | `state()` | 最新 observation（`positions`、`safety_state`、`is_torqued`、`fault` 等） |
 | `poses()`、`save_pose(name)`、`delete_pose(name)`、`move_to_pose(name, speed_scale=1.0)` | 保存在 armd 中的命名位姿 |
 | `place(pose=None, position=None, rpy=None, approach_height_m=0.08, release=True, retreat=True, speed_scale=1.0)` | 放下手中物体：抬升、接近、下降、张开、撤离（能力 `place`） |
