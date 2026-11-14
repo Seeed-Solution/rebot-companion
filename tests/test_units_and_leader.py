@@ -1695,6 +1695,54 @@ def test_auto_detect_leader_port_and_ping_ids(monkeypatch):
     assert not any(0xFE in pkt for pkt in [transport.written])
 
 
+def test_leader_teleop_main_restores_signal_handlers(monkeypatch):
+    import signal
+    from rebot_companion import leader_teleop
+
+    mock_client = MagicMock()
+    mock_client.get_schema.return_value = ObservationSchema.from_dict({
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "limits": [
+            {"name": f"j{i}", "min_position": -3.14, "max_position": 3.14, "max_velocity": 2.0, "max_acceleration": 5.0}
+            for i in range(6)
+        ],
+    })
+    mock_client.get_safety_describe.return_value = {"device": {"follower": "mock"}}
+    monkeypatch.setattr(leader_teleop, "ArmdClient", lambda *a, **k: mock_client)
+
+    class NonRespondingTransport(MockLeaderTransport):
+        def close(self):
+            pass
+
+    transport = NonRespondingTransport()
+    monkeypatch.setattr(leader_teleop, "open_serial_transport", lambda *a, **k: transport)
+    mock_session_cls = MagicMock()
+    monkeypatch.setattr(leader_teleop, "ArmSession", mock_session_cls)
+
+    def sentinel_int(signum, frame):
+        pass
+
+    def sentinel_term(signum, frame):
+        pass
+
+    orig_int = signal.getsignal(signal.SIGINT)
+    orig_term = signal.getsignal(signal.SIGTERM)
+    try:
+        signal.signal(signal.SIGINT, sentinel_int)
+        signal.signal(signal.SIGTERM, sentinel_term)
+
+        rc = leader_teleop.main(["--leader-port", "/dev/ttyUSB0", "--arm-host", "127.0.0.1"])
+        assert rc == 1
+
+        assert signal.getsignal(signal.SIGINT) is sentinel_int
+        assert signal.getsignal(signal.SIGTERM) is sentinel_term
+    finally:
+        signal.signal(signal.SIGINT, orig_int)
+        signal.signal(signal.SIGTERM, orig_term)
+
+
 def test_mcp_server_gripper_fraction_schema_bounds():
     from rebot_companion.mcp_server import gripper_fraction
 

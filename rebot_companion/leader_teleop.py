@@ -1119,6 +1119,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     session: ArmSession | None = None
     bridge: LeaderTeleopBridge | None = None
     bus: FeetechSerialBus | None = None
+    saved_handlers: list[tuple[int, Any]] = []
     try:
         bus = FeetechSerialBus(transport)
         client = ArmdClient(host_url("http", args.arm_host, ARMD_PORT))
@@ -1163,8 +1164,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             else:
                 raise KeyboardInterrupt
 
-        signal.signal(signal.SIGINT, _sig_handler)
-        signal.signal(signal.SIGTERM, _sig_handler)
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                prev = signal.signal(sig, _sig_handler)
+                saved_handlers.append((sig, prev))
+            except ValueError:
+                pass
 
         responded = bus.ping_ids(calib.servo_ids)
         if set(responded) != set(calib.servo_ids):
@@ -1209,6 +1214,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"rebot-teleop-leader: error: {exc}", file=sys.stderr)
         return 1
     finally:
+        for sig, prev in saved_handlers:
+            try:
+                signal.signal(sig, prev)
+            except (ValueError, OSError):
+                pass
         if bridge is not None:
             bridge.close()
         if session is not None:
