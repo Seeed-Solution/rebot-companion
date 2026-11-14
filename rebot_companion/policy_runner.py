@@ -743,6 +743,7 @@ class PolicyRunner:
         sender_join_s: float = 2 * SEND_TIMEOUT_S,
         action_units: str = "auto",
         state_units: str = "auto",
+        lerobot_calib: str | Path | None = None,
     ) -> None:
         if fps is None and policy.fps is None:
             raise ValueError(f"fps of {policy.name} is unknown ({policy.fps_problem or 'not given'}): pass --fps")
@@ -776,6 +777,10 @@ class PolicyRunner:
         self.connect_timeout = connect_timeout
         self.action_units_requested = action_units
         self.state_units_requested = state_units
+        self.lerobot_calib = lerobot_calib
+        self._lerobot_limits: list[tuple[float, float]] | None = None
+        self._lerobot_closed_rad: float | None = None
+        self._lerobot_open_rad: float | None = None
         self.action_units = "rad"
         self.state_units = "rad"
         self.dof = len(JOINT_NAMES)
@@ -933,6 +938,12 @@ class PolicyRunner:
             schema.gripper_policy, limits, self.gripper_joint
         )
 
+        if self.lerobot_calib is not None:
+            l_limits, l_closed, l_open = units.load_lerobot_norm_bounds(self.lerobot_calib, schema=self.schema)
+            self._lerobot_limits = l_limits
+            self._lerobot_closed_rad = l_closed
+            self._lerobot_open_rad = l_open
+
         lead = raw_schema.get("servo_max_lead_rad")
         self.lead = float(lead) if isinstance(lead, (int, float)) and lead > 0 else DEFAULT_LEAD_RAD
 
@@ -989,14 +1000,28 @@ class PolicyRunner:
                 self.state_units_requested, policy_info, require_metadata=require_meta
             )
 
+        if (
+            (self.action_units == "so101_norm" or self.state_units == "so101_norm")
+            and self.lerobot_calib is None
+            and not (isinstance(policy_info, dict) and policy_info.get("rebot_unit_mode"))
+        ):
+            log.warning(
+                "so101_norm is active without --lerobot-calib and without 'rebot_unit_mode' in metadata; "
+                "normalizing using armd schema joint limits (rebot-record convention). "
+                "If running an external LeRobot policy, pass --lerobot-calib <calib.json> to align motor ranges."
+            )
+
     def _observation(self, obs: ArmStatus) -> dict[str, np.ndarray]:
+        limits = self._lerobot_limits if self._lerobot_limits is not None else self.limits
+        closed_rad = self._lerobot_closed_rad if self._lerobot_closed_rad is not None else self.closed_rad
+        open_rad = self._lerobot_open_rad if self._lerobot_open_rad is not None else self.open_rad
         positions = units.from_armd(
             obs.positions,
             self.state_units,
-            limits=self.limits,
+            limits=limits,
             gripper_joint=self.gripper_joint,
-            closed_rad=self.closed_rad,
-            open_rad=self.open_rad,
+            closed_rad=closed_rad,
+            open_rad=open_rad,
         )
         out = {STATE_KEY: np.asarray(positions, dtype=np.float32)}
         for key, attr in EXTRA_KEYS.items():
@@ -1166,6 +1191,8 @@ class PolicyRunner:
                 send_timeout=self.send_timeout_s,
             ).open()
             if getattr(self.session, "_schema", None) is None:
+                if hasattr(self.session, "set_schema"):
+                    self.session.set_schema(self.schema)
                 self.session._schema = self.schema
             try:
                 self._prepare()
@@ -1344,13 +1371,16 @@ class PolicyRunner:
                 self.request_stop("bad_action", f"policy returned {action.tolist()}")
                 break
             if self.action_units != "rad":
+                limits = self._lerobot_limits if self._lerobot_limits is not None else self.limits
+                closed_rad = self._lerobot_closed_rad if self._lerobot_closed_rad is not None else self.closed_rad
+                open_rad = self._lerobot_open_rad if self._lerobot_open_rad is not None else self.open_rad
                 action_rad = units.to_armd(
                     action.tolist(),
                     self.action_units,
-                    limits=self.limits,
+                    limits=limits,
                     gripper_joint=self.gripper_joint,
-                    closed_rad=self.closed_rad,
-                    open_rad=self.open_rad,
+                    closed_rad=closed_rad,
+                    open_rad=open_rad,
                 )
                 action = np.asarray(action_rad, dtype=np.float64)
             self._publish(action)
@@ -1483,13 +1513,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--action-units",
         choices=["auto", "rad", "so101_norm", "deg"],
         default="auto",
-        help="units for policy actions: auto (read from info.json, default rad), rad, so101_norm, deg",
+        help="units for policy actions: auto (read from info.json, default rad; strictly requires unit_mode on SO-ARM), rad, so101_norm ([-100, 100], gripper [0, 100]), deg",
     )
     p.add_argument(
         "--state-units",
         choices=["auto", "rad", "so101_norm", "deg"],
         default="auto",
-        help="units for policy observations: auto (read from info.json, default rad), rad, so101_norm, deg",
+        help="units for policy observations: auto (read from info.json, default rad; strictly requires unit_mode on SO-ARM), rad, so101_norm, deg",
+    )
+    p.add_argument(
+        "--lerobot-calib",
+        help="path to LeRobot SO-100/SO-101 calibration JSON to align motor tick bounds for so101_norm",
     )
     p.add_argument("--stall-s", type=float, default=1.0, help="stop when the policy gives no target for this long")
     p.add_argument("--max-frame-age", type=float, default=0.5, help="stop when the newest camera frame is older (s)")
@@ -1553,6 +1587,7 @@ def _main(args: argparse.Namespace, handle: Any) -> int:
             log_path=args.log,
             action_units=args.action_units,
             state_units=args.state_units,
+            lerobot_calib=args.lerobot_calib,
         )
         print(
             f"policy {policy.name}"

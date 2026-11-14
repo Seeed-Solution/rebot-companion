@@ -19,6 +19,7 @@ import os
 import select
 import signal
 import sys
+import threading
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -345,16 +346,26 @@ class FeetechSerialBus:
             self.transport.write(encode_packet(sid, INST_WRITE, [REG_TORQUE_ENABLE, 0]))
 
     def read_positions_sequential(
-        self, servo_ids: Sequence[int] = (1, 2, 3, 4, 5, 6), max_retries: int = 1
+        self,
+        servo_ids: Sequence[int] = (1, 2, 3, 4, 5, 6),
+        max_retries: int = 1,
+        read_timeout: float = 0.03,
+        deadline_s: float | None = None,
     ) -> dict[int, int]:
         positions: dict[int, int] = {}
+        t_start = time.monotonic()
         for sid in servo_ids:
+            if deadline_s is not None and (time.monotonic() - t_start) >= deadline_s:
+                self.dropouts += 1
+                continue
             val = None
             for attempt in range(max_retries + 1):
+                if deadline_s is not None and (time.monotonic() - t_start) >= deadline_s:
+                    break
                 self.transport.flush()
                 pkt = encode_packet(sid, INST_READ, [REG_PRESENT_POSITION, 2])
                 self.transport.write(pkt)
-                resp = self.transport.read(8, timeout=0.03)
+                resp = self.transport.read(8, timeout=read_timeout)
                 s_id, err, params, _ = decode_packet(resp)
                 if s_id == sid and err == 0 and params is not None and len(params) >= 2:
                     val = params[0] | (params[1] << 8)
@@ -386,8 +397,9 @@ class FeetechSerialBus:
                 break
         if len(positions) == len(servo_ids):
             return positions
-        # Fallback to sequential read if sync read missed any
-        seq = self.read_positions_sequential(servo_ids)
+        # Fallback to sequential read for missing IDs only
+        missing = [sid for sid in servo_ids if sid not in positions]
+        seq = self.read_positions_sequential(missing, max_retries=0, read_timeout=0.015, deadline_s=0.08)
         positions.update(seq)
         return positions
 
@@ -494,6 +506,23 @@ class LeaderCalibration:
                     raise LeaderError(f"calibration file {p} is not valid JSON or YAML: {exc}") from exc
 
         joints: list[JointCalib] = []
+        SO101_JOINT_ALIASES = ("shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll")
+        RECOGNIZED_TOP_KEYS = {
+            "joints",
+            "joint_1",
+            "joint_2",
+            "joint_3",
+            "joint_4",
+            "joint_5",
+            *SO101_JOINT_ALIASES,
+            "gripper",
+            "servo_ids",
+        }
+        if not any(k in d for k in RECOGNIZED_TOP_KEYS):
+            raise LeaderError(
+                f"calibration data contains no recognized keys ({sorted(RECOGNIZED_TOP_KEYS)})"
+            )
+
         if "joints" in d:
             if not isinstance(d["joints"], list):
                 raise LeaderError("'joints' must be a list of 5 joint calibrations")
@@ -503,9 +532,13 @@ class LeaderCalibration:
         else:
             for i in range(5):
                 name = f"joint_{i + 1}"
+                alias = SO101_JOINT_ALIASES[i]
                 if name in d:
                     entry = d[name]
                     joints.append(_parse_joint_calib(entry, name))
+                elif alias in d:
+                    entry = d[alias]
+                    joints.append(_parse_joint_calib(entry, alias))
                 else:
                     joints.append(JointCalib())
 
@@ -607,7 +640,10 @@ class LeaderTeleopBridge:
             schema.gripper_policy, self.limits, self.gripper_joint
         )
         if getattr(session, "_schema", None) is None:
-            session._schema = schema
+            if hasattr(session, "set_schema"):
+                session.set_schema(schema)
+            else:
+                session._schema = schema
 
         self._stop = False
         self._activated = False
@@ -691,19 +727,29 @@ class LeaderTeleopBridge:
             raise LeaderError(
                 f"expected 6 DOF for SO-ARM101 ({stage}: got follower={len(follower_positions)}, leader={len(leader_target)})"
             )
-        gap = max(abs(ldr - flw) for ldr, flw in zip(leader_target, follower_positions))
-        log.info("%s alignment gap: %.3f rad (threshold: %.3f rad)", stage, gap, self.max_gap_rad)
-        if gap > HARD_MAX_GAP_RAD:
+        arm_gap = max(
+            (abs(l - f) for i, (l, f) in enumerate(zip(leader_target, follower_positions)) if i != self.gripper_joint),
+            default=0.0,
+        )
+        overall_gap = max(abs(ldr - flw) for ldr, flw in zip(leader_target, follower_positions))
+        log.info(
+            "%s alignment arm_gap: %.3f rad, overall_gap: %.3f rad (threshold: %.3f rad)",
+            stage,
+            arm_gap,
+            overall_gap,
+            self.max_gap_rad,
+        )
+        if arm_gap > HARD_MAX_GAP_RAD:
             raise LeaderError(
-                f"{stage} alignment gap {gap:.3f} rad exceeds hard limit {HARD_MAX_GAP_RAD:.3f} rad (pi); "
+                f"{stage} alignment gap {arm_gap:.3f} rad exceeds hard limit {HARD_MAX_GAP_RAD:.3f} rad (pi); "
                 "re-align leader arm before proceeding"
             )
-        if gap > self.max_gap_rad and not self.allow_large_gap:
+        if arm_gap > self.max_gap_rad and not self.allow_large_gap:
             raise LeaderError(
-                f"{stage} alignment gap {gap:.3f} rad exceeds --max-gap-rad {self.max_gap_rad:.3f}; "
+                f"{stage} alignment gap {arm_gap:.3f} rad exceeds --max-gap-rad {self.max_gap_rad:.3f}; "
                 "align the leader arm with the follower or pass --allow-large-gap"
             )
-        return gap
+        return overall_gap
 
     def align_and_ramp(self) -> None:
         """Verify alignment against the follower arm and perform a smooth quintic ramp-in."""
@@ -747,6 +793,7 @@ class LeaderTeleopBridge:
             if self._stop:
                 return
             log.info("enabling follower torque before ramp ...")
+            self._activated = True
             self.session.torque(True)
             deadline = time.monotonic() + 5.0
             while not (obs.is_torqued and obs.is_operational):
@@ -789,12 +836,16 @@ class LeaderTeleopBridge:
             # Quintic polynomial: 10s^3 - 15s^4 + 6s^5 (smooth acceleration & deceleration)
             alpha = 10.0 * (s**3) - 15.0 * (s**4) + 6.0 * (s**5)
             cur_leader = self.read_leader_target()
+            if self._stop:
+                break
             interp = [(1.0 - alpha) * flw + alpha * ldr for flw, ldr in zip(follower_start, cur_leader)]
             self.session.servo(interp)
             self.frames_sent += 1
             now = time.monotonic()
             if due > now:
                 time.sleep(due - now)
+            if self._stop:
+                break
 
     def run(self) -> None:
         """Stream servo frames continuously at fps."""
@@ -813,13 +864,21 @@ class LeaderTeleopBridge:
         while not self._stop:
             due = t0 + k * period
             now = time.monotonic()
-            if due > now:
+            if now - due > period:
+                t0 = now
+                k = 0
+                due = t0
+            elif due > now:
                 time.sleep(due - now)
+            if self._stop:
+                break
 
             try:
                 obs = self.session.latest_observation()
                 self._check_follower_healthy(obs, require_torqued=True)
                 target = self.read_leader_target()
+                if self._stop:
+                    break
                 self.session.servo(target)
                 self.frames_sent += 1
             except (LeaderError, ServoRejected, LeaseError, ArmConnectionError, RebotError, OSError) as exc:
@@ -943,9 +1002,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             return 1
 
+        stop_requested = threading.Event()
+
         def _sig_handler(*_: Any) -> None:
-            if bridge:
+            stop_requested.set()
+            if bridge is not None:
                 bridge.stop()
+            else:
+                raise KeyboardInterrupt
 
         signal.signal(signal.SIGINT, _sig_handler)
         signal.signal(signal.SIGTERM, _sig_handler)
@@ -960,8 +1024,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             return 1
 
+        if stop_requested.is_set():
+            return 0
+
         session = ArmSession(client, safe_exit="off").open()
-        session._schema = schema
+        if hasattr(session, "set_schema"):
+            session.set_schema(schema)
+        else:
+            session._schema = schema
         bridge = LeaderTeleopBridge(
             bus,
             session,
@@ -974,6 +1044,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             allow_large_gap=args.allow_large_gap,
             park_on_exit=not args.no_park,
         )
+        if stop_requested.is_set():
+            bridge.stop()
 
         bridge.run()
         if bridge._error is not None:

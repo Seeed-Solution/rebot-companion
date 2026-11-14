@@ -1328,19 +1328,28 @@ def test_resolve_unit_mode_require_metadata():
     assert units.resolve_unit_mode("auto", None) == "rad"
     assert units.resolve_unit_mode("auto", {}, require_metadata=False) == "rad"
 
-    # require_metadata=True fails closed if metadata/stats missing
-    with pytest.raises(ValueError, match="cannot infer unit mode 'auto' without metadata or stats"):
+    # require_metadata=True fails closed if metadata/stats missing or without unit_mode
+    with pytest.raises(ValueError, match="cannot infer unit mode 'auto' without explicit 'unit_mode' in metadata"):
         units.resolve_unit_mode("auto", {}, require_metadata=True)
-    with pytest.raises(ValueError, match="cannot infer unit mode 'auto' without metadata or stats"):
+    with pytest.raises(ValueError, match="cannot infer unit mode 'auto' without explicit 'unit_mode' in metadata"):
         units.resolve_unit_mode("auto", None, require_metadata=True)
 
     # require_metadata=True succeeds when explicit unit_mode is present
     assert units.resolve_unit_mode("auto", {"unit_mode": "so101_norm"}, require_metadata=True) == "so101_norm"
     assert units.resolve_unit_mode("auto", {"rebot_unit_mode": "deg"}, require_metadata=True) == "deg"
 
-    # require_metadata=True succeeds when usable radian stats are present
-    usable_meta = {"stats": {"observation.state": {"min": [-2.0], "max": [2.0]}}}
-    assert units.resolve_unit_mode("auto", usable_meta, require_metadata=True) == "rad"
+    # require_metadata=True fails closed even with action/state stats within [0, 5] without unit_mode
+    usable_meta = {
+        "stats": {
+            "observation.state": {"min": [-2.0], "max": [2.0]},
+            "action": {"min": [0.0], "max": [5.0]},
+        }
+    }
+    with pytest.raises(ValueError, match="cannot infer unit mode 'auto' without explicit 'unit_mode' in metadata"):
+        units.resolve_unit_mode("auto", usable_meta, require_metadata=True)
+
+    # but with require_metadata=False, it infers "rad" for [0, 5] stats
+    assert units.resolve_unit_mode("auto", usable_meta, require_metadata=False) == "rad"
 
 
 def test_policy_runner_fails_closed_on_so_arm_when_metadata_missing():
@@ -1380,7 +1389,7 @@ def test_policy_runner_fails_closed_on_so_arm_when_metadata_missing():
             return {"device": {"follower": "mock"}}
 
     runner = PolicyRunner(FakeClient(), MockReplay())
-    with pytest.raises(ValueError, match="cannot infer unit mode 'auto' without metadata or stats"):
+    with pytest.raises(ValueError, match="cannot infer unit mode 'auto' without explicit 'unit_mode' in metadata"):
         runner._read_arm()
 
 
@@ -1610,6 +1619,9 @@ def test_leader_bridge_post_torque_gap_growth_fails_before_ramp():
     # Torque was requested, but servo was NOT called due to post-torque gap failure
     mock_session.torque.assert_called_once_with(True)
     mock_session.servo.assert_not_called()
+    assert bridge._activated is True
+    bridge.close()
+    mock_session.unload.assert_called_once_with(wait=True, timeout=15.0)
 
 
 def test_auto_detect_leader_port_and_ping_ids(monkeypatch):
@@ -1897,7 +1909,9 @@ def test_leader_bridge_align_and_ramp_stop_preflight():
 
     mock_session.wait_for_observation.side_effect = stop_during_wait
     bridge2.align_and_ramp()
-    assert bridge2._activated is False
+    assert bridge2._activated is True
+    bridge2.close()
+    mock_session.unload.assert_called_once_with(wait=True, timeout=15.0)
     mock_session.servo.assert_not_called()
 
 
@@ -2090,6 +2104,288 @@ def test_check_b601_compatibility_allows_dm_rs_and_rejects_so101():
     # Rejected: so-arm101
     with pytest.raises(ValueError, match="Local B601 kinematics cannot be used"):
         check_b601_compatibility({"profile_id": "so-arm101", "arm_dof": 6})
+    with pytest.raises(ValueError, match="Local B601 kinematics cannot be used"):
+        check_b601_compatibility({"profile_id": "rebot-dm-so101", "arm_dof": 6})
     with pytest.raises(ValueError, match="arm_dof=6"):
         check_b601_compatibility({"profile_id": "rebot-dm", "arm_dof": 5})
+
+
+def test_client_session_set_schema_and_gripper_dedup():
+    import rebot.client
+    from rebot.client import ArmSession, ObservationSchema
+
+    mock_client = MagicMock()
+    sch = ObservationSchema.from_dict({
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "limits": [
+            {"name": f"j{i}", "min_position": -3.0, "max_position": 3.0, "max_velocity": 2.0, "max_acceleration": 5.0}
+            for i in range(6)
+        ],
+    })
+
+    session = ArmSession(mock_client)
+    assert session._schema is None
+    assert session._gripper_joint is rebot.client._GRIPPER_UNSET
+
+    # Public set_schema updates schema, gripper_joint, and clears last_schema_attempt
+    session._last_schema_attempt = 100.0
+    session.set_schema(sch)
+    assert session._schema is sch
+    assert session._gripper_joint == 5
+    assert session._last_schema_attempt is None
+    assert session.gripper_joint == 5
+
+    # Dedup behavior: when schema is unset and schema() fails with cooldown, delegates to _cached_gripper_joint
+    session2 = ArmSession(mock_client)
+    session2._last_schema_attempt = time.monotonic()  # in cooldown
+    mock_obs = MagicMock()
+    mock_obs.positions = [0.0] * 7
+    session2.latest_observation = MagicMock(return_value=mock_obs)
+    assert session2.gripper_joint == 6
+    mock_client.get_schema.assert_not_called()
+
+
+def test_leader_teleop_calibration_validation_and_aliases(tmp_path: Path):
+    from rebot_companion.leader_teleop import LeaderCalibration, LeaderError
+
+    # 1. Unrecognized top-level keys raise LeaderError
+    with pytest.raises(LeaderError, match="calibration data contains no recognized keys"):
+        LeaderCalibration.load({"unknown_key": {"range_min": 1000, "range_max": 3000}})
+    with pytest.raises(LeaderError, match="calibration data contains no recognized keys"):
+        LeaderCalibration.load({})
+
+    # 2. SO-101 joint aliases
+    calib_dict = {
+        "shoulder_pan": {"center": 2048, "sign": 1},
+        "shoulder_lift": {"center": 2048, "sign": -1},
+        "elbow_flex": {"center": 2048, "drive_mode": 1},
+        "wrist_flex": {"center": 2048, "sign": 1},
+        "wrist_roll": {"center": 2048, "drive_mode": 0},
+        "gripper": {"closed_tick": 2000, "open_tick": 3000},
+    }
+    calib = LeaderCalibration.load(calib_dict)
+    assert len(calib.joints) == 5
+    assert calib.joints[0].sign == 1
+    assert calib.joints[1].sign == -1
+    assert calib.joints[2].sign == -1  # drive_mode 1 -> sign -1
+    assert calib.joints[4].sign == 1
+
+    # 3. homing_offset without center raises LeaderError
+    with pytest.raises(LeaderError, match="raw EEPROM 'homing_offset' without 'center'"):
+        LeaderCalibration.load({"shoulder_pan": {"homing_offset": 50}})
+
+
+def test_leader_teleop_gripper_gap_exclusion_and_ramp_extension():
+    bus = MagicMock()
+    mock_session = MagicMock()
+    schema = ObservationSchema.from_dict({
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "limits": [
+            {"name": f"j{i}", "min_position": -3.14, "max_position": 3.14, "max_velocity": 2.0, "max_acceleration": 5.0}
+            for i in range(6)
+        ],
+    })
+
+    bridge = LeaderTeleopBridge(
+        bus, mock_session, schema, fps=50, ramp_seconds=0.2, max_gap_rad=0.5, allow_large_gap=False
+    )
+
+    # Arm joints differ by 0.1 rad <= 0.5 rad; gripper (joint 5) differs by 1.2 rad > 0.5 rad!
+    follower_positions = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    leader_target = [0.1, -0.1, 0.05, -0.05, 0.1, 1.2]
+
+    # Does NOT raise because arm_gap (0.1 rad) <= max_gap_rad (0.5 rad)
+    overall_gap = bridge._check_alignment_gap(leader_target, follower_positions, stage="initial")
+    # Returns overall_gap (1.2 rad) so ramp extension smoothly covers large gripper opening difference
+    assert math.isclose(overall_gap, 1.2, abs_tol=1e-4)
+
+    # But if arm joint exceeds max_gap_rad, it raises
+    bad_leader_target = [0.6, 0.0, 0.0, 0.0, 0.0, 0.0]
+    with pytest.raises(LeaderError, match="alignment gap 0.600 rad exceeds --max-gap-rad"):
+        bridge._check_alignment_gap(bad_leader_target, follower_positions, stage="initial")
+
+
+def test_leader_teleop_bounded_sync_fallback_and_stop_checks():
+    transport = MagicMock()
+    bus = FeetechSerialBus(transport)
+
+    # Mock sync read returning positions for servos 1, 2, 4, 5, 6 (missing servo 3)
+    def fake_sync_read(sids, timeout=0.05):
+        return {1: 2000, 2: 2000, 4: 2000, 5: 2000, 6: 2000}
+
+    bus.read_positions_sync = MagicMock(side_effect=fake_sync_read)
+
+    mock_session = MagicMock()
+    schema = ObservationSchema.from_dict({
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "limits": [
+            {"name": f"j{i}", "min_position": -3.14, "max_position": 3.14, "max_velocity": 2.0, "max_acceleration": 5.0}
+            for i in range(6)
+        ],
+    })
+
+    bridge = LeaderTeleopBridge(bus, mock_session, schema, fps=50)
+
+    # When missing servo 3, read_leader_target raises LeaderError with missing IDs
+    with pytest.raises(LeaderError, match=r"missing leader readings for servo IDs \[3\]"):
+        bridge.read_leader_target()
+
+    # Recheck stop before servo in align_and_ramp
+    idle_obs = MagicMock()
+    idle_obs.positions = [0.0] * 6
+    idle_obs.safety_state = "Armed"
+    idle_obs.is_stopped = False
+    idle_obs.is_torqued = True
+    idle_obs.is_operational = True
+    idle_obs.collision = None
+    mock_session.wait_for_observation.return_value = idle_obs
+    mock_session.latest_observation.return_value = idle_obs
+    bus.read_positions_sync.return_value = {i: 2048 for i in range(1, 7)}
+
+    # Stop before ramp starts
+    bridge.stop()
+    bridge.align_and_ramp()
+    mock_session.servo.assert_not_called()
+
+
+def test_units_load_lerobot_norm_bounds_and_roundtrip(tmp_path: Path):
+    calib_json = tmp_path / "lerobot_calib.json"
+    calib_data = {
+        "shoulder_pan": {"range_min": 1024, "range_max": 3072, "center": 2048, "drive_mode": 0},
+        "shoulder_lift": {"range_min": 1024, "range_max": 3072, "center": 2048, "drive_mode": 1},  # inverted
+        "elbow_flex": {"range_min": 1024, "range_max": 3072, "center": 2048, "drive_mode": 0},
+        "wrist_flex": {"range_min": 1024, "range_max": 3072, "center": 2048, "drive_mode": 0},
+        "wrist_roll": {"range_min": 1024, "range_max": 3072, "center": 2048, "drive_mode": 0},
+        "gripper": {"range_min": 1500, "range_max": 2500, "center": 2048, "drive_mode": 0},
+    }
+    calib_json.write_text(json.dumps(calib_data), encoding="utf-8")
+
+    limits, closed_rad, open_rad = units.load_lerobot_norm_bounds(calib_json)
+    assert len(limits) == 6
+    assert limits[0][0] < limits[0][1]  # drive_mode 0: range_min < range_max
+    assert limits[1][0] < limits[1][1]  # tick_neg100 = 3072, tick_pos100 = 1024; sign = -1 -> rad_neg100 < rad_pos100
+
+    # Directional inverted motor test (where lo > hi)
+    custom_limits = [(1.5, -1.5), (-1.5, 1.5), (0.0, 2.0), (0.0, 2.0), (0.0, 2.0), (0.0, 1.0)]
+    # Round-trip test: to_armd(from_armd(x)) == x
+    arm_rads = [0.8, -0.5, 1.0, 0.5, 1.2, 0.4]
+    norms = units.from_armd(arm_rads, "so101_norm", limits=custom_limits, gripper_joint=5, closed_rad=0.0, open_rad=1.0)
+    recovered = units.to_armd(norms, "so101_norm", limits=custom_limits, gripper_joint=5, closed_rad=0.0, open_rad=1.0)
+    for r, orig in zip(recovered, arm_rads):
+        assert math.isclose(r, orig, abs_tol=1e-5)
+
+    # Missing joint raises ValueError
+    bad_json = tmp_path / "bad.json"
+    bad_json.write_text(json.dumps({"shoulder_pan": {"range_min": 0, "range_max": 100}}))
+    with pytest.raises(ValueError, match="missing required joint key"):
+        units.load_lerobot_norm_bounds(bad_json)
+
+
+def test_policy_runner_lerobot_calib_and_warning(tmp_path: Path, caplog):
+    from rebot_companion.policy_runner import PolicyRunner, ReplayPolicy
+
+    calib_json = tmp_path / "calib.json"
+    calib_data = {
+        f"joint_{i+1}": {"range_min": 1024, "range_max": 3072, "center": 2048} for i in range(5)
+    }
+    calib_data["gripper"] = {"range_min": 1500, "range_max": 2500, "center": 2048}
+    calib_json.write_text(json.dumps(calib_data), encoding="utf-8")
+
+    raw_schema = {
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "profile_id": "so-arm101",
+        "limits": [
+            {"name": f"j{i}", "min_position": -3.14, "max_position": 3.14, "max_velocity": 2.0, "max_acceleration": 5.0}
+            for i in range(6)
+        ],
+    }
+    schema = ObservationSchema.from_dict(raw_schema)
+
+    class FakeClient:
+        def get_schema(self):
+            return schema
+
+        def request(self, method, path, **kwargs):
+            resp = MagicMock()
+            resp.ok = True
+            resp.json.return_value = raw_schema
+            return resp
+
+        def get_safety_describe(self):
+            return {"device": {"follower": "mock"}}
+
+    class MockPolicy(ReplayPolicy):
+        def __init__(self):
+            self.name = "replay:mock:0"
+            self.fps = 10
+            self.action_dim = 6
+            self.actions = np.zeros((2, 6))
+            self.info = {"unit_mode": "so101_norm"}
+
+    runner = PolicyRunner(
+        FakeClient(),
+        MockPolicy(),
+        action_units="so101_norm",
+        state_units="so101_norm",
+        lerobot_calib=calib_json,
+    )
+    runner._read_arm()
+    assert runner._lerobot_limits is not None
+    assert len(runner._lerobot_limits) == 6
+
+    # Warning when so101_norm is active without lerobot_calib and without rebot_unit_mode
+    import logging
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        runner_no_calib = PolicyRunner(
+            FakeClient(),
+            MockPolicy(),
+            action_units="so101_norm",
+            state_units="so101_norm",
+        )
+        runner_no_calib._read_arm()
+        assert any("so101_norm is active without --lerobot-calib" in record.message for record in caplog.records)
+
+
+def test_mcp_fallback_schema_and_orientation_dof_guard():
+    from rebot_companion.mcp_server import Controller, ToolFail
+
+    mock_client = MagicMock()
+    mock_client.get_schema.side_effect = Exception("network down")
+
+    ctrl = Controller(mock_client, MagicMock(), MagicMock(), auto_lease=False)
+    obs = MagicMock()
+    obs.positions = [0.0] * 6
+    ctrl.observation = MagicMock(return_value=obs)
+
+    # 1. Fallback schema has dof=6, arm_dof=None (NEVER 6), orientation_dof=None
+    fallback_sch = ctrl.schema()
+    assert fallback_sch.dof == 6
+    assert fallback_sch.arm_dof is None
+    assert fallback_sch.orientation_dof is None
+    assert ctrl._schema_is_fallback is True
+
+    # 2. format_tcp refuses to call B601 FK on fallback schema for 6-positions
+    tcp = ctrl.format_tcp(None, [0.0] * 6)
+    assert tcp is None
+
+    # 3. move_to with explicit orientation raises ToolFail("CONNECTION") when orient_dof is None
+    mock_session = MagicMock()
+    mock_session.has_lease = True
+    mock_session.lease_lost = None
+    mock_session.closed_reason = None
+    ctrl.session = mock_session
+    mock_session.latest_observation.return_value = obs
+    with pytest.raises(ToolFail, match="observation schema unavailable; cannot determine arm orientation DOF"):
+        ctrl.move_to(0.2, 0.0, 0.1, roll_deg=0.0, pitch_deg=45.0, yaw_deg=0.0, quat=None, speed_mps=None, timeout_s=None)
+
 

@@ -90,6 +90,21 @@ class HandEyeResult:
         return gripper_pose(joints, sign, offset, joint_map, schema=schema) @ self.transform
 
 
+B601_COMPATIBLE_PROFILES = frozenset(
+    {
+        "b601",
+        "rebot-b601",
+        "rebot-b601dm",
+        "rebot-b601-dm",
+        "rebot-b601rs",
+        "rebot-b601-rs",
+        "rebot-dm",
+        "rebot-rs",
+        "rebot-devarm",
+    }
+)
+
+
 def check_b601_compatibility(schema_or_profile: Any) -> None:
     """Refuse B601 kinematics/IK when profile_id indicates non-B601 or arm_dof != 6."""
     profile_id = getattr(schema_or_profile, "profile_id", None)
@@ -98,9 +113,8 @@ def check_b601_compatibility(schema_or_profile: Any) -> None:
         profile_id = schema_or_profile.get("profile_id")
         arm_dof = schema_or_profile.get("arm_dof")
     if profile_id is not None:
-        norm = str(profile_id).lower().replace("_", "-")
-        allowed = ("b601", "rebot-dm", "rebot-rs")
-        if not any(a in norm for a in allowed):
+        norm = str(profile_id).strip().lower().replace("_", "-")
+        if norm not in B601_COMPATIBLE_PROFILES:
             raise ValueError(f"Local B601 kinematics cannot be used for arm with profile_id '{profile_id}'")
     if arm_dof is not None and arm_dof != 6:
         raise ValueError(f"Local B601 kinematics requires arm_dof=6, got {arm_dof}")

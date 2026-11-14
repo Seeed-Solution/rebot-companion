@@ -746,6 +746,11 @@ class ArmSession:
         try:
             self.wait_for_observation(timeout=self.connect_timeout)
             self._acquire_lease()
+            if self._schema is None and self._gripper_joint is _GRIPPER_UNSET:
+                try:
+                    self.schema()
+                except Exception:
+                    pass
         except BaseException:
             self._shutdown()
             raise
@@ -913,6 +918,11 @@ class ArmSession:
                 raise
         return self._schema
 
+    def set_schema(self, schema: ObservationSchema) -> None:
+        self._schema = schema
+        self._gripper_joint = schema.gripper_joint
+        self._last_schema_attempt = None
+
     def _cached_gripper_joint(self, pos_len: int | None = None) -> int | None:
         if self._schema is not None:
             return self._schema.gripper_joint
@@ -936,15 +946,13 @@ class ArmSession:
         if self._gripper_joint is not _GRIPPER_UNSET:
             return self._gripper_joint  # type: ignore[return-value]
         now = time.monotonic()
-        if self._last_schema_attempt is not None and now - self._last_schema_attempt < _SCHEMA_RETRY_COOLDOWN_S:
-            obs = self.latest_observation()
-            return 6 if obs is not None and len(obs.positions) == 7 else None
-        try:
-            self._gripper_joint = self.schema().gripper_joint
-            return self._gripper_joint  # type: ignore[return-value]
-        except Exception:
-            obs = self.latest_observation()
-            return 6 if obs is not None and len(obs.positions) == 7 else None
+        if self._last_schema_attempt is None or (now - self._last_schema_attempt >= _SCHEMA_RETRY_COOLDOWN_S):
+            try:
+                self._gripper_joint = self.schema().gripper_joint
+                return self._gripper_joint  # type: ignore[return-value]
+            except Exception:
+                pass
+        return self._cached_gripper_joint()
 
     # ---- background threads --------------------------------------------------
 

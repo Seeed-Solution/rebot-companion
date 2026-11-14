@@ -64,7 +64,7 @@ from rebot.detection import (
 )
 from rebot.errors import UnsupportedError
 
-from . import kinematics, units
+from . import calibration, kinematics, units
 from .snapshot import (
     CameraUnavailable,
     SnapshotError,
@@ -316,6 +316,7 @@ class Controller:
         self._lock = threading.RLock()
         self._joint_map: kinematics.JointMap | None = None
         self._schema: ObservationSchema | None = None
+        self._schema_is_fallback: bool = False
         self._last_schema_attempt: float | None = None
         self._cached_fallback_schema: ObservationSchema | None = None
 
@@ -326,16 +327,38 @@ class Controller:
                 if self._cached_fallback_schema is not None:
                     return self._cached_fallback_schema
                 dof = len(self.observation().positions) if self.observation() else 7
-                return ObservationSchema.from_dict({"dof": dof})
+                self._cached_fallback_schema = ObservationSchema(
+                    dof=dof,
+                    joint_names=[],
+                    limits=[],
+                    fields=[],
+                    capabilities={},
+                    arm_dof=6 if dof == 7 else None,
+                    gripper_joint=6 if dof == 7 else None,
+                    orientation_dof=3 if dof == 7 else None,
+                )
+                self._schema_is_fallback = True
+                return self._cached_fallback_schema
             try:
                 self._schema = self.client.get_schema()
                 self._last_schema_attempt = None
                 self._cached_fallback_schema = None
+                self._schema_is_fallback = False
             except Exception as exc:
                 self._last_schema_attempt = time.monotonic()
                 log.warning("observation schema unavailable: %s", exc)
                 dof = len(self.observation().positions) if self.observation() else 7
-                self._cached_fallback_schema = ObservationSchema.from_dict({"dof": dof})
+                self._cached_fallback_schema = ObservationSchema(
+                    dof=dof,
+                    joint_names=[],
+                    limits=[],
+                    fields=[],
+                    capabilities={},
+                    arm_dof=6 if dof == 7 else None,
+                    gripper_joint=6 if dof == 7 else None,
+                    orientation_dof=3 if dof == 7 else None,
+                )
+                self._schema_is_fallback = True
                 return self._cached_fallback_schema
         return self._schema
 
@@ -379,14 +402,17 @@ class Controller:
                 "rpy_deg": rpy_deg,
                 "quat": [_r(v, 5) for v in quat] if quat is not None else None,
             }
-        sch = None
-        try:
-            sch = self.schema()
-        except Exception:
-            pass
-        arm_dof = sch.arm_dof if sch else None
-        dof = sch.dof if sch else len(positions)
-        if (dof == 7 or arm_dof == 6) and len(positions) >= 6:
+        can_b601 = False
+        if self._schema is not None and not self._schema_is_fallback and self._schema.arm_dof == 6:
+            try:
+                calibration.check_b601_compatibility(self._schema)
+                can_b601 = True
+            except ValueError:
+                can_b601 = False
+        elif self._schema is None and len(positions) == 7:
+            can_b601 = True
+
+        if can_b601 and len(positions) >= 6:
             return tcp_dict(positions, self.joint_map())
         return None
 
@@ -565,7 +591,11 @@ class Controller:
         if quat is not None and any(v is not None for v in (roll_deg, pitch_deg, yaw_deg)):
             raise ToolFail("INVALID_ARGUMENT", "give roll/pitch/yaw or quat, not both")
         sch = self.schema()
-        orient_dof = sch.orientation_dof or (2 if sch.arm_dof == 5 else 3)
+        orient_dof = (
+            sch.orientation_dof
+            if sch.orientation_dof is not None
+            else (2 if sch.arm_dof == 5 else (3 if sch.arm_dof == 6 else None))
+        )
         auto_yaw = None
 
         if quat is not None:
@@ -573,13 +603,24 @@ class Controller:
         elif roll_deg is None and pitch_deg is None and yaw_deg is None:
             rpy = None
         else:
+            if orient_dof is None:
+                raise ToolFail("CONNECTION", "observation schema unavailable; cannot determine arm orientation DOF")
             obs = s.latest_observation()
             cur_rpy: list[float] | None = None
             if obs is not None and getattr(obs, "tcp", None) is not None:
                 cur_rpy = _tcp_rpy_rad(obs.tcp)
             if cur_rpy is None and obs is not None:
-                dof = sch.dof if sch else len(obs.positions)
-                if (dof == 7 or sch.arm_dof == 6) and len(obs.positions) >= 6:
+                can_b601_fk = (
+                    self._schema is not None
+                    and not self._schema_is_fallback
+                    and (sch.dof == 7 or sch.arm_dof == 6)
+                )
+                if can_b601_fk:
+                    try:
+                        calibration.check_b601_compatibility(sch)
+                    except ValueError:
+                        can_b601_fk = False
+                if can_b601_fk and len(obs.positions) >= 6:
                     fk = tcp_dict(obs.commanded_positions or obs.positions, self.joint_map())
                     if fk and fk.get("rpy_deg"):
                         cur_rpy = [math.radians(v) for v in fk["rpy_deg"]]

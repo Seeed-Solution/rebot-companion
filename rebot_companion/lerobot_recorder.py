@@ -1025,6 +1025,7 @@ class LeRobotRecorder:
             "robot_type": self.robot_type,
             "splits": {"train": f"0:{len(self._episodes)}"},
             "unit_mode": self.unit_mode,
+            "rebot_unit_mode": self.unit_mode,
             "profile_id": self.profile_id,
             "arm_dof": self.arm_dof,
             "gripper_joint": self.gripper_joint,
@@ -1172,7 +1173,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--unit-mode",
         choices=["rad", "so101_norm", "deg"],
         default="rad",
-        help="unit mode for state/action: rad (default, passthrough), so101_norm ([-100, 100], gripper [0, 100]), deg",
+        help="unit mode for state/action: rad (default, passthrough), so101_norm ([-100, 100], gripper [0, 100] normalized to armd limits), deg",
     )
     p.add_argument("--no-prompt", action="store_true", help="start/save episodes without waiting for Enter")
     p.add_argument("--reset-s", type=float, default=0.0, help="pause between episodes with --no-prompt")

@@ -17,8 +17,10 @@ Supported modes:
 
 from __future__ import annotations
 
+import json
 import math
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Any
 
 SUPPORTED_UNIT_MODES = ("rad", "so101_norm", "deg")
@@ -99,10 +101,10 @@ def resolve_unit_mode(
 
     When ``requested == "auto"``:
     - Inspects ``info_meta`` for ``unit_mode`` or ``rebot_unit_mode``.
-    - Checks heuristic range on ``stats`` (both ``observation.state`` and ``action``).
-      If non-radian values are present without explicit metadata, raises ``ValueError``.
-    - If ``require_metadata=True`` and ``info_meta`` has neither explicit ``unit_mode``/``rebot_unit_mode``
-      nor usable ``observation.state``/``action`` stats (finite min/max), raises ``ValueError``.
+    - If ``require_metadata=True`` and ``info_meta`` has neither explicit ``unit_mode`` nor
+      ``rebot_unit_mode``, raises ``ValueError``.
+    - If ``require_metadata=False``, checks heuristic range on ``stats`` (both ``observation.state``
+      and ``action``). If non-radian values are present without explicit metadata, raises ``ValueError``.
     - Defaults to ``"rad"``.
     """
     if requested != "auto":
@@ -110,7 +112,6 @@ def resolve_unit_mode(
             raise ValueError(f"unsupported unit mode {requested!r}; choose from {SUPPORTED_UNIT_MODES} or 'auto'")
         return requested
 
-    has_usable_stats = False
     if isinstance(info_meta, dict):
         raw_mode = info_meta.get("unit_mode") or info_meta.get("rebot_unit_mode")
         if raw_mode is not None:
@@ -120,6 +121,14 @@ def resolve_unit_mode(
                     return mode_str
                 raise ValueError(f"unsupported unit mode {mode_str!r} in metadata; choose from {SUPPORTED_UNIT_MODES}")
 
+    if require_metadata:
+        raise ValueError(
+            "cannot infer unit mode 'auto' without explicit 'unit_mode' in metadata; "
+            "pass --action-units / --state-units explicitly ('rad', 'so101_norm', or 'deg')"
+        )
+
+    # Heuristic stats check for require_metadata=False
+    if isinstance(info_meta, dict):
         stats = info_meta.get("stats")
         if isinstance(stats, dict):
             threshold = 2 * math.pi + 0.25
@@ -140,7 +149,6 @@ def resolve_unit_mode(
                             try:
                                 fv = float(v)
                                 if math.isfinite(fv):
-                                    has_usable_stats = True
                                     if abs(fv) > threshold:
                                         raise ValueError(
                                             "cannot infer unit mode 'auto' from non-radian stats without 'unit_mode' "
@@ -149,12 +157,6 @@ def resolve_unit_mode(
                             except (TypeError, ValueError) as exc:
                                 if "cannot infer unit mode" in str(exc):
                                     raise
-
-    if require_metadata and not has_usable_stats:
-        raise ValueError(
-            "cannot infer unit mode 'auto' without metadata or stats on this platform; "
-            "pass --action-units / --state-units explicitly ('rad', 'so101_norm', or 'deg')"
-        )
 
     return "rad"
 
@@ -194,7 +196,8 @@ def from_armd(
                 if hi == lo:
                     out.append(0.0)
                 else:
-                    x_clamped = min(max(float(x), lo), hi)
+                    lo_b, hi_b = (lo, hi) if lo <= hi else (hi, lo)
+                    x_clamped = min(max(float(x), lo_b), hi_b)
                     norm = 200.0 * (x_clamped - lo) / (hi - lo) - 100.0
                     out.append(float(min(max(norm, -100.0), 100.0)))
         return out
@@ -264,3 +267,124 @@ def to_armd(
         return out
 
     raise ValueError(f"unsupported unit mode {mode!r}; choose from {SUPPORTED_UNIT_MODES}")
+
+
+def load_lerobot_norm_bounds(
+    calib_path: str | Path,
+    schema: Any = None,
+) -> tuple[list[tuple[float, float]], float | None, float | None]:
+    """Parse LeRobot SO-100/SO-101 calibration JSON and convert motor tick ranges to armd radians.
+
+    Returns:
+        (limits, closed_rad, open_rad) where limits has 6 elements [(lo_j1, hi_j1), ..., (closed_rad, open_rad)].
+    """
+    p = Path(calib_path).expanduser()
+    if not p.is_file():
+        raise ValueError(f"calibration file not found: {p}")
+
+    try:
+        content = p.read_text(encoding="utf-8")
+        data = json.loads(content)
+    except Exception as exc:
+        raise ValueError(f"failed to read/parse calibration file {p}: {exc}") from exc
+
+    if not isinstance(data, dict):
+        raise ValueError(f"calibration file {p} must contain a JSON object, got {type(data).__name__}")
+
+    joint_names = ("shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll")
+    model_joint_map = (
+        schema.model_joint_map
+        if schema is not None and hasattr(schema, "model_joint_map")
+        else (schema.get("model_joint_map") if isinstance(schema, dict) else None)
+    )
+
+    limits: list[tuple[float, float]] = []
+    for i, name in enumerate(joint_names):
+        alt_name = f"joint_{i + 1}"
+        entry = data.get(name) or data.get(alt_name)
+        if entry is None or not isinstance(entry, dict):
+            raise ValueError(
+                f"missing required joint key '{name}' or '{alt_name}' in calibration file {p}"
+            )
+        if "range_min" not in entry or "range_max" not in entry:
+            raise ValueError(f"{name}: missing required 'range_min' or 'range_max' in {entry}")
+
+        try:
+            range_min = float(entry["range_min"])
+            range_max = float(entry["range_max"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name}: invalid range_min/range_max in {entry}") from exc
+
+        dm = entry.get("drive_mode", 0)
+        drive_mode = bool(dm in (1, True, "1"))
+        sign = -1.0 if drive_mode else 1.0
+        center = float(entry.get("center", 2048))
+
+        tick_neg100 = range_max if drive_mode else range_min
+        tick_pos100 = range_min if drive_mode else range_max
+
+        raw_rad_neg100 = sign * (tick_neg100 - center) * (2.0 * math.pi / 4096.0)
+        raw_rad_pos100 = sign * (tick_pos100 - center) * (2.0 * math.pi / 4096.0)
+
+        if model_joint_map and i < len(model_joint_map):
+            m = model_joint_map[i]
+            if isinstance(m, dict):
+                m_sign = float(m.get("sign", 1.0))
+                m_off = float(m.get("offset_rad", 0.0))
+                rad_neg100 = m_sign * raw_rad_neg100 + m_off
+                rad_pos100 = m_sign * raw_rad_pos100 + m_off
+            else:
+                rad_neg100 = raw_rad_neg100
+                rad_pos100 = raw_rad_pos100
+        else:
+            rad_neg100 = raw_rad_neg100
+            rad_pos100 = raw_rad_pos100
+
+        limits.append((float(rad_neg100), float(rad_pos100)))
+
+    # Gripper
+    grip_entry = data.get("gripper")
+    if grip_entry is None or not isinstance(grip_entry, dict):
+        raise ValueError(f"missing required key 'gripper' in calibration file {p}")
+    if "range_min" not in grip_entry or "range_max" not in grip_entry:
+        raise ValueError(f"gripper: missing required 'range_min' or 'range_max' in {grip_entry}")
+
+    try:
+        g_min = float(grip_entry["range_min"])
+        g_max = float(grip_entry["range_max"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"gripper: invalid range_min/range_max in {grip_entry}") from exc
+
+    g_dm = grip_entry.get("drive_mode", 0)
+    g_drive_mode = bool(g_dm in (1, True, "1"))
+    g_sign = -1.0 if g_drive_mode else 1.0
+    g_center = float(grip_entry.get("center", 2048))
+
+    g_tick_closed = g_max if g_drive_mode else g_min
+    g_tick_open = g_min if g_drive_mode else g_max
+    if "closed_tick" in grip_entry or "closed" in grip_entry:
+        g_tick_closed = float(grip_entry.get("closed_tick", grip_entry.get("closed")))
+    if "open_tick" in grip_entry or "open" in grip_entry:
+        g_tick_open = float(grip_entry.get("open_tick", grip_entry.get("open")))
+
+    raw_closed = g_sign * (g_tick_closed - g_center) * (2.0 * math.pi / 4096.0)
+    raw_open = g_sign * (g_tick_open - g_center) * (2.0 * math.pi / 4096.0)
+
+    if model_joint_map and len(model_joint_map) > 5:
+        m = model_joint_map[5]
+        if isinstance(m, dict):
+            m_sign = float(m.get("sign", 1.0))
+            m_off = float(m.get("offset_rad", 0.0))
+            closed_rad = m_sign * raw_closed + m_off
+            open_rad = m_sign * raw_open + m_off
+        else:
+            closed_rad = raw_closed
+            open_rad = raw_open
+    else:
+        closed_rad = raw_closed
+        open_rad = raw_open
+
+    closed_rad = float(closed_rad)
+    open_rad = float(open_rad)
+    limits.append((closed_rad, open_rad))
+    return limits, closed_rad, open_rad
