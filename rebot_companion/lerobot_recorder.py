@@ -577,7 +577,7 @@ class LeRobotRecorder:
         try:
             from rebot.client import ArmdClient
 
-            client = ArmdClient(self.armd_host)
+            client = ArmdClient(armd_url(self.armd_host))
             schema = client.get_schema()
             self.schema = schema
             self.profile_id = schema.profile_id
@@ -596,7 +596,7 @@ class LeRobotRecorder:
             from rebot._http import request
 
             res = request(
-                "GET", host_url(self.armd_host, ARMD_PORT) + "/api/v1/gripper/calibration", timeout=self.connect_timeout
+                "GET", armd_url(self.armd_host) + "/api/v1/gripper/calibration", timeout=self.connect_timeout
             )
             if res.ok:
                 calib = res.json()

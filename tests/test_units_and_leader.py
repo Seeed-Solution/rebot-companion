@@ -19,6 +19,7 @@ from rebot_companion.leader_teleop import (
     GripperCalib,
     JointCalib,
     LeaderCalibration,
+    LeaderError,
     LeaderTeleopBridge,
     LeaderTransport,
     compute_checksum,
@@ -27,7 +28,7 @@ from rebot_companion.leader_teleop import (
 )
 from rebot_companion.lerobot_recorder import LeRobotRecorder
 from rebot_companion.mcp_server import Controller
-from rebot_companion.policy_runner import PolicyRunner, RunnerError
+from rebot_companion.policy_runner import PolicyRunner, RunnerError, pretrained_info
 
 # --------------------------------------------------------------------------- units.py tests
 
@@ -389,6 +390,9 @@ def test_leader_teleop_bridge_lifecycle_and_ramp():
     # Follower starts at zero angles
     mock_obs.positions = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
     mock_obs.safety_state = "Armed"
+    mock_obs.is_stopped = False
+    mock_obs.is_torqued = True
+    mock_obs.is_operational = True
     mock_obs.collision = None
     mock_session.wait_for_observation.return_value = mock_obs
     mock_session.latest_observation.return_value = mock_obs
@@ -430,6 +434,172 @@ def test_leader_teleop_bridge_lifecycle_and_ramp():
     # Test shutdown
     bridge.close()
     mock_session.unload.assert_called_once_with(wait=True, timeout=15.0)
+
+
+def test_read_positions_sync_partial_packet_no_hang():
+    from rebot_companion.leader_teleop import FeetechSerialBus
+
+    transport = MockLeaderTransport()
+    bus = FeetechSerialBus(transport)
+    # Feed truncated 5-byte partial frame
+    transport.to_read = bytearray(b"\xff\xff\x01\x04\x00")
+    # Must terminate immediately without hanging and fallback cleanly
+    positions = bus.read_positions_sync([1, 2, 3, 4, 5, 6])
+    assert positions == {}
+
+
+def test_leader_bridge_rejects_missing_servos():
+    bus = MagicMock()
+    # Missing servo 6
+    bus.read_positions_sync.return_value = {1: 2048, 2: 2048, 3: 2048, 4: 2048, 5: 2048}
+    mock_session = MagicMock()
+    schema = ObservationSchema.from_dict({
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "limits": [
+            {"name": f"j{i}", "min_position": -3.14, "max_position": 3.14, "max_velocity": 2.0, "max_acceleration": 5.0}
+            for i in range(6)
+        ],
+    })
+    bridge = LeaderTeleopBridge(bus, mock_session, schema)
+    with pytest.raises(LeaderError, match=r"missing leader readings for servo IDs \[6\]"):
+        bridge.read_leader_target()
+
+
+def test_leader_bridge_arms_idle_follower_before_ramp():
+    bus = MagicMock()
+    bus.read_positions_sync.return_value = {1: 2048, 2: 2048, 3: 2048, 4: 2048, 5: 2048, 6: 2048}
+
+    idle_obs = MagicMock()
+    idle_obs.positions = [0.0] * 6
+    idle_obs.safety_state = "Idle"
+    idle_obs.is_stopped = False
+    idle_obs.is_torqued = False
+    idle_obs.is_operational = False
+    idle_obs.collision = None
+
+    armed_obs = MagicMock()
+    armed_obs.positions = [0.0] * 6
+    armed_obs.safety_state = "Armed"
+    armed_obs.is_stopped = False
+    armed_obs.is_torqued = True
+    armed_obs.is_operational = True
+    armed_obs.collision = None
+
+    mock_session = MagicMock()
+    mock_session.wait_for_observation.side_effect = [idle_obs, armed_obs]
+
+    schema = ObservationSchema.from_dict({
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "limits": [
+            {"name": f"j{i}", "min_position": -3.14, "max_position": 3.14, "max_velocity": 2.0, "max_acceleration": 5.0}
+            for i in range(6)
+        ],
+    })
+
+    bridge = LeaderTeleopBridge(
+        bus,
+        mock_session,
+        schema,
+        fps=50,
+        ramp_seconds=0.04,  # 2 steps
+        max_gap_rad=0.5,
+    )
+    bridge.align_and_ramp()
+    mock_session.torque.assert_called_once_with(True)
+    assert mock_session.servo.call_count == 2
+
+
+def test_recorder_fetch_schema_normalizes_plain_host(tmp_path, monkeypatch):
+    from rebot._http import host_url
+
+    # Verify host_url argument order
+    assert host_url("http", "192.168.16.1", 8765) == "http://192.168.16.1:8765"
+
+    recorded_client_hosts = []
+    recorded_requests = []
+
+    class FakeArmdClient:
+        def __init__(self, host_or_url: str):
+            recorded_client_hosts.append(host_or_url)
+
+        def get_schema(self):
+            return ObservationSchema.from_dict({
+                "dof": 6,
+                "arm_dof": 5,
+                "gripper_joint": 5,
+                "limits": [
+                    {"name": f"j{i}", "min_position": -3.14, "max_position": 3.14, "max_velocity": 2.0, "max_acceleration": 5.0}
+                    for i in range(6)
+                ],
+            })
+
+    def fake_request(method, url, **kwargs):
+        recorded_requests.append((method, url))
+        resp = MagicMock()
+        resp.ok = True
+        resp.json.return_value = {"points": []}
+        return resp
+
+    monkeypatch.setattr("rebot.client.ArmdClient", FakeArmdClient)
+    monkeypatch.setattr("rebot._http.request", fake_request)
+
+    recorder = LeRobotRecorder(tmp_path / "rec", "test/repo", armd_host="192.168.16.1", fps=10)
+    recorder._fetch_schema()
+
+    assert recorded_client_hosts == ["http://192.168.16.1:8765"]
+    assert any(
+        method == "GET" and url == "http://192.168.16.1:8765/api/v1/gripper/calibration"
+        for method, url in recorded_requests
+    )
+
+
+def test_pretrained_info_resolves_so101_norm_for_lerobot_policy(tmp_path):
+    dataset_dir = tmp_path / "ds"
+    (dataset_dir / "meta").mkdir(parents=True)
+    (dataset_dir / "meta" / "info.json").write_text(json.dumps({"unit_mode": "so101_norm", "fps": 30}))
+    (dataset_dir / "meta" / "stats.json").write_text(json.dumps({"observation.state": {"min": [0.0], "max": [1.0]}}))
+
+    policy_dir = tmp_path / "policy"
+    policy_dir.mkdir(parents=True)
+    (policy_dir / "train_config.json").write_text(json.dumps({"dataset": {"root": str(dataset_dir)}}))
+
+    info = pretrained_info(policy_dir)
+    assert info is not None
+    assert info["unit_mode"] == "so101_norm"
+    assert "stats" in info
+
+    from rebot_companion.policy_runner import Policy
+
+    class DummyPolicy(Policy):
+        action_dim = 6
+        fps = 30
+
+        def __init__(self, info_dict):
+            self.info = info_dict
+
+    policy = DummyPolicy(info)
+    mock_client = MagicMock()
+    mock_client.get_safety_describe.return_value = {"device": {"follower": "mock"}}
+    mock_res = MagicMock()
+    mock_res.json.return_value = {
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "limits": [
+            {"name": f"j{i}", "min_position": -3.14, "max_position": 3.14, "max_velocity": 2.0, "max_acceleration": 5.0}
+            for i in range(6)
+        ],
+    }
+    mock_client.request.return_value = mock_res
+
+    runner = PolicyRunner(mock_client, policy, camera=None, action_units="auto", state_units="auto", operator_present=True)
+    runner._read_arm()
+    assert runner.action_units == "so101_norm"
+    assert runner.state_units == "so101_norm"
 
 
 # --------------------------------------------------------------------------- mcp_server.py tests

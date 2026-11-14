@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from rebot._http import host_url
 from rebot.client import ArmdClient, ArmSession, ObservationSchema
 from rebot.errors import ArmConnectionError, LeaseError, RebotError, ServoRejected
 
@@ -34,6 +35,7 @@ DEFAULT_FPS = 50
 DEFAULT_BAUD = 1000000
 DEFAULT_MAX_GAP_RAD = 0.5
 DEFAULT_RAMP_SECONDS = 2.0
+ARMD_PORT = 8765
 TICKS_PER_REV = 4096
 DEFAULT_CENTER_TICK = 2048
 DEFAULT_WRIST_ROLL_LIMITS = (-2.74, 2.74)
@@ -296,10 +298,11 @@ class FeetechSerialBus:
         positions: dict[int, int] = {}
         rem = buf
         while rem:
+            prev_rem = rem
             sid, err, params, rem = decode_packet(rem)
             if sid is not None and err == 0 and params is not None and len(params) >= 2:
                 positions[sid] = params[0] | (params[1] << 8)
-            elif sid is None and not rem:
+            elif sid is None and (not rem or rem == prev_rem):
                 break
         if len(positions) == len(servo_ids):
             return positions
@@ -474,6 +477,9 @@ class LeaderTeleopBridge:
 
     def read_leader_target(self) -> list[float]:
         ticks = self.bus.read_positions_sync(self.calib.servo_ids)
+        missing = [sid for sid in self.calib.servo_ids if sid not in ticks]
+        if missing:
+            raise LeaderError(f"missing leader readings for servo IDs {missing}")
         return self.calib.ticks_to_rad(
             ticks,
             follower_limits=self.limits,
@@ -484,9 +490,15 @@ class LeaderTeleopBridge:
     def align_and_ramp(self) -> None:
         """Verify alignment against the follower arm and perform a smooth quintic ramp-in."""
         obs = self.session.wait_for_observation(timeout=5.0)
-        follower_start = list(obs.positions[:6])
+        if obs.is_stopped:
+            raise LeaderError(
+                f"follower is in {obs.safety_state} ({obs.fault_code or obs.fault_reason}); "
+                "check it and clear the fault in the cockpit"
+            )
+        if obs.collision and obs.collision.get("active"):
+            raise LeaderError("follower collision hold active; wait until it resumes")
 
-        # Read leader target
+        follower_start = list(obs.positions[:6])
         leader_target = self.read_leader_target()
         if len(leader_target) != 6 or len(follower_start) != 6:
             raise LeaderError(
@@ -500,6 +512,22 @@ class LeaderTeleopBridge:
                 f"alignment gap {gap:.3f} rad exceeds --max-gap-rad {self.max_gap_rad:.3f}; "
                 "align the leader arm with the follower or pass --i-am-at-the-arm"
             )
+
+        if not obs.is_torqued or not obs.is_operational:
+            log.info("enabling follower torque before ramp ...")
+            self.session.torque(True)
+            deadline = time.monotonic() + 5.0
+            while not (obs.is_torqued and obs.is_operational):
+                rem = max(0.1, deadline - time.monotonic())
+                if time.monotonic() >= deadline:
+                    raise LeaderError("timed out waiting for follower to enable torque and become operational")
+                obs = self.session.wait_for_observation(timeout=min(1.0, rem))
+                if obs.is_stopped:
+                    raise LeaderError(
+                        f"follower is in {obs.safety_state} ({obs.fault_code or obs.fault_reason}); "
+                        "check it and clear the fault in the cockpit"
+                    )
+            follower_start = list(obs.positions[:6])
 
         if self.ramp_seconds <= 0.0:
             return
@@ -549,11 +577,11 @@ class LeaderTeleopBridge:
                     log.warning("follower collision hold active")
                     break
 
-            target = self.read_leader_target()
             try:
+                target = self.read_leader_target()
                 self.session.servo(target)
                 self.frames_sent += 1
-            except (ServoRejected, LeaseError, ArmConnectionError, RebotError) as exc:
+            except (LeaderError, ServoRejected, LeaseError, ArmConnectionError, RebotError, OSError) as exc:
                 log.error("servo streaming stopped: %s", exc)
                 break
             k += 1
@@ -615,7 +643,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
 
     bus = FeetechSerialBus(transport)
-    client = ArmdClient(args.arm_host)
+    client = ArmdClient(host_url("http", args.arm_host, ARMD_PORT))
     try:
         schema = client.get_schema()
     except Exception as exc:

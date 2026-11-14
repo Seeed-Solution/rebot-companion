@@ -257,6 +257,7 @@ class LeRobotPolicy(Policy):
             _, h, w = inputs[self.image_key].shape
             self.image_size = (int(h), int(w))
         self.inputs = tuple(inputs)
+        self.info = pretrained_info(path)
         try:
             found = pretrained_fps(path)
         except ValueError as exc:
@@ -298,11 +299,12 @@ def _fps_field(container: Any, where: str) -> int | None:
     return int(v)
 
 
-def pretrained_fps(path: str | Path) -> tuple[int, str] | None:
-    """``(fps, where it came from)`` for a LeRobot pretrained directory or Hub repo id, from its
-    ``train_config.json``: ``env.fps``, ``dataset.fps``, else the training dataset's ``meta/info.json``
-    (``dataset.root``, else ``$HF_LEROBOT_HOME/<dataset.repo_id>``). None when none of them is available;
-    ValueError when one of them is malformed (not an object, fps not a whole number > 0)."""
+def _load_train_config(path: str | Path) -> tuple[dict | None, Path | None]:
+    """Load ``train_config.json`` from a local directory or download it from the Hub.
+
+    Returns ``(cfg_dict, cfg_path)``, or ``(None, None)`` when the file is absent.
+    Raises ValueError when the JSON is malformed or not a dict.
+    """
     local = Path(path).expanduser()
     cfg_file = local / "train_config.json"
     if not local.is_dir():
@@ -312,29 +314,47 @@ def pretrained_fps(path: str | Path) -> tuple[int, str] | None:
             cfg_file = Path(hf_hub_download(str(path), "train_config.json"))
         except Exception as exc:  # no huggingface_hub, offline, no such file
             log.info("no train_config.json for %s: %s", path, exc)
-            return None
+            return None, None
     try:
         cfg = json.loads(cfg_file.read_text())
     except FileNotFoundError:
-        return None
+        return None, None
     except (OSError, ValueError) as exc:
         raise ValueError(f"{cfg_file} is not readable JSON: {exc}") from None
     if not isinstance(cfg, dict):
         raise ValueError(f"{cfg_file} is not a JSON object")
-    for section in ("env", "dataset"):
-        fps = _fps_field(cfg.get(section), f"{cfg_file} {section}")
-        if fps:
-            return fps, f"{cfg_file} {section}.fps"
+    return cfg, cfg_file
+
+
+def _resolve_dataset_roots(cfg: dict, cfg_file: Path | None = None) -> list[Path]:
+    """Extract candidate dataset root paths from a train_config dict."""
     dataset = cfg.get("dataset") or {}
     for key in ("root", "repo_id"):
         if dataset.get(key) is not None and not isinstance(dataset[key], str):
-            raise ValueError(f"{cfg_file} dataset.{key} {dataset[key]!r} is not a string")
+            prefix = f"{cfg_file} " if cfg_file else ""
+            raise ValueError(f"{prefix}dataset.{key} {dataset[key]!r} is not a string")
     roots = []
     if dataset.get("root"):
         roots.append(Path(dataset["root"]).expanduser())
     if dataset.get("repo_id"):
         home = os.environ.get("HF_LEROBOT_HOME") or Path.home() / ".cache" / "huggingface" / "lerobot"
         roots.append(Path(home) / dataset["repo_id"])
+    return roots
+
+
+def pretrained_fps(path: str | Path) -> tuple[int, str] | None:
+    """``(fps, where it came from)`` for a LeRobot pretrained directory or Hub repo id, from its
+    ``train_config.json``: ``env.fps``, ``dataset.fps``, else the training dataset's ``meta/info.json``
+    (``dataset.root``, else ``$HF_LEROBOT_HOME/<dataset.repo_id>``). None when none of them is available;
+    ValueError when one of them is malformed (not an object, fps not a whole number > 0)."""
+    cfg, cfg_file = _load_train_config(path)
+    if cfg is None:
+        return None
+    for section in ("env", "dataset"):
+        fps = _fps_field(cfg.get(section), f"{cfg_file} {section}")
+        if fps:
+            return fps, f"{cfg_file} {section}.fps"
+    roots = _resolve_dataset_roots(cfg, cfg_file)
     for root in roots:
         info = root / "meta" / "info.json"
         try:
@@ -347,6 +367,82 @@ def pretrained_fps(path: str | Path) -> tuple[int, str] | None:
         if fps:
             return fps, str(info)
     return None
+
+
+def pretrained_info(path: str | Path) -> dict | None:
+    """Read dataset and policy metadata (``meta/info.json``, ``stats.json``, configs) for a pretrained policy.
+
+    Returns a dict with dataset info/stats/unit_mode, or None. Logs warnings on non-fatal errors.
+    """
+    local = Path(path).expanduser()
+    try:
+        cfg, cfg_file = _load_train_config(path)
+    except Exception as exc:
+        log.warning("failed to load train_config for %s: %s", path, exc)
+        cfg, cfg_file = None, None
+
+    policy_cfg: dict | None = None
+    if local.is_dir():
+        p_cfg = local / "config.json"
+        if p_cfg.is_file():
+            try:
+                data = json.loads(p_cfg.read_text())
+                if isinstance(data, dict):
+                    policy_cfg = data
+            except Exception as exc:
+                log.warning("failed to read %s: %s", p_cfg, exc)
+
+    roots: list[Path] = []
+    if cfg is not None:
+        try:
+            roots = _resolve_dataset_roots(cfg, cfg_file)
+        except Exception as exc:
+            log.warning("failed to resolve dataset roots for %s: %s", path, exc)
+
+    info_dict: dict | None = None
+    info_path: Path | None = None
+    for root in roots:
+        info_file = root / "meta" / "info.json"
+        if info_file.is_file():
+            try:
+                data = json.loads(info_file.read_text())
+                if isinstance(data, dict):
+                    info_dict = data
+                    info_path = info_file
+                    break
+            except Exception as exc:
+                log.warning("failed to read %s: %s", info_file, exc)
+
+    if info_dict is not None and "stats" not in info_dict and info_path is not None:
+        stats_file = info_path.parent / "stats.json"
+        if stats_file.is_file():
+            try:
+                stats_data = json.loads(stats_file.read_text())
+                if isinstance(stats_data, dict):
+                    info_dict["stats"] = stats_data
+            except Exception as exc:
+                log.warning("failed to read %s: %s", stats_file, exc)
+
+    cfg_unit_mode = None
+    candidates = [cfg]
+    if isinstance(cfg, dict) and isinstance(cfg.get("dataset"), dict):
+        candidates.append(cfg["dataset"])
+    if isinstance(policy_cfg, dict):
+        candidates.append(policy_cfg)
+    for candidate in candidates:
+        if isinstance(candidate, dict):
+            m = candidate.get("unit_mode") or candidate.get("rebot_unit_mode")
+            if m:
+                cfg_unit_mode = m
+                break
+
+    if cfg_unit_mode:
+        if info_dict is None:
+            info_dict = {"unit_mode": cfg_unit_mode}
+        elif "unit_mode" not in info_dict and "rebot_unit_mode" not in info_dict:
+            info_dict["unit_mode"] = cfg_unit_mode
+
+    return info_dict
 
 
 _PREFIX = re.compile(r"[A-Za-z][\w.+-]*:")
