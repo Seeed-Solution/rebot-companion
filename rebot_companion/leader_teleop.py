@@ -59,6 +59,9 @@ class LeaderError(RuntimeError):
     """The leader teleop bridge encountered an error."""
 
 
+LeaderTeleopError = LeaderError
+
+
 # --------------------------------------------------------------------------- packet codec
 
 
@@ -723,6 +726,40 @@ class LeaderCalibration:
         return out
 
 
+def _clamp_lead_and_step(
+    val: float,
+    prev_val: float,
+    ref_val: float,
+    max_step: float,
+    max_lead: float,
+    j_min: float | None = None,
+    j_max: float | None = None,
+    joint_index: int | None = None,
+) -> float:
+    """Clamp target angle within both previous command step limit and follower reference lead limit.
+
+    Intersects [prev_val - max_step, prev_val + max_step], [ref_val - max_lead, ref_val + max_lead],
+    and [j_min, j_max] if provided. Raises LeaderTeleopError if lead and step intervals are disjoint.
+    """
+    lo = max(prev_val - max_step, ref_val - max_lead)
+    hi = min(prev_val + max_step, ref_val + max_lead)
+    if j_min is not None:
+        lo = max(lo, j_min)
+    if j_max is not None:
+        hi = min(hi, j_max)
+
+    if lo > hi + 1e-9:
+        j_str = f"joint {joint_index + 1}: " if joint_index is not None else ""
+        raise LeaderTeleopError(
+            f"{j_str}disjoint lead and step intervals (prev_val={prev_val:.4f}, "
+            f"ref_val={ref_val:.4f}, max_step={max_step:.4f}, max_lead={max_lead:.4f}, "
+            f"lo={lo:.4f}, hi={hi:.4f})"
+        )
+    if lo > hi:
+        return 0.5 * (lo + hi)
+    return min(max(val, lo), hi)
+
+
 # --------------------------------------------------------------------------- leader bridge
 
 
@@ -833,10 +870,13 @@ class LeaderTeleopBridge:
         self.limits: list[tuple[float, float]] = [
             (float(lim.min_position), float(lim.max_position)) for lim in schema.limits
         ]
+        self.follower_limits = self.limits
         self.gripper_joint = schema.gripper_joint
         self.closed_rad, self.open_rad = units.resolve_schema_gripper_bounds(
             schema.gripper_policy, self.limits, self.gripper_joint
         )
+        self.follower_gripper_open = self.open_rad
+        self.follower_gripper_closed = self.closed_rad
         if getattr(session, "_schema", None) is None:
             if hasattr(session, "set_schema"):
                 session.set_schema(schema)
@@ -981,15 +1021,43 @@ class LeaderTeleopBridge:
         leader_target = self.read_leader_target()
         gap = self._check_alignment_gap(leader_target, follower_start, stage="initial")
 
-        v_maxes = [
-            float(lim.max_velocity)
-            for lim in self.schema.limits[:5]
-            if hasattr(lim, "max_velocity")
-            and math.isfinite(float(lim.max_velocity))
-            and float(lim.max_velocity) > 0
-        ]
+        v_maxes = []
+        for i, lim in enumerate(self.schema.limits[:5]):
+            val = getattr(lim, "max_velocity", None)
+            if val is None and isinstance(lim, dict):
+                val = lim.get("max_velocity")
+            if val is not None:
+                try:
+                    v = float(val)
+                except (ValueError, TypeError):
+                    raise LeaderTeleopError(
+                        f"follower joint {i + 1} ({getattr(lim, 'name', f'j{i+1}')}) has non-numeric max_velocity: {val}"
+                    )
+                if not math.isfinite(v) or v <= 0:
+                    raise LeaderTeleopError(
+                        f"follower joint {i + 1} ({getattr(lim, 'name', f'j{i+1}')}) has non-finite or non-positive max_velocity: {val}"
+                    )
+                v_maxes.append(v)
+        if hasattr(self, "follower_limits") and self.follower_limits:
+            for i, flim in enumerate(self.follower_limits[:5]):
+                val = getattr(flim, "max_velocity", None)
+                if val is None and isinstance(flim, dict):
+                    val = flim.get("max_velocity")
+                if val is not None:
+                    try:
+                        v = float(val)
+                    except (ValueError, TypeError):
+                        raise LeaderTeleopError(
+                            f"follower limit {i + 1} has non-numeric max_velocity: {val}"
+                        )
+                    if not math.isfinite(v) or v <= 0:
+                        raise LeaderTeleopError(
+                            f"follower limit {i + 1} has non-finite or non-positive max_velocity: {val}"
+                        )
+                    if v not in v_maxes:
+                        v_maxes.append(v)
         min_v_max = min(v_maxes) if v_maxes else 0.6
-        max_ramp_vel = max(0.1, min(0.6, 0.8 * min_v_max))
+        max_ramp_vel = min(0.6, 0.8 * min_v_max)
 
         base_steps = max(1, int(round(self.ramp_seconds * self.fps)))
         v_steps = math.ceil(1.875 * gap * self.fps / max_ramp_vel) if gap > 0 else 1
@@ -1074,8 +1142,17 @@ class LeaderTeleopBridge:
             for j in range(min(len(interp), len(ref))):
                 if j != self.gripper_joint and j < 5:
                     max_step = v_cap * dt
-                    interp[j] = min(max(interp[j], prev_cmd[j] - max_step), prev_cmd[j] + max_step)
-                    interp[j] = min(max(interp[j], ref[j] - self.arm_lead), ref[j] + self.arm_lead)
+                    j_min, j_max = self.limits[j] if j < len(self.limits) else (None, None)
+                    interp[j] = _clamp_lead_and_step(
+                        interp[j],
+                        prev_cmd[j],
+                        ref[j],
+                        max_step,
+                        self.arm_lead,
+                        j_min=j_min,
+                        j_max=j_max,
+                        joint_index=j,
+                    )
             prev_cmd = list(interp)
             self.session.servo(interp)
             self._last_servo_cmd = list(interp)
@@ -1136,8 +1213,17 @@ class LeaderTeleopBridge:
                     for j in range(min(len(settle_cmd), len(ref))):
                         if j != self.gripper_joint and j < 5:
                             max_step = v_cap * dt
-                            settle_cmd[j] = min(max(settle_cmd[j], prev_cmd[j] - max_step), prev_cmd[j] + max_step)
-                            settle_cmd[j] = min(max(settle_cmd[j], ref[j] - self.arm_lead), ref[j] + self.arm_lead)
+                            j_min, j_max = self.limits[j] if j < len(self.limits) else (None, None)
+                            settle_cmd[j] = _clamp_lead_and_step(
+                                settle_cmd[j],
+                                prev_cmd[j],
+                                ref[j],
+                                max_step,
+                                self.arm_lead,
+                                j_min=j_min,
+                                j_max=j_max,
+                                joint_index=j,
+                            )
                     prev_cmd = list(settle_cmd)
                     self.session.servo(settle_cmd)
                     self._last_servo_cmd = list(settle_cmd)
@@ -1196,11 +1282,37 @@ class LeaderTeleopBridge:
                 for j in range(min(len(clamped_target), len(ref))):
                     if j != self.gripper_joint and j < 5:
                         orig_val = clamped_target[j]
-                        clamped_val = min(max(orig_val, ref[j] - self.arm_lead), ref[j] + self.arm_lead)
-                        clamped_val = min(max(clamped_val, prev[j] - max_frame_step), prev[j] + max_frame_step)
+                        j_min, j_max = self.limits[j] if j < len(self.limits) else (None, None)
+                        clamped_val = _clamp_lead_and_step(
+                            orig_val,
+                            prev[j],
+                            ref[j],
+                            max_frame_step,
+                            self.arm_lead,
+                            j_min=j_min,
+                            j_max=j_max,
+                            joint_index=j,
+                        )
                         if clamped_val != orig_val:
                             saturated = True
                         clamped_target[j] = clamped_val
+
+                gj = self.gripper_joint if self.gripper_joint is not None else 5
+                if gj is not None and gj < len(clamped_target) and gj < len(prev):
+                    max_gripper_step = max(
+                        0.30, 0.25 * abs(self.follower_gripper_open - self.follower_gripper_closed)
+                    )
+                    follower_limits = getattr(self, "follower_limits", None) or self.limits
+                    if follower_limits and len(follower_limits) > gj:
+                        fl_lo, fl_hi = follower_limits[gj]
+                        g_lo, g_hi = (fl_lo, fl_hi) if fl_lo <= fl_hi else (fl_hi, fl_lo)
+                    else:
+                        g_lo = min(self.follower_gripper_open, self.follower_gripper_closed)
+                        g_hi = max(self.follower_gripper_open, self.follower_gripper_closed)
+                    orig_g = clamped_target[gj]
+                    clamped_g = min(max(orig_g, prev[gj] - max_gripper_step), prev[gj] + max_gripper_step)
+                    clamped_g = min(max(clamped_g, g_lo), g_hi)
+                    clamped_target[gj] = clamped_g
 
                 if saturated:
                     self._lead_clamp_consecutive += 1

@@ -9,6 +9,7 @@ from rebot.client import (
     ArmdClient,
     ArmSession,
     ArmStatus,
+    JointLimit,
     ObservationSchema,
     SafeExitOutcome,
 )
@@ -129,7 +130,7 @@ def test_pipeline_fault_aborts():
 
 def test_pipeline_motion_uses_lease_session():
     arm = MagicMock(spec=ArmdClient)
-    arm.get_observation.return_value = status("Idle")
+    arm.get_observation.return_value = status("Idle", positions=[0.0] * 7)
     session = session_mock("Idle")
     arm.session.return_value.__enter__.return_value = session
     ik = MagicMock(side_effect=lambda pose: [float(pose.translation[2])] + [0.0] * 5)
@@ -383,3 +384,37 @@ def test_dynamic_gripper_bounds_in_pipeline():
     assert res2.success is True
     targets2 = [c.args[0] for c in session2.move_to.call_args_list]
     assert [t[5] for t in targets2] == pytest.approx([-2.5, -2.5, -2.5, -0.1, -0.1, -0.1, -2.5])
+
+
+def test_pipeline_toolless_7dof_schema():
+    """7-DOF toolless arm with schema.gripper_joint=None commands 4 motion steps and has_gripper=False."""
+    arm = MagicMock(spec=ArmdClient)
+    arm.get_observation.return_value = status("Armed", torqued=True, positions=[0.0] * 7)
+    session = session_mock("Armed", positions=[0.0] * 7)
+    arm.session.return_value.__enter__.return_value = session
+
+    schema = ObservationSchema(
+        dof=7,
+        joint_names=[f"joint_{i+1}" for i in range(7)],
+        limits=[
+            JointLimit(name=f"j{i+1}", min_position=-3.14, max_position=3.14, max_velocity=2.0, max_acceleration=5.0)
+            for i in range(7)
+        ],
+        fields=[],
+        capabilities={"gripper": False},
+        arm_dof=7,
+        gripper_joint=None,
+    )
+    arm.get_schema.return_value = schema
+    ik = MagicMock(side_effect=lambda pose: [float(pose.translation[2])] + [0.0] * 6)
+    cam_to_base = Transform.from_translation_euler([0.1, -0.1, 0.1], 0.0, 0.0, 0.0)
+    pipeline = DeterministicPickPlacePipeline(
+        marker_scene(), arm, cam_to_base, PipelineConfig(max_allowed_distance=1.0), ik_solver=ik
+    )
+    res = pipeline.run_cycle()
+    assert res.success is True, res.error_message
+    # Without gripper, only 4 moves are commanded: approach, grasp, lift, place
+    assert session.move_to.call_count == 4
+    for call in session.move_to.call_args_list:
+        cmd = call.args[0]
+        assert len(cmd) == 7

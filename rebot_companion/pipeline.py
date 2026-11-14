@@ -254,8 +254,15 @@ class DeterministicPickPlacePipeline:
                 success=False, stage="ik_solve", target_pose_base=target_in_base, error_message=f"IK failed: {e}"
             )
 
-        raw_gj = getattr(schema, "gripper_joint", None) if schema else None
-        gripper_joint = raw_gj if isinstance(raw_gj, int) else (6 if schema is None or len(arm_status.positions) >= 7 else None)
+        if schema is not None:
+            if hasattr(schema, "gripper_joint"):
+                raw_gj = schema.gripper_joint
+                gripper_joint = raw_gj if isinstance(raw_gj, int) and not isinstance(raw_gj, bool) else None
+            else:
+                raw_arm_dof = getattr(schema, "arm_dof", None)
+                gripper_joint = 6 if len(arm_status.positions) >= 7 and raw_arm_dof != 7 else None
+        else:
+            gripper_joint = 6 if len(arm_status.positions) >= 7 else None
         capabilities = getattr(schema, "capabilities", {}) if schema else {}
         cap_gripper = capabilities.get("gripper") if isinstance(capabilities, dict) else None
         if cap_gripper is False or gripper_joint is None:

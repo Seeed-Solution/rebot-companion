@@ -3390,3 +3390,146 @@ def test_policy_runner_post_conversion_nan_guard():
         runner.run()
 
     assert runner.result.reason == "bad_action"
+
+
+def test_clamp_lead_and_step_overlapping_and_disjoint():
+    from rebot_companion.leader_teleop import _clamp_lead_and_step, LeaderTeleopError
+
+    # 1. Normal overlapping intervals
+    # prev=0.0, ref=0.0, step=0.2, lead=0.3 -> [-0.2, 0.2]
+    assert _clamp_lead_and_step(0.5, 0.0, 0.0, 0.2, 0.3) == pytest.approx(0.2)
+    assert _clamp_lead_and_step(-0.5, 0.0, 0.0, 0.2, 0.3) == pytest.approx(-0.2)
+    assert _clamp_lead_and_step(0.15, 0.0, 0.0, 0.2, 0.3) == pytest.approx(0.15)
+
+    # With joint limits
+    assert _clamp_lead_and_step(0.15, 0.0, 0.0, 0.2, 0.3, j_min=-0.1, j_max=0.1) == pytest.approx(0.1)
+
+    # 2. Touching/near-touching within 1e-9 tolerance returns midpoint
+    # prev=0.0, step=0.1 -> [ -0.1, 0.1 ]; ref=0.20000000005, lead=0.1 -> [ 0.10000000005, 0.30000000005 ]
+    # lo = 0.10000000005, hi = 0.1 (lo > hi by 5e-11 <= 1e-9)
+    res = _clamp_lead_and_step(0.1, 0.0, 0.20000000005, 0.1, 0.1)
+    assert res == pytest.approx(0.1, abs=1e-8)
+
+    # 3. Disjoint intervals (> 1e-9) raise LeaderTeleopError with joint index and diagnostics
+    with pytest.raises(LeaderTeleopError) as exc_info:
+        _clamp_lead_and_step(0.0, prev_val=0.0, ref_val=1.0, max_step=0.1, max_lead=0.1, joint_index=2)
+    err_msg = str(exc_info.value)
+    assert "joint 3" in err_msg
+    assert "prev_val=0.0000" in err_msg
+    assert "ref_val=1.0000" in err_msg
+    assert "max_step=0.1000" in err_msg
+    assert "max_lead=0.1000" in err_msg
+    assert "disjoint lead and step intervals" in err_msg
+
+
+def test_leader_teleop_low_max_velocity_ramp_limit():
+    """When follower limits specify max_velocity = 0.05 rad/s, max_ramp_vel is not floored at 0.1 rad/s and step deltas are bounded."""
+    from unittest.mock import patch
+
+    bus = MagicMock()
+    bus.read_positions_sync.return_value = {1: 2439, 2: 2439, 3: 2439, 4: 2439, 5: 2439, 6: 2439}
+    mock_session = MagicMock()
+    mock_session.client.get_safety_describe.return_value = {"device": {"follower": "mock"}}
+    mock_obs = MagicMock()
+    mock_obs.positions = [0.0] * 6
+    mock_obs.commanded_positions = [0.0] * 6
+    mock_obs.safety_state = "Armed"
+    mock_obs.is_stopped = False
+    mock_obs.is_torqued = True
+    mock_obs.is_operational = True
+    mock_obs.collision = None
+    mock_session.wait_for_observation.return_value = mock_obs
+    mock_session.latest_observation.return_value = mock_obs
+
+    schema = ObservationSchema.from_dict({
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "limits": [
+            {"name": f"j{i}", "min_position": -3.14, "max_position": 3.14, "max_velocity": 0.05, "max_acceleration": 5.0}
+            for i in range(6)
+        ],
+    })
+
+    sent_frames = []
+    def mock_servo(cmd):
+        sent_frames.append(list(cmd))
+        mock_obs.positions = list(cmd)
+        mock_obs.commanded_positions = list(cmd)
+
+    mock_session.servo.side_effect = mock_servo
+
+    fps = 50
+    bridge = LeaderTeleopBridge(
+        bus, mock_session, schema, fps=fps, ramp_seconds=0.2, max_gap_rad=1.0, allow_large_gap=True
+    )
+    cur_t = 1000.0
+    period = 1.0 / fps
+    def fake_sleep(d):
+        nonlocal cur_t
+        cur_t += d
+    def fake_monotonic():
+        return cur_t
+
+    with patch("time.sleep", side_effect=fake_sleep), patch("time.monotonic", side_effect=fake_monotonic):
+        bridge.align_and_ramp()
+
+    # min_v_max is 0.05, max_ramp_vel = min(0.6, 0.8 * 0.05) = 0.04 rad/s (NOT floored at 0.1 rad/s!)
+    assert len(sent_frames) > 0
+    dt_max = 3.0 * period
+    for i in range(1, len(sent_frames)):
+        for j in range(5):
+            delta = abs(sent_frames[i][j] - sent_frames[i - 1][j])
+            assert delta <= 0.05 * dt_max + 1e-9, f"Delta {delta} exceeded 0.05 * dt ({0.05 * dt_max})"
+
+
+def test_leader_teleop_gripper_glitch_step_clamp():
+    """In steady streaming, a corrupt leader packet snapping gripper 100% of travel is clamped per frame."""
+    from unittest.mock import patch
+
+    bus = MagicMock()
+    # Gripper jumps from 0 to 4095 (100% stroke)
+    bus.read_positions_sync.return_value = {1: 2048, 2: 2048, 3: 2048, 4: 2048, 5: 2048, 6: 4095}
+    mock_session = MagicMock()
+    mock_session.client.get_safety_describe.return_value = {"device": {"follower": "mock"}}
+    mock_obs = MagicMock()
+    mock_obs.positions = [0.0] * 6
+    mock_obs.commanded_positions = [0.0] * 6
+    mock_obs.safety_state = "Armed"
+    mock_obs.is_stopped = False
+    mock_obs.is_torqued = True
+    mock_obs.is_operational = True
+    mock_obs.collision = None
+    mock_session.wait_for_observation.return_value = mock_obs
+    mock_session.latest_observation.return_value = mock_obs
+
+    schema = ObservationSchema.from_dict({
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "gripper_policy": {"closed_rad": 0.0, "open_rad": 1.5},
+        "limits": [
+            {"name": f"j{i}", "min_position": -3.14, "max_position": 3.14, "max_velocity": 2.0, "max_acceleration": 5.0}
+            for i in range(5)
+        ] + [{"name": "gripper", "min_position": 0.0, "max_position": 1.745329, "max_velocity": 2.0, "max_acceleration": 5.0}],
+    })
+
+    sent_frames = []
+    bridge = LeaderTeleopBridge(bus, mock_session, schema, fps=50)
+
+    def on_servo(cmd):
+        sent_frames.append(list(cmd))
+        bridge.stop()
+
+    mock_session.servo.side_effect = on_servo
+
+    with patch.object(bridge, "align_and_ramp"):
+        with patch("time.sleep", return_value=None):
+            bridge.run()
+
+    assert len(sent_frames) == 1
+    # Gripper target from packet is 1.5 rad (4095 ticks maps to open_rad).
+    # prev[5] is 0.0 rad.
+    # max_gripper_step = max(0.30, 0.25 * 1.5) = 0.375 rad.
+    # Frame 0 gripper must be clamped to 0.375 rad, NOT 1.5 rad.
+    assert sent_frames[0][5] == pytest.approx(0.375, abs=1e-3)

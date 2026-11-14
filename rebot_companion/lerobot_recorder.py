@@ -593,6 +593,10 @@ class LeRobotRecorder:
                     raise RecorderError(
                         f"armd schema joint limits required for non-radian unit_mode {self.unit_mode!r}"
                     )
+                if schema.dof == 6 and schema.arm_dof is None and schema.gripper_joint is None:
+                    raise RecorderError(
+                        f"ambiguous 6-DOF schema missing arm_dof and gripper_joint for unit_mode {self.unit_mode!r}"
+                    )
                 if self.unit_mode == "so101_norm" and schema.gripper_joint is None:
                     if schema.arm_dof != 6:
                         raise RecorderError(
@@ -717,10 +721,11 @@ class LeRobotRecorder:
         i = len(ep.state)
         if i == 0:
             self._dof = len(state)
-            if self.arm_dof is None:
-                self.arm_dof = (6 if self._dof >= 6 else self._dof) if self.schema is not None else None
-            if self.gripper_joint is None and self._dof == 7 and self.schema is not None:
-                self.gripper_joint = 6
+            if self.schema is None and self._dof == 7:
+                if self.arm_dof is None:
+                    self.arm_dof = 6
+                if self.gripper_joint is None:
+                    self.gripper_joint = 6
         if len(state) != self._dof or len(action) != self._dof:
             raise ValueError(f"state and action need {self._dof} values")
 

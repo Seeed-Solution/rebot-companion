@@ -500,3 +500,40 @@ def test_host_urls_bracket_ipv6_literals():
     assert camera_url("fd00::2") == "ws://[fd00::2]:8001/"
     assert camera_url("192.168.16.1") == "ws://192.168.16.1:8001/"
     assert camera_url("ws://x/y") == "ws://x/y"
+
+
+def test_recorder_7dof_toolless_deg_mode(tmp_path: Path):
+    """7-DOF toolless arm in deg mode records J7 as degrees (57.2957795), NOT 50.0 gripper openness."""
+    import math
+    from rebot.client import JointLimit, ObservationSchema
+
+    schema = ObservationSchema(
+        dof=7,
+        joint_names=[f"joint_{i+1}" for i in range(7)],
+        limits=[
+            JointLimit(name=f"j{i+1}", min_position=-3.14, max_position=3.14, max_velocity=2.0, max_acceleration=5.0)
+            for i in range(7)
+        ],
+        fields=[],
+        capabilities={},
+        arm_dof=7,
+        gripper_joint=None,
+    )
+    rec = LeRobotRecorder(tmp_path / "rec_toolless", "test/repo", unit_mode="deg", fps=10, armd_host=None, camera_url=None)
+    rec.schema = schema
+    rec.arm_dof = 7
+    rec.gripper_joint = None
+    rec.limits = schema.limits
+    rec._schema_fetched = True
+
+    rec.start_episode(sample=False)
+    state = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]  # J7 = 1.0 rad
+    action = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+    rec.add_frame(state=state, action=action)
+
+    assert rec.gripper_joint is None
+    assert rec.arm_dof == 7
+    rec_state = rec._ep.state[0]
+    expected_deg = math.degrees(1.0)  # ~57.2957795 deg
+    assert rec_state[6] == pytest.approx(expected_deg, rel=1e-5)
+    assert rec_state[6] != pytest.approx(50.0, rel=1e-2)

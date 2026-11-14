@@ -834,10 +834,11 @@ class ArmSession:
         """Bring a torqued arm to rest with torque off before the lease is released.
 
         Steps: if torque is off, nothing to do. A latched EStop is reported and left
-        alone. A Fault is cleared, the arm is re-armed (torque on, no motion) and
-        :meth:`unload` runs with ``timeout`` (default ``safe_exit_timeout``). If armd
-        has no resting-pose profile (``UNSUPPORTED``) the arm stays torqued and armd
-        latches ``Fault(WatchdogTimeout)`` once the lease is released; this is
+        alone. Only recoverable faults are cleared and re-armed (torque on, no motion)
+        before running :meth:`unload` with ``timeout`` (default ``safe_exit_timeout``);
+        unrecoverable faults and E-stop remain latched and automatic unloading is skipped.
+        If armd has no resting-pose profile (``UNSUPPORTED``) the arm stays torqued and
+        armd latches ``Fault(WatchdogTimeout)`` once the lease is released; this is
         reported, because torque cannot be disabled away from the resting pose.
         """
         outcome = self._safe_exit(self.safe_exit_timeout if timeout is None else timeout)
@@ -977,7 +978,7 @@ class ArmSession:
         now = time.monotonic()
         if self._last_schema_attempt is None or (now - self._last_schema_attempt >= _SCHEMA_RETRY_COOLDOWN_S):
             try:
-                self._gripper_joint = self.schema().gripper_joint
+                self._gripper_joint = self.schema(timeout=0.5).gripper_joint
                 return self._gripper_joint  # type: ignore[return-value]
             except Exception:
                 pass
@@ -1770,7 +1771,19 @@ class ArmSession:
     def _tolerances(self, target: Sequence[float], tolerance: Any) -> list[float | None]:
         if tolerance is None:
             tol: list[float | None] = [0.03] * len(target)
-            gj = self.gripper_joint
+            if self._schema is not None:
+                gj = self._schema.gripper_joint
+            elif self._gripper_joint is not _GRIPPER_UNSET:
+                gj = self._gripper_joint  # type: ignore[assignment]
+            else:
+                now = time.monotonic()
+                if self._last_schema_attempt is None or (now - self._last_schema_attempt >= _SCHEMA_RETRY_COOLDOWN_S):
+                    try:
+                        gj = self.schema(timeout=0.5).gripper_joint
+                    except Exception:
+                        gj = self._cached_gripper_joint(len(target))
+                else:
+                    gj = self._cached_gripper_joint(len(target))
             if gj is not None and len(target) > gj:
                 tol[gj] = None
             elif self._schema is None and gj is None and len(target) >= 7:

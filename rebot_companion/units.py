@@ -47,24 +47,39 @@ def _resolve_gripper_bounds(
     closed_rad: float | None,
     open_rad: float | None,
 ) -> tuple[float, float]:
-    c = 0.0 if closed_rad is None else float(closed_rad)
     if open_rad is not None:
-        return c, float(open_rad)
-    fallback = -5.7 if gripper_joint == 6 else 1.5
-    if limits is not None and gripper_joint is not None and 0 <= gripper_joint < len(limits):
-        lo, hi = _extract_limit(limits[gripper_joint])
-        if gripper_joint == 6:
-            # Preserve B601-DM GRIPPER_OPEN = -5.7 safety margin when within limits
-            if lo <= -5.7 <= hi:
-                o = -5.7
-            else:
-                o = hi if abs(hi - c) >= abs(lo - c) else lo
-        else:
-            o = hi if abs(hi - c) >= abs(lo - c) else lo
-        if o == c:
-            o = fallback
+        o = float(open_rad)
     else:
-        o = fallback
+        fallback = -5.7 if gripper_joint == 6 else 1.5
+        if limits is not None and gripper_joint is not None and 0 <= gripper_joint < len(limits):
+            lo, hi = _extract_limit(limits[gripper_joint])
+            if gripper_joint == 6:
+                # Preserve B601-DM GRIPPER_OPEN = -5.7 safety margin when within limits
+                if lo <= -5.7 <= hi:
+                    o = -5.7
+                else:
+                    c_ref = 0.0 if closed_rad is None else float(closed_rad)
+                    o = hi if abs(hi - c_ref) >= abs(lo - c_ref) else lo
+            else:
+                c_ref = 0.0 if closed_rad is None else float(closed_rad)
+                o = hi if abs(hi - c_ref) >= abs(lo - c_ref) else lo
+            if o == (0.0 if closed_rad is None else float(closed_rad)):
+                o = fallback
+        else:
+            o = fallback
+
+    if closed_rad is not None:
+        c = float(closed_rad)
+    else:
+        if limits is not None and gripper_joint is not None and 0 <= gripper_joint < len(limits):
+            lo, hi = _extract_limit(limits[gripper_joint])
+            if lo <= 0.0 <= hi and abs(o - 0.0) > 1e-6:
+                c = 0.0
+            else:
+                c = lo if abs(lo - o) >= abs(hi - o) else hi
+        else:
+            c = 0.0
+
     if o == c:
         o = 1.5 if c == -5.7 else -5.7
     return c, o
@@ -85,7 +100,12 @@ def resolve_schema_gripper_bounds(
     limits: Sequence[Any] | None,
     gripper_joint: int | None,
 ) -> tuple[float, float]:
-    """Resolve (closed_rad, open_rad) bounds from schema gripper_policy and limits."""
+    """Resolve (closed_rad, open_rad) bounds from schema gripper_policy and limits.
+
+    When ``gripper_policy`` omits ``"closed_rad"`` and ``limits`` is provided with
+    ``0 <= gripper_joint < len(limits)``, falls back to the limit endpoint (``min_position``
+    or ``max_position``) farthest from ``open_rad``, else ``0.0``.
+    """
     closed_rad: float | None = None
     open_rad: float | None = None
     if isinstance(gripper_policy, dict):
@@ -278,6 +298,9 @@ def load_lerobot_norm_bounds(
 ) -> tuple[list[tuple[float, float]], float | None, float | None]:
     """Parse LeRobot SO-100/SO-101 calibration JSON and convert motor tick ranges to armd radians.
 
+    When ``homing_applied_in_hw=False`` in follower ``feetech_joints``, ``zero_step + homing_offset_steps``
+    matches armd's ``FeetechJointCalib::steps_to_rad`` (``src/protocol/feetech.rs:483-487``).
+
     Returns:
         (limits, closed_rad, open_rad) where limits has 6 elements [(lo_j1, hi_j1), ..., (closed_rad, open_rad)].
     """
@@ -346,6 +369,8 @@ def load_lerobot_norm_bounds(
             zero_step = float(fj.get("zero_step", 2048))
             homing_applied = bool(fj.get("homing_applied_in_hw", False))
             homing_offset = float(fj.get("homing_offset_steps", 0))
+            # When homing_applied_in_hw=False, zero_step + homing_offset_steps matches
+            # armd's FeetechJointCalib::steps_to_rad (src/protocol/feetech.rs:483-487).
             effective_zero = zero_step if homing_applied else zero_step + homing_offset
             armd_sign = -1.0 if fj.get("drive_mode_invert") else 1.0
         else:
@@ -406,6 +431,8 @@ def load_lerobot_norm_bounds(
         g_zero_step = float(fj_grip.get("zero_step", 2048))
         g_homing_applied = bool(fj_grip.get("homing_applied_in_hw", False))
         g_homing_offset = float(fj_grip.get("homing_offset_steps", 0))
+        # When homing_applied_in_hw=False, zero_step + homing_offset_steps matches
+        # armd's FeetechJointCalib::steps_to_rad (src/protocol/feetech.rs:483-487).
         g_effective_zero = g_zero_step if g_homing_applied else g_zero_step + g_homing_offset
         g_armd_sign = -1.0 if fj_grip.get("drive_mode_invert") else 1.0
     else:
