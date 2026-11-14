@@ -44,7 +44,6 @@ from pydantic import BaseModel, Field
 from scipy.spatial.transform import Rotation
 
 from rebot.client import (
-    GRIPPER_INDEX,
     ActionFailed,
     ActionResult,
     ArmCommandRejected,
@@ -55,6 +54,7 @@ from rebot.client import (
     ArmStatus,
     LeaseError,
     MotionTimeout,
+    ObservationSchema,
 )
 from rebot.detection import (
     DEFAULT_TRIGGER_PIPELINES,
@@ -282,6 +282,51 @@ class Controller:
         self.released = False  # release_control was called: no automatic re-acquire
         self._lock = threading.RLock()
         self._joint_map: kinematics.JointMap | None = None
+        self._schema: ObservationSchema | None = None
+
+    def schema(self) -> ObservationSchema:
+        if self._schema is None:
+            try:
+                self._schema = self.client.get_schema()
+            except Exception as exc:
+                log.warning("observation schema unavailable: %s", exc)
+                dof = len(self.observation().positions) if self.observation() else 7
+                self._schema = ObservationSchema(dof=dof, joint_names=[], limits=[], fields=[])
+        return self._schema
+
+    def gripper_joint(self) -> int | None:
+        try:
+            return self.schema().gripper_joint
+        except Exception:
+            obs = self.observation()
+            return 6 if obs and len(obs.positions) == 7 else None
+
+    def format_tcp(self, obs_tcp: Any, positions: list[float]) -> dict | None:
+        if obs_tcp is not None:
+            raw_xyz = obs_tcp.get("xyz_m") if hasattr(obs_tcp, "get") else getattr(obs_tcp, "xyz_m", [])
+            xyz = [_r(v) for v in raw_xyz or []]
+            rpy_rad = obs_tcp.get("rpy_rad") if hasattr(obs_tcp, "get") else getattr(obs_tcp, "rpy_rad", None)
+            quat = (
+                obs_tcp.get("quat_wxyz") if hasattr(obs_tcp, "get") else getattr(obs_tcp, "quat_wxyz", None)
+            ) or (
+                obs_tcp.get("quat") if hasattr(obs_tcp, "get") else getattr(obs_tcp, "quat", None)
+            )
+            rpy_deg = [_r(math.degrees(v), 2) for v in rpy_rad] if rpy_rad is not None else None
+            return {
+                "xyz_m": xyz,
+                "rpy_deg": rpy_deg,
+                "quat": [_r(v, 5) for v in quat] if quat is not None else None,
+            }
+        sch = None
+        try:
+            sch = self.schema()
+        except Exception:
+            pass
+        arm_dof = sch.arm_dof if sch else None
+        dof = sch.dof if sch else len(positions)
+        if (dof == 7 or arm_dof == 6) and len(positions) >= 6:
+            return tcp_dict(positions, self.joint_map())
+        return None
 
     def joint_map(self) -> kinematics.JointMap:
         """armd's motor -> URDF map (schema ``model_joint_map``), read once; the B601-DM map when
@@ -391,7 +436,21 @@ class Controller:
 
     def get_state(self) -> dict:
         obs = self.observation()
-        grip = obs.positions[GRIPPER_INDEX] if len(obs.positions) > GRIPPER_INDEX else None
+        if obs.gripper is not None:
+            gripper = {
+                "joint": obs.gripper.joint,
+                "rad": _r(obs.gripper.rad),
+                "fraction": _r(obs.gripper.fraction, 3),
+                "opening_m": _r(obs.gripper.opening_m, 4) if obs.gripper.opening_m is not None else None,
+                "stalled": obs.gripper.stalled,
+            }
+        else:
+            gj = self.gripper_joint()
+            if gj is not None and len(obs.positions) > gj:
+                grip = obs.positions[gj]
+                gripper = {"rad": _r(grip), "fraction": _r(gripper_fraction(grip), 3)}
+            else:
+                gripper = None
         return {
             "safety_state": obs.safety_state,
             "fault_reason": obs.fault_reason,
@@ -405,8 +464,8 @@ class Controller:
                 "temperatures": [_r(v, 1) for v in obs.temperatures],
             },
             "fault": obs.fault,
-            "tcp": tcp_dict(obs.positions, self.joint_map()),
-            "gripper": None if grip is None else {"rad": _r(grip), "fraction": _r(gripper_fraction(grip), 3)},
+            "tcp": self.format_tcp(obs.tcp, obs.positions),
+            "gripper": gripper,
             "action": obs.action.to_dict() if obs.action else None,
             "feedback_valid": obs.feedback_valid,
             "epoch_id": obs.epoch_id,
@@ -420,7 +479,7 @@ class Controller:
             "kind": a.kind if a else None,
             "state": a.state if a else "done",
             "settled": a.settled if a else None,
-            "tcp_after": tcp_dict(res.status.positions, self.joint_map()),
+            "tcp_after": self.format_tcp(res.status.tcp, res.status.positions),
             "duration_s": _r(res.duration_s, 3),
             "safety_state": res.status.safety_state,
             "is_torqued": res.status.is_torqued,
@@ -442,11 +501,34 @@ class Controller:
         rpy = None
         if quat is not None and any(v is not None for v in (roll_deg, pitch_deg, yaw_deg)):
             raise ToolFail("INVALID_ARGUMENT", "give roll/pitch/yaw or quat, not both")
-        if any(v is not None for v in (roll_deg, pitch_deg, yaw_deg)):
+        sch = self.schema()
+        orient_dof = sch.orientation_dof or (2 if sch.arm_dof == 5 else 3)
+        if orient_dof == 2:
+            # 2-DOF orientation arm (e.g. 5-arm): pitch/roll controllable, yaw is not independent.
+            # When all orientation angles are omitted or only yaw was given, pass rpy=None.
+            if roll_deg is None and pitch_deg is None:
+                rpy = None
+            else:
+                obs = s.latest_observation()
+                cur_tcp = self.format_tcp(obs.tcp, obs.commanded_positions or obs.positions) if obs else None
+                cur = cur_tcp.get("rpy_deg") if cur_tcp else None
+                if not cur or len(cur) < 3:
+                    cur = [0.0, 0.0, 0.0]
+                rpy = [
+                    math.radians(roll_deg if roll_deg is not None else cur[0]),
+                    math.radians(pitch_deg if pitch_deg is not None else cur[1]),
+                    math.radians(yaw_deg if yaw_deg is not None else cur[2]),
+                ]
+        elif any(v is not None for v in (roll_deg, pitch_deg, yaw_deg)):
             obs = s.latest_observation()
-            cur = (tcp_dict(obs.commanded_positions or obs.positions, self.joint_map()) or {}).get(
-                "rpy_deg", [0.0, 0.0, 0.0]
-            )
+            cur_tcp = self.format_tcp(obs.tcp, obs.commanded_positions or obs.positions) if obs else None
+            cur = cur_tcp.get("rpy_deg") if cur_tcp else None
+            if not cur or len(cur) < 3:
+                cur = (tcp_dict(obs.commanded_positions or obs.positions, self.joint_map()) or {}).get(
+                    "rpy_deg", [0.0, 0.0, 0.0]
+                )
+            if not cur or len(cur) < 3:
+                cur = [0.0, 0.0, 0.0]
             rpy = [math.radians(v if v is not None else c) for v, c in zip((roll_deg, pitch_deg, yaw_deg), cur)]
         res = s.move_pose([x, y, z], rpy=rpy, quat=quat, linear_speed=speed_mps, timeout=timeout_s)
         return self._action_dict(res)
@@ -458,16 +540,25 @@ class Controller:
         return self._action_dict(res)
 
     def gripper(self, command: str, fraction: float | None, grasp: bool | None) -> dict:
+        gj = self.gripper_joint()
+        if gj is None:
+            raise ToolFail("UNSUPPORTED", "This arm model does not have a gripper")
         s = self.actuator()
         res = s.gripper(command, fraction=fraction, grasp=grasp)
         obs, a = res.status, res.action
-        grip = obs.positions[GRIPPER_INDEX] if len(obs.positions) > GRIPPER_INDEX else 0.0
+        if obs.gripper is not None:
+            grip = obs.gripper.rad
+            frac = obs.gripper.fraction
+        else:
+            grip = obs.positions[gj] if len(obs.positions) > gj else 0.0
+            frac = gripper_fraction(grip)
+        torque = _r(obs.torques[gj], 3) if len(obs.torques) > gj else None
         return {
             "state": a.state if a else "done",
             "holding": a.holding if a else None,
             "gap_rad": a.gripper_gap_rad if a else None,
-            "torque_nm": _r(obs.torques[GRIPPER_INDEX], 3) if len(obs.torques) > GRIPPER_INDEX else None,
-            "fraction": _r(gripper_fraction(grip), 3),
+            "torque_nm": torque,
+            "fraction": _r(frac, 3),
         }
 
     def home(self) -> dict:
@@ -640,7 +731,12 @@ class Controller:
         return [Image(data=snap.jpeg, format="jpeg"), json.dumps(meta)]
 
     def detect(self, wait_ms: int, min_score: float, pipelines: str | None = None) -> dict:
-        wanted = None if pipelines is None else (list(DEFAULT_TRIGGER_PIPELINES) if pipelines == "both" else [pipelines])
+        if pipelines is None:
+            wanted = None
+        elif pipelines == "both":
+            wanted = list(DEFAULT_TRIGGER_PIPELINES)
+        else:
+            wanted = [pipelines]
         res = self.detector.detect_once(wait_ms=wait_ms, pipelines=wanted)
         dets = [d for d in parse_detections(res["raw"]) if d.score >= min_score]
         out = {

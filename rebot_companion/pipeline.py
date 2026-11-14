@@ -8,12 +8,12 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from rebot.client import ArmCommandRejected, ArmdClient, ArmdError, ArmSession, SafeExitOutcome
+from rebot.client import ArmCommandRejected, ArmdClient, ArmdError, ArmSession, ObservationSchema, SafeExitOutcome
 
 from . import kinematics
 from .calibration import HandEyeResult
 from .camera_client import CameraTriggerTimeout, MarkerDetection, ReCameraClient
-from .ik import GRIPPER_CLOSED, GRIPPER_INDEX, GRIPPER_OPEN
+from .ik import GRIPPER_CLOSED, GRIPPER_OPEN, B601IkAdapter
 from .transforms import Transform
 
 
@@ -201,6 +201,34 @@ class DeterministicPickPlacePipeline:
                 error_message="No IK solver configured: target computed and checked, arm not moved",
             )
 
+        schema = None
+        try:
+            sch = self.arm.get_schema()
+            if isinstance(sch, ObservationSchema) or (hasattr(sch, "dof") and isinstance(sch.dof, int)):
+                schema = sch
+        except Exception:
+            pass
+
+        if schema is not None:
+            profile_id = getattr(schema, "profile_id", None)
+            arm_dof = getattr(schema, "arm_dof", None)
+            is_b601_ik = isinstance(self.ik_solver, B601IkAdapter) or (
+                hasattr(self.ik_solver, "__module__") and "ik" in getattr(self.ik_solver, "__module__", "")
+            )
+            if is_b601_ik:
+                if (isinstance(profile_id, str) and "b601" not in profile_id.lower()) or (
+                    isinstance(arm_dof, int) and arm_dof != 6
+                ):
+                    return PipelineResult(
+                        success=False,
+                        stage="ik_solve",
+                        target_pose_base=target_in_base,
+                        error_message=(
+                            f"Refusing local B601 IK on incompatible arm (profile_id={profile_id!r}, "
+                            f"arm_dof={arm_dof})"
+                        ),
+                    )
+
         warnings: list[str] = []
         # Solve every waypoint before moving so an unreachable pose aborts with the arm still.
         try:
@@ -217,14 +245,21 @@ class DeterministicPickPlacePipeline:
                 success=False, stage="ik_solve", target_pose_base=target_in_base, error_message=f"IK failed: {e}"
             )
 
-        has_gripper = all(len(q) > GRIPPER_INDEX for q in (q_approach, q_grasp, q_lift, q_place))
-        if not has_gripper:
-            warnings.append(f"IK targets have no gripper joint (index {GRIPPER_INDEX}); gripper not commanded")
+        raw_gj = getattr(schema, "gripper_joint", None) if schema else None
+        gripper_joint = raw_gj if isinstance(raw_gj, int) else (6 if schema is None or len(arm_status.positions) >= 7 else None)
+        capabilities = getattr(schema, "capabilities", {}) if schema else {}
+        cap_gripper = capabilities.get("gripper") if isinstance(capabilities, dict) else None
+        if cap_gripper is False or gripper_joint is None:
+            has_gripper = False
+        else:
+            has_gripper = all(len(q) > gripper_joint for q in (q_approach, q_grasp, q_lift, q_place))
+            if not has_gripper:
+                warnings.append(f"IK targets have no gripper joint (index {gripper_joint}); gripper not commanded")
 
         def grip(q: list[float], value: float) -> list[float]:
             q = list(q)
-            if has_gripper:
-                q[GRIPPER_INDEX] = value
+            if has_gripper and gripper_joint is not None:
+                q[gripper_joint] = value
             return q
 
         opened, closed = cfg.gripper_open, cfg.gripper_closed

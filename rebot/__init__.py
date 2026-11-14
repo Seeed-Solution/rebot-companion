@@ -8,11 +8,14 @@ from .client import (
     ActionResult,
     ActionStatus,
     ArmdClient,
+    ArmObservation,
     ArmSession,
     ArmStatus,
+    GripperStatus,
     JointLimit,
     ObservationSchema,
     SafeExitOutcome,
+    TcpPose,
 )
 from .detection import Detection, DetectionClient, parse_detections
 from .errors import (
@@ -37,6 +40,9 @@ __all__ = [
     "ArmdClient",
     "ArmSession",
     "ArmStatus",
+    "ArmObservation",
+    "TcpPose",
+    "GripperStatus",
     "ActionStatus",
     "ActionResult",
     "ObservationSchema",

@@ -80,13 +80,27 @@ class HandEyeResult:
         sign: Sequence[float] = kinematics.DEFAULT_SIGN,
         offset: Sequence[float] = kinematics.DEFAULT_OFFSET,
         joint_map: kinematics.JointMap = kinematics.B601DM_JOINT_MAP,
+        schema: Any = None,
     ) -> Transform:
         """``T_cam_to_base``. For eye_in_hand, ``joints`` are the raw armd positions when the image was taken."""
         if self.setup == "eye_to_hand":
             return self.transform
         if joints is None:
             raise ValueError("eye_in_hand calibration needs the arm joints at detection time")
-        return gripper_pose(joints, sign, offset, joint_map) @ self.transform
+        return gripper_pose(joints, sign, offset, joint_map, schema=schema) @ self.transform
+
+
+def check_b601_compatibility(schema_or_profile: Any) -> None:
+    """Refuse B601 kinematics/IK when profile_id indicates non-B601 or arm_dof != 6."""
+    profile_id = getattr(schema_or_profile, "profile_id", None)
+    arm_dof = getattr(schema_or_profile, "arm_dof", None)
+    if isinstance(schema_or_profile, dict):
+        profile_id = schema_or_profile.get("profile_id")
+        arm_dof = schema_or_profile.get("arm_dof")
+    if profile_id is not None and "b601" not in str(profile_id).lower():
+        raise ValueError(f"Local B601 kinematics cannot be used for arm with profile_id '{profile_id}'")
+    if arm_dof is not None and arm_dof != 6:
+        raise ValueError(f"Local B601 kinematics requires arm_dof=6, got {arm_dof}")
 
 
 def gripper_pose(
@@ -94,6 +108,7 @@ def gripper_pose(
     sign: Sequence[float] = kinematics.DEFAULT_SIGN,
     offset: Sequence[float] = kinematics.DEFAULT_OFFSET,
     joint_map: kinematics.JointMap = kinematics.B601DM_JOINT_MAP,
+    schema: Any = None,
 ) -> Transform:
     """``T_base_gripper`` from raw armd joint positions (J1..J6 via the URDF chain; gripper ignored).
 
@@ -101,6 +116,8 @@ def gripper_pose(
     joint5 (wrist swing) / joint6 (tool roll) through ``joint_map`` (B601-DM: joint6 = motor - pi/2;
     armd publishes its map as ``model_joint_map``, :meth:`kinematics.JointMap.from_schema`).
     """
+    if schema is not None:
+        check_b601_compatibility(schema)
     return kinematics.tcp_pose_from_joints(joints, sign, offset, joint_map)
 
 
