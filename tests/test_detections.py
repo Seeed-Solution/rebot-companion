@@ -580,7 +580,7 @@ def test_v2_obb_payload_and_to_dict_roundtrip():
 
 
 def test_border_obb_corner_preserved_and_annotate_no_aabb_outer_pixels():
-    from PIL import Image
+    Image = pytest.importorskip("PIL.Image")
 
     # 200x200 black snapshot
     img = Image.new("RGB", (200, 200), (0, 0, 0))
