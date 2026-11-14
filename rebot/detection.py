@@ -6,6 +6,7 @@ Standard library only. :func:`parse_detections` reads the same payload formats a
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Callable, Sequence
 
@@ -37,6 +38,11 @@ class Detection:
     height_m: float | None = None  # 3D bounding height in metres (> 0)
     width_m: float | None = None  # 3D bounding width in metres (> 0)
     length_m: float | None = None  # 3D bounding length in metres (> 0)
+    angle_deg: float | None = None  # oriented box angle in [-90.0, 90.0) deg
+    angle_conf: float | None = None  # angle confidence in [0, 1]
+    grasp_width_px: float | None = None  # gripper grasp width in pixels (> 0)
+    mask_focus: bool | None = None  # segmentation mask focus flag
+    obb_corners_norm: list[tuple[float, float]] | None = None  # 4 oriented box corners (not clamped)
 
     def to_dict(self) -> dict:
         d = {
@@ -48,6 +54,8 @@ class Detection:
         }
         if self.corners_norm is not None:
             d["corners_norm"] = [[round(u, 4), round(v, 4)] for u, v in self.corners_norm]
+        if self.obb_corners_norm is not None:
+            d["obb_corners_norm"] = [[round(u, 4), round(v, 4)] for u, v in self.obb_corners_norm]
         for k in (
             "length_px",
             "disp_fg",
@@ -58,6 +66,10 @@ class Detection:
             "height_m",
             "width_m",
             "length_m",
+            "angle_deg",
+            "angle_conf",
+            "grasp_width_px",
+            "mask_focus",
         ):
             v = getattr(self, k)
             if v is not None:
@@ -91,6 +103,20 @@ def _opt_unit_float(v: Any) -> float | None:
 
 def _opt_bool(v: Any) -> bool | None:
     return v if isinstance(v, bool) else None
+
+
+def _opt_angle_deg(v: Any) -> float | None:
+    f = _opt_float(v)
+    if f is None:
+        return None
+    w = (f + 90.0) % 180.0 - 90.0
+    if w >= 90.0 or abs(w - 90.0) < 1e-12:
+        w = -90.0
+    elif w < -90.0:
+        w = -90.0
+    if w == 0.0:
+        w = 0.0
+    return w
 
 
 def _find_field(item: Any, key: str, parse: Callable[[Any], Any] | None = None) -> Any:
@@ -151,6 +177,78 @@ def _corners(item: dict) -> list[tuple[float, float]] | None:
     return None
 
 
+def _obb_corners(item: dict) -> list[tuple[float, float]] | None:
+    """Four OBB corners from ``obb_corners`` / ``rbox_corners`` (also under ``detail``)."""
+    det = item.get("detail") if isinstance(item.get("detail"), dict) else {}
+    for src in (item, det):
+        for k in ("obb_corners", "rbox_corners"):
+            raw = src.get(k)
+            if not isinstance(raw, list):
+                continue
+            flat = _flatten_xy(raw)
+            if len(flat) != 8:
+                continue
+            nums = [_opt_float(v) for v in flat]
+            if all(n is not None for n in nums):
+                return [(nums[i], nums[i + 1]) for i in range(0, 8, 2)]  # type: ignore[misc]
+    return None
+
+
+def _obb_geometry(item: Any, raw_fmt: str | None = None) -> tuple[list[tuple[float, float]], float] | None:
+    """(4 rotated corners, wrapped long-side angle_deg) for obb/rbox items."""
+    cx, cy, w, h, angle = None, None, None, None, None
+    explicit_deg: float | None = None
+    if isinstance(item, (list, tuple)) and raw_fmt in ("obb", "rbox") and len(item) >= 5:
+        vals = [_opt_float(v) for v in item[:5]]
+        if any(v is None for v in vals):
+            return None
+        cx, cy, w, h, angle = vals  # type: ignore[misc]
+    elif isinstance(item, dict):
+        fmt = item.get("format") or raw_fmt
+        if fmt not in ("obb", "rbox"):
+            return None
+        bbox = item.get("rbox") if isinstance(item.get("rbox"), list) else item.get("bbox") if isinstance(item.get("bbox"), list) else item.get("box")
+        bbox = bbox if isinstance(bbox, list) and len(bbox) >= 5 else None
+        if bbox:
+            vals = [_opt_float(v) for v in bbox[:5]]
+            if any(v is None for v in vals):
+                return None
+            cx, cy, w, h, angle = vals  # type: ignore[misc]
+        else:
+            cx = _opt_float(item.get("cx", item.get("x")))
+            cy = _opt_float(item.get("cy", item.get("y")))
+            w = _opt_float(item.get("w", item.get("width")))
+            h = _opt_float(item.get("h", item.get("height")))
+            if item.get("angle_deg") is not None:
+                explicit_deg = _opt_angle_deg(item.get("angle_deg"))
+                if explicit_deg is not None:
+                    angle = math.radians(explicit_deg)
+            if angle is None:
+                angle = _opt_float(item.get("angle", item.get("angle_rad", item.get("theta"))))
+    else:
+        return None
+
+    if None in (cx, cy, w, h, angle) or w <= 0 or h <= 0:
+        return None
+
+    cos_a = math.cos(angle)
+    sin_a = math.sin(angle)
+    dx1 = (w / 2.0) * cos_a
+    dy1 = (w / 2.0) * sin_a
+    dx2 = -(h / 2.0) * sin_a
+    dy2 = (h / 2.0) * cos_a
+    corners = [
+        (cx - dx1 - dx2, cy - dy1 - dy2),
+        (cx + dx1 - dx2, cy + dy1 - dy2),
+        (cx + dx1 + dx2, cy + dy1 + dy2),
+        (cx - dx1 + dx2, cy - dy1 + dy2),
+    ]
+    input_deg = explicit_deg if explicit_deg is not None else math.degrees(angle)
+    long_side_deg = input_deg + (90.0 if w < h else 0.0)
+    angle_deg = _opt_angle_deg(long_side_deg)
+    return corners, angle_deg if angle_deg is not None else 0.0
+
+
 def _items(raw: Any) -> tuple[list, float | None, float | None]:
     if isinstance(raw, list):
         if len(raw) >= 5 and isinstance(raw[0], (int, float)):
@@ -160,7 +258,7 @@ def _items(raw: Any) -> tuple[list, float | None, float | None]:
         return [], None, None
     data = raw.get("data") if isinstance(raw.get("data"), dict) else {}
     items: list = []
-    if raw.get("format"):
+    if raw.get("format") and not isinstance(raw.get("boxes"), list) and not isinstance(raw.get("detections"), list):
         items = [raw]
     elif isinstance(raw.get("boxes"), list):
         items = raw["boxes"]
@@ -188,9 +286,23 @@ def _items(raw: Any) -> tuple[list, float | None, float | None]:
     return items, _num(ref_w), _num(ref_h)
 
 
-def _raw_box(item: Any, corners: list[tuple[float, float]] | None):
+def _raw_box(item: Any, corners: list[tuple[float, float]] | None, raw_fmt: str | None = None):
     """``(cx, cy, w, h, score, label, track_id)`` in the payload's units, or None to drop."""
     if isinstance(item, (list, tuple)) and len(item) >= 5:
+        if raw_fmt in ("obb", "rbox"):
+            geom = _obb_geometry(item, raw_fmt)
+            if geom is None:
+                return None
+            corners_4, _ = geom
+            xs = [c[0] for c in corners_4]
+            ys = [c[1] for c in corners_4]
+            w_aabb = max(xs) - min(xs)
+            h_aabb = max(ys) - min(ys)
+            cx, cy = sum(xs) / 4.0, sum(ys) / 4.0
+            score = _opt_unit_float(item[5]) if len(item) > 5 else 1.0
+            label = str(item[6]) if len(item) > 6 else "obj"
+            track = item[7] if len(item) > 7 else None
+            return cx, cy, w_aabb, h_aabb, score, label, track
         # SSCMA array [cx, cy, w, h, score, target(, track)], centre per the cockpit (index.html:2471);
         # needs verification against real yolo-detector output.
         vals = [_num(v) for v in item[:4]]
@@ -203,7 +315,7 @@ def _raw_box(item: Any, corners: list[tuple[float, float]] | None):
         return cx, cy, w, h, _num(item[4]), label, item[6] if len(item) > 6 else None
     if not isinstance(item, dict):
         return None
-    fmt = item.get("format") or ("corners" if corners else None)
+    fmt = item.get("format") or raw_fmt or ("corners" if corners else None)
     if fmt == "corners":
         if not corners:
             return None
@@ -219,6 +331,18 @@ def _raw_box(item: Any, corners: list[tuple[float, float]] | None):
         h = _num(item.get("h", item.get("height")))
         if None in (cx, cy, w, h) or w <= 0 or h <= 0:
             return None
+    elif fmt in ("obb", "rbox"):
+        geom = _obb_geometry(item, raw_fmt)
+        if geom is None:
+            return None
+        corners_4, _ = geom
+        xs = [c[0] for c in corners_4]
+        ys = [c[1] for c in corners_4]
+        w = max(xs) - min(xs)
+        h = max(ys) - min(ys)
+        if w <= 0 or h <= 0:
+            return None
+        cx, cy = sum(xs) / 4.0, sum(ys) / 4.0
     elif fmt == "xyxy":
         bbox = item.get("bbox") if isinstance(item.get("bbox"), list) else item.get("box")
         bbox = bbox if isinstance(bbox, list) and len(bbox) >= 4 else None
@@ -270,8 +394,8 @@ def parse_detections(raw: Any, ref_res: tuple[int, int] | None = None) -> list[D
 
     Accepts the envelopes ``result`` / ``results`` / ``boxes`` / ``detections`` / ``data.*`` plus
     ``markers`` / ``aruco`` lists; items as SSCMA arrays ``[cx, cy, w, h, score, target(, track)]``
-    or dicts with ``format`` ``xywh_center`` / ``xyxy`` / ``xywh_top_left`` / ``corners``. Values
-    with ``cx|cy|w|h > 1.05`` are pixels and are divided by the payload ``width/height/resolution``,
+    or dicts with ``format`` ``xywh_center`` / ``xyxy`` / ``xywh_top_left`` / ``corners`` / ``obb`` / ``rbox``.
+    Values with ``cx|cy|w|h > 1.05`` are pixels and are divided by the payload ``width/height/resolution``,
     else by ``ref_res`` (usually the snapshot size); pixel items without a resolution are dropped.
     Scores are clamped to [0, 1]; boxes are clamped to the frame.
     """
@@ -288,10 +412,16 @@ def parse_detections(raw: Any, ref_res: tuple[int, int] | None = None) -> list[D
         ref_h = ref_h or _num(ref_res[1])
     has_ref = bool(ref_w and ref_h and ref_w > 0 and ref_h > 0)
 
+    raw_fmt = raw.get("format") if isinstance(raw, dict) else None
     out: list[Detection] = []
     for item in items:
         corners = _corners(item) if isinstance(item, dict) else None
-        box = _raw_box(item, corners)
+        obb_corners = _obb_corners(item) if isinstance(item, dict) else None
+        derived_obb = _obb_geometry(item, raw_fmt)
+        if obb_corners is None and derived_obb is not None:
+            obb_corners = derived_obb[0]
+
+        box = _raw_box(item, corners, raw_fmt=raw_fmt)
         if box is None:
             continue
         cx, cy, w, h, score, label, track = box
@@ -307,6 +437,12 @@ def parse_detections(raw: Any, ref_res: tuple[int, int] | None = None) -> list[D
         x1, y1 = clamp((cx + w / 2) / sx), clamp((cy + h / 2) / sy)
         if x1 - x0 <= 0.001 or y1 - y0 <= 0.001:
             continue
+
+        item_fmt = item.get("format") if isinstance(item, dict) else raw_fmt
+        angle_deg = _find_field(item, "angle_deg", _opt_angle_deg) if isinstance(item, dict) else None
+        if (angle_deg is None or item_fmt in ("obb", "rbox")) and derived_obb is not None:
+            angle_deg = derived_obb[1]
+
         out.append(
             Detection(
                 label=label,
@@ -315,15 +451,20 @@ def parse_detections(raw: Any, ref_res: tuple[int, int] | None = None) -> list[D
                 track_id=track,
                 center_norm=(clamp(cx / sx), clamp(cy / sy)),
                 corners_norm=[(u / sx, v / sy) for u, v in corners] if corners else None,
-                length_px=_find_field(item, "length_px", _opt_pos_float),
-                disp_fg=_find_field(item, "disp_fg", _opt_float),
-                disp_bg=_find_field(item, "disp_bg", _opt_float),
-                depth_conf=_find_field(item, "depth_conf", _opt_unit_float),
-                jaw_clear=_find_field(item, "jaw_clear", _opt_bool),
-                depth_m=_find_field(item, "depth_m", _opt_pos_float),
-                height_m=_find_field(item, "height_m", _opt_pos_float),
-                width_m=_find_field(item, "width_m", _opt_pos_float),
-                length_m=_find_field(item, "length_m", _opt_pos_float),
+                obb_corners_norm=[(u / sx, v / sy) for u, v in obb_corners] if obb_corners else None,
+                angle_deg=angle_deg,
+                angle_conf=_find_field(item, "angle_conf", _opt_unit_float) if isinstance(item, dict) else None,
+                grasp_width_px=_find_field(item, "grasp_width_px", _opt_pos_float) if isinstance(item, dict) else None,
+                mask_focus=_find_field(item, "mask_focus", _opt_bool) if isinstance(item, dict) else None,
+                length_px=_find_field(item, "length_px", _opt_pos_float) if isinstance(item, dict) else None,
+                disp_fg=_find_field(item, "disp_fg", _opt_float) if isinstance(item, dict) else None,
+                disp_bg=_find_field(item, "disp_bg", _opt_float) if isinstance(item, dict) else None,
+                depth_conf=_find_field(item, "depth_conf", _opt_unit_float) if isinstance(item, dict) else None,
+                jaw_clear=_find_field(item, "jaw_clear", _opt_bool) if isinstance(item, dict) else None,
+                depth_m=_find_field(item, "depth_m", _opt_pos_float) if isinstance(item, dict) else None,
+                height_m=_find_field(item, "height_m", _opt_pos_float) if isinstance(item, dict) else None,
+                width_m=_find_field(item, "width_m", _opt_pos_float) if isinstance(item, dict) else None,
+                length_m=_find_field(item, "length_m", _opt_pos_float) if isinstance(item, dict) else None,
             )
         )
     return out
