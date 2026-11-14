@@ -64,7 +64,7 @@ with Arm() as arm:  # $REBOT_HOST or 127.0.0.1; takes control, torque on
 | `move_joints(positions)` | 7 values in radians |
 | `poses()`, `save_pose(name)`, `delete_pose(name)`, `move_to_pose(name, speed_scale)` | capability `poses` |
 | `place(pose=None, position=None, rpy=None, approach_height_m=0.08, release=True, retreat=True, speed_scale=1.0)` | exactly one of `pose` / `position`; capability `place` |
-| `detect(label=None, pipelines=("yolo",), min_score=0.3)` | list of `Detection` |
+| `detect(label=None, pipelines=("yolo",), min_score=0.3)` | list of `Detection` (`label`, `score`, `box_norm`, `center_norm`, `angle_deg`, `angle_conf`, `grasp_width_px`, `obb_corners_norm`, `mask_focus`) |
 | `grasp(detection)` | `result.holding` is True when an object is held |
 | `grasp_dry_run(detection)` | `(reachable, code, message)` without moving or lease |
 | `grasp_any(label=None, min_score=0.3, max_candidates=5)` | detect, dry-run in order, grasp first reachable; raises `ActionFailed` |
