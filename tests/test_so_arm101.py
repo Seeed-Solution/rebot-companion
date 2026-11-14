@@ -26,7 +26,7 @@ from rebot import (
     ServoJumpError,
     TcpPose,
 )
-from rebot_companion.calibration import check_b601_compatibility, gripper_pose
+from rebot_companion.calibration import HandEyeResult, check_b601_compatibility, gripper_pose
 from rebot_companion.camera_client import MarkerDetection, ReCameraClient
 from rebot_companion.gripper_calib import main as gripper_calib_main
 from rebot_companion.ik import B601IkAdapter
@@ -586,3 +586,81 @@ def test_pipeline_refuses_b601_ik_on_non_b601_arm():
     assert res.success is False
     assert res.stage == "ik_solve"
     assert "Refusing local B601 IK" in res.error_message
+
+
+def test_pipeline_eye_in_hand_fails_closed_before_cam_to_base_on_so_arm101():
+    so_schema = ObservationSchema.from_dict({
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "profile_id": "so-arm101",
+        "limits": [],
+    })
+    arm = MagicMock(spec=ArmdClient)
+    arm.get_schema.return_value = so_schema
+    arm.get_observation.return_value = ArmStatus(
+        timestamp=1.0,
+        positions=[0.0] * 6,
+        velocities=[0.0] * 6,
+        torques=[0.0] * 6,
+        temperatures=[25.0] * 6,
+        is_torqued=True,
+        safety_state="Armed",
+        epoch_id=1,
+    )
+
+    camera = MagicMock(spec=ReCameraClient)
+    marker = Transform.from_translation_euler([0.2, 0.1, 0.3], 0.0, 0.0, 0.0)
+    camera.trigger.return_value = [MarkerDetection(id=0, center=[0, 0], corners=[], pose=marker, reprojection_error=0)]
+
+    hand_eye = MagicMock(spec=HandEyeResult)
+    hand_eye.is_eye_in_hand = True
+    hand_eye.setup = "eye_in_hand"
+
+    pipeline = DeterministicPickPlacePipeline(
+        camera,
+        arm,
+        hand_eye,
+        PipelineConfig(max_allowed_distance=1.0),
+    )
+    res = pipeline.run_cycle()
+    assert res.success is False
+    assert res.stage == "frame_transform"
+    assert "Camera pose unavailable: Local B601 kinematics cannot be used for arm with profile_id 'so-arm101'" in res.error_message
+    hand_eye.cam_to_base.assert_not_called()
+
+
+def test_pipeline_fails_closed_when_get_schema_fails():
+    arm = MagicMock(spec=ArmdClient)
+    arm.get_schema.side_effect = Exception("schema network timeout")
+    arm.get_observation.return_value = ArmStatus(
+        timestamp=1.0,
+        positions=[0.0] * 6,
+        velocities=[0.0] * 6,
+        torques=[0.0] * 6,
+        temperatures=[25.0] * 6,
+        is_torqued=True,
+        safety_state="Armed",
+        epoch_id=1,
+    )
+    camera = MagicMock(spec=ReCameraClient)
+    marker = Transform.from_translation_euler([0.2, 0.1, 0.3], 0.0, 0.0, 0.0)
+    camera.trigger.return_value = [MarkerDetection(id=0, center=[0, 0], corners=[], pose=marker, reprojection_error=0)]
+
+    # 1. eye_in_hand -> stage "frame_transform"
+    hand_eye = MagicMock(spec=HandEyeResult)
+    hand_eye.is_eye_in_hand = True
+    hand_eye.setup = "eye_in_hand"
+    pipeline_eih = DeterministicPickPlacePipeline(camera, arm, hand_eye, PipelineConfig(max_allowed_distance=1.0))
+    res_eih = pipeline_eih.run_cycle()
+    assert res_eih.success is False and res_eih.stage == "frame_transform"
+    assert "schema network timeout" in res_eih.error_message
+    hand_eye.cam_to_base.assert_not_called()
+
+    # 2. is_b601_ik -> stage "ik_solve"
+    pipeline_ik = DeterministicPickPlacePipeline(
+        camera, arm, Transform(), PipelineConfig(max_allowed_distance=1.0), ik_solver=B601IkAdapter()
+    )
+    res_ik = pipeline_ik.run_cycle()
+    assert res_ik.success is False and res_ik.stage == "ik_solve"
+    assert "schema network timeout" in res_ik.error_message

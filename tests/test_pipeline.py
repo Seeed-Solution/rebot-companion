@@ -4,7 +4,14 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 
-from rebot.client import ArmCommandRejected, ArmdClient, ArmSession, ArmStatus, SafeExitOutcome
+from rebot.client import (
+    ArmCommandRejected,
+    ArmdClient,
+    ArmSession,
+    ArmStatus,
+    ObservationSchema,
+    SafeExitOutcome,
+)
 from rebot_companion import kinematics as K
 from rebot_companion.calibration import HandEyeResult
 from rebot_companion.camera_client import MarkerDetection, ReCameraClient
@@ -236,8 +243,21 @@ def test_ik_adapter_returns_full_armd_vector():
         ik(Transform.from_rot_trans(np.eye(3), [2.0, 0.0, 0.1]))
 
 
+B601_SCHEMA = ObservationSchema.from_dict({
+    "dof": 7,
+    "arm_dof": 6,
+    "gripper_joint": 6,
+    "profile_id": "rebot-b601dm",
+    "limits": [
+        {"name": f"j{i}", "min_position": -3.14, "max_position": 3.14, "max_velocity": 2.0, "max_acceleration": 5.0}
+        for i in range(7)
+    ],
+})
+
+
 def test_pipeline_with_ik_adapter_moves_seven_joint_targets():
     arm = MagicMock(spec=ArmdClient)
+    arm.get_schema.return_value = B601_SCHEMA
     arm.get_observation.return_value = status("Armed", torqued=True, positions=HOME7)
     session = session_mock("Armed", positions=HOME7)
     marker = Transform.from_translation_euler([0.3, 0.05, 0.4], 0.0, 0.0, 0.0)
@@ -262,6 +282,7 @@ Q_DET = [0.3, 0.4, -0.5, 0.2, 0.0, 1.5707963, 0.0]
 
 def test_eye_in_hand_uses_arm_pose_at_detection():
     arm = MagicMock(spec=ArmdClient)
+    arm.get_schema.return_value = B601_SCHEMA
     arm.get_observation.return_value = status("Armed", torqued=True, positions=Q_DET)
     camera = marker_scene()
     res = DeterministicPickPlacePipeline(
@@ -277,6 +298,7 @@ def test_eye_in_hand_uses_arm_pose_at_detection():
 
 def test_eye_in_hand_rejects_arm_motion_during_detection():
     arm = MagicMock(spec=ArmdClient)
+    arm.get_schema.return_value = B601_SCHEMA
     moved = list(Q_DET)
     moved[0] += 0.05
     arm.get_observation.side_effect = [status("Armed", True, Q_DET), status("Armed", True, moved)]

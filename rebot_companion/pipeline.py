@@ -11,7 +11,7 @@ import numpy as np
 from rebot.client import ArmCommandRejected, ArmdClient, ArmdError, ArmSession, ObservationSchema, SafeExitOutcome
 
 from . import kinematics
-from .calibration import HandEyeResult
+from .calibration import HandEyeResult, check_b601_compatibility
 from .camera_client import CameraTriggerTimeout, MarkerDetection, ReCameraClient
 from .ik import GRIPPER_CLOSED, GRIPPER_OPEN, B601IkAdapter
 from .transforms import Transform
@@ -155,6 +155,38 @@ class DeterministicPickPlacePipeline:
 
         # Step 3: Coordinate frame transformation (Camera Frame -> Arm Base Frame)
         # T_marker_in_base = T_cam_to_base @ T_marker_in_cam
+        is_b601_ik = isinstance(self.ik_solver, B601IkAdapter)
+
+        schema = None
+        if eye_in_hand or is_b601_ik:
+            try:
+                get_schema = getattr(self.arm, "get_schema", None)
+                if not callable(get_schema):
+                    raise ValueError("arm client does not provide get_schema()")
+                sch = get_schema()
+                if not (isinstance(sch, ObservationSchema) or (hasattr(sch, "dof") and isinstance(sch.dof, int))):
+                    raise ValueError(f"invalid schema returned by get_schema(): {sch!r}")
+                check_b601_compatibility(sch)
+                schema = sch
+            except Exception as e:
+                stage = "frame_transform" if eye_in_hand else "ik_solve"
+                return PipelineResult(
+                    success=False,
+                    stage=stage,
+                    error_message=f"Refusing local B601 IK on incompatible arm: {e}"
+                    if not eye_in_hand
+                    else f"Camera pose unavailable: {e}",
+                )
+        else:
+            try:
+                get_schema = getattr(self.arm, "get_schema", None)
+                if callable(get_schema):
+                    sch = get_schema()
+                    if isinstance(sch, ObservationSchema) or (hasattr(sch, "dof") and isinstance(sch.dof, int)):
+                        schema = sch
+            except Exception:
+                pass
+
         try:
             if eye_in_hand:
                 after = self.arm.get_observation()
@@ -169,7 +201,11 @@ class DeterministicPickPlacePipeline:
                         error_message=f"Arm moved during eye_in_hand detection (max joint change {drift:.4f} rad)",
                     )
             cam_to_base = self.hand_eye.cam_to_base(
-                arm_status.positions, cfg.kinematics_sign, cfg.kinematics_offset, cfg.kinematics_joint_map
+                arm_status.positions,
+                cfg.kinematics_sign,
+                cfg.kinematics_offset,
+                cfg.kinematics_joint_map,
+                schema=schema,
             )
         except Exception as e:
             return PipelineResult(success=False, stage="frame_transform", error_message=f"Camera pose unavailable: {e}")
@@ -200,34 +236,6 @@ class DeterministicPickPlacePipeline:
                 elapsed_ms=(time.perf_counter() - t0) * 1000.0,
                 error_message="No IK solver configured: target computed and checked, arm not moved",
             )
-
-        schema = None
-        try:
-            sch = self.arm.get_schema()
-            if isinstance(sch, ObservationSchema) or (hasattr(sch, "dof") and isinstance(sch.dof, int)):
-                schema = sch
-        except Exception:
-            pass
-
-        if schema is not None:
-            profile_id = getattr(schema, "profile_id", None)
-            arm_dof = getattr(schema, "arm_dof", None)
-            is_b601_ik = isinstance(self.ik_solver, B601IkAdapter) or (
-                hasattr(self.ik_solver, "__module__") and "ik" in getattr(self.ik_solver, "__module__", "")
-            )
-            if is_b601_ik:
-                if (isinstance(profile_id, str) and "b601" not in profile_id.lower()) or (
-                    isinstance(arm_dof, int) and arm_dof != 6
-                ):
-                    return PipelineResult(
-                        success=False,
-                        stage="ik_solve",
-                        target_pose_base=target_in_base,
-                        error_message=(
-                            f"Refusing local B601 IK on incompatible arm (profile_id={profile_id!r}, "
-                            f"arm_dof={arm_dof})"
-                        ),
-                    )
 
         warnings: list[str] = []
         # Solve every waypoint before moving so an unreachable pose aborts with the arm still.

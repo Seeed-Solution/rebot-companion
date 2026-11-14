@@ -58,12 +58,37 @@ def _resolve_gripper_bounds(
     return c, o
 
 
+def _as_finite_float(val: Any) -> float | None:
+    if val is None:
+        return None
+    try:
+        f = float(val)
+        return f if math.isfinite(f) else None
+    except (ValueError, TypeError):
+        return None
+
+
+def resolve_schema_gripper_bounds(
+    gripper_policy: dict[str, Any] | None,
+    limits: Sequence[Any] | None,
+    gripper_joint: int | None,
+) -> tuple[float, float]:
+    """Resolve (closed_rad, open_rad) bounds from schema gripper_policy and limits."""
+    closed_rad: float | None = None
+    open_rad: float | None = None
+    if isinstance(gripper_policy, dict):
+        closed_rad = _as_finite_float(gripper_policy.get("closed_rad"))
+        open_rad = _as_finite_float(gripper_policy.get("open_rad"))
+    return _resolve_gripper_bounds(limits, gripper_joint, closed_rad, open_rad)
+
+
 def resolve_unit_mode(requested: str, info_meta: dict[str, Any] | None = None) -> str:
     """Resolve unit mode from user requested string and optional dataset/policy metadata.
 
     When ``requested == "auto"``:
     - Inspects ``info_meta`` for ``unit_mode`` or ``rebot_unit_mode``.
-    - Checks heuristic range on ``stats`` / ``observation.state`` if available.
+    - Checks heuristic range on ``stats`` (both ``observation.state`` and ``action``).
+      If non-radian values are present without explicit metadata, raises ``ValueError``.
     - Defaults to ``"rad"``.
     """
     if requested != "auto":
@@ -72,27 +97,41 @@ def resolve_unit_mode(requested: str, info_meta: dict[str, Any] | None = None) -
         return requested
 
     if isinstance(info_meta, dict):
-        mode = info_meta.get("unit_mode") or info_meta.get("rebot_unit_mode")
-        if mode in SUPPORTED_UNIT_MODES:
-            return str(mode)
-        # Heuristic check on stats
+        raw_mode = info_meta.get("unit_mode") or info_meta.get("rebot_unit_mode")
+        if raw_mode is not None:
+            mode_str = str(raw_mode).strip()
+            if mode_str:
+                if mode_str in SUPPORTED_UNIT_MODES:
+                    return mode_str
+                raise ValueError(f"unsupported unit mode {mode_str!r} in metadata; choose from {SUPPORTED_UNIT_MODES}")
+
         stats = info_meta.get("stats")
         if isinstance(stats, dict):
-            state_stats = stats.get("observation.state")
-            if isinstance(state_stats, dict):
-                max_vals = state_stats.get("max")
-                min_vals = state_stats.get("min")
-                if max_vals is not None and min_vals is not None:
-                    try:
-                        max_arr = [float(v) for v in max_vals]
-                        min_arr = [float(v) for v in min_vals]
-                        combined = max_arr + min_arr
-                        if any(abs(v) > 100.0 for v in combined):
-                            return "deg"
-                        if any(v > 10.0 for v in max_arr) or any(v < -10.0 for v in min_arr):
-                            return "so101_norm"
-                    except (ValueError, TypeError):
-                        pass
+            threshold = 2 * math.pi + 0.25
+            for key in ("observation.state", "action"):
+                sub_stats = stats.get(key)
+                if isinstance(sub_stats, dict):
+                    for bound_key in ("min", "max"):
+                        raw_vals = sub_stats.get(bound_key)
+                        if raw_vals is None:
+                            continue
+                        if isinstance(raw_vals, (list, tuple)) or (
+                            hasattr(raw_vals, "__iter__") and not isinstance(raw_vals, (str, bytes, dict))
+                        ):
+                            items = raw_vals
+                        else:
+                            items = [raw_vals]
+                        for v in items:
+                            try:
+                                fv = float(v)
+                                if math.isfinite(fv) and abs(fv) > threshold:
+                                    raise ValueError(
+                                        "cannot infer unit mode 'auto' from non-radian stats without 'unit_mode' "
+                                        "in metadata; pass --action-units / --state-units explicitly ('so101_norm' or 'deg')"
+                                    )
+                            except (TypeError, ValueError) as exc:
+                                if "cannot infer unit mode" in str(exc):
+                                    raise
 
     return "rad"
 

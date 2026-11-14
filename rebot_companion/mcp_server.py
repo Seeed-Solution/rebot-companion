@@ -291,7 +291,7 @@ class Controller:
             except Exception as exc:
                 log.warning("observation schema unavailable: %s", exc)
                 dof = len(self.observation().positions) if self.observation() else 7
-                self._schema = ObservationSchema.from_dict({"dof": dof})
+                return ObservationSchema.from_dict({"dof": dof})
         return self._schema
 
     def gripper_joint(self) -> int | None:

@@ -393,35 +393,49 @@ def pretrained_info(path: str | Path) -> dict | None:
                 log.warning("failed to read %s: %s", p_cfg, exc)
 
     roots: list[Path] = []
+    if local.is_dir():
+        roots.append(local)
     if cfg is not None:
         try:
-            roots = _resolve_dataset_roots(cfg, cfg_file)
+            roots.extend(_resolve_dataset_roots(cfg, cfg_file))
         except Exception as exc:
             log.warning("failed to resolve dataset roots for %s: %s", path, exc)
 
     info_dict: dict | None = None
     info_path: Path | None = None
     for root in roots:
-        info_file = root / "meta" / "info.json"
-        if info_file.is_file():
-            try:
-                data = json.loads(info_file.read_text())
-                if isinstance(data, dict):
-                    info_dict = data
-                    info_path = info_file
-                    break
-            except Exception as exc:
-                log.warning("failed to read %s: %s", info_file, exc)
+        candidates = [root / "meta" / "info.json", root / "info.json"]
+        found = False
+        for info_file in candidates:
+            if info_file.is_file():
+                try:
+                    data = json.loads(info_file.read_text())
+                    if isinstance(data, dict):
+                        info_dict = data
+                        info_path = info_file
+                        found = True
+                        break
+                except Exception as exc:
+                    log.warning("failed to read %s: %s", info_file, exc)
+        if found:
+            break
 
-    if info_dict is not None and "stats" not in info_dict and info_path is not None:
-        stats_file = info_path.parent / "stats.json"
-        if stats_file.is_file():
-            try:
-                stats_data = json.loads(stats_file.read_text())
-                if isinstance(stats_data, dict):
-                    info_dict["stats"] = stats_data
-            except Exception as exc:
-                log.warning("failed to read %s: %s", stats_file, exc)
+    if info_dict is not None and "stats" not in info_dict:
+        stats_candidates: list[Path] = []
+        if info_path is not None:
+            stats_candidates.append(info_path.parent / "stats.json")
+        if local.is_dir():
+            stats_candidates.append(local / "meta" / "stats.json")
+            stats_candidates.append(local / "stats.json")
+        for stats_file in stats_candidates:
+            if stats_file.is_file():
+                try:
+                    stats_data = json.loads(stats_file.read_text())
+                    if isinstance(stats_data, dict):
+                        info_dict["stats"] = stats_data
+                        break
+                except Exception as exc:
+                    log.warning("failed to read %s: %s", stats_file, exc)
 
     cfg_unit_mode = None
     candidates = [cfg]
@@ -814,17 +828,22 @@ class PolicyRunner:
         self.schema = schema
         self.dof = schema.dof
         self.gripper_joint = schema.gripper_joint
-        if schema.gripper_policy:
-            if "closed_rad" in schema.gripper_policy:
-                self.closed_rad = float(schema.gripper_policy["closed_rad"])
-            if "open_rad" in schema.gripper_policy:
-                self.open_rad = float(schema.gripper_policy["open_rad"])
-        elif self.gripper_joint == 6:
-            self.closed_rad = 0.0
-            self.open_rad = -5.7
-        else:
-            self.closed_rad = 0.0
-            self.open_rad = 1.5
+
+        try:
+            limits = [
+                (float(lim["min_position"]), float(lim["max_position"])) for lim in raw_schema.get("limits") or []
+            ]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RunnerError(f"armd schema joint limits are malformed: {exc}") from exc
+        if len(limits) != self.dof or not all(
+            math.isfinite(lo) and math.isfinite(hi) and hi - lo > 2 * LIMIT_MARGIN for lo, hi in limits
+        ):
+            raise RunnerError(f"armd schema joint limits are unusable (need {self.dof} finite min < max): {limits}")
+        self.limits = limits
+
+        self.closed_rad, self.open_rad = units.resolve_schema_gripper_bounds(
+            schema.gripper_policy, limits, self.gripper_joint
+        )
 
         lead = raw_schema.get("servo_max_lead_rad")
         self.lead = float(lead) if isinstance(lead, (int, float)) and lead > 0 else DEFAULT_LEAD_RAD
@@ -846,18 +865,6 @@ class PolicyRunner:
 
         if isinstance(self.policy, SinePolicy) and self.policy.joint >= self.dof:
             raise RunnerError(f"sine policy joint index {self.policy.joint + 1} exceeds arm DOF {self.dof}")
-
-        try:
-            limits = [
-                (float(lim["min_position"]), float(lim["max_position"])) for lim in raw_schema.get("limits") or []
-            ]
-        except (KeyError, TypeError, ValueError) as exc:
-            raise RunnerError(f"armd schema joint limits are malformed: {exc}") from exc
-        if len(limits) != self.dof or not all(
-            math.isfinite(lo) and math.isfinite(hi) and hi - lo > 2 * LIMIT_MARGIN for lo, hi in limits
-        ):
-            raise RunnerError(f"armd schema joint limits are unusable (need {self.dof} finite min < max): {limits}")
-        self.limits = limits
 
         policy_info = getattr(self.policy, "info", None)
         self.action_units = units.resolve_unit_mode(self.action_units_requested, policy_info)

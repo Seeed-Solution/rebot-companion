@@ -911,10 +911,10 @@ class ArmSession:
             return self._gripper_joint  # type: ignore[return-value]
         try:
             self._gripper_joint = self.schema().gripper_joint
+            return self._gripper_joint  # type: ignore[return-value]
         except Exception:
             obs = self.latest_observation()
-            self._gripper_joint = 6 if obs is not None and len(obs.positions) == 7 else None
-        return self._gripper_joint  # type: ignore[return-value]
+            return 6 if obs is not None and len(obs.positions) == 7 else None
 
     # ---- background threads --------------------------------------------------
 

@@ -28,12 +28,14 @@ from typing import Any
 from rebot._http import host_url
 from rebot.client import ArmdClient, ArmSession, ObservationSchema
 from rebot.errors import ArmConnectionError, LeaseError, RebotError, ServoRejected
+from rebot_companion import units
 
 log = logging.getLogger("rebot_companion.leader_teleop")
 
 DEFAULT_FPS = 50
 DEFAULT_BAUD = 1000000
 DEFAULT_MAX_GAP_RAD = 0.5
+HARD_MAX_GAP_RAD = math.pi
 DEFAULT_RAMP_SECONDS = 2.0
 ARMD_PORT = 8765
 TICKS_PER_REV = 4096
@@ -45,7 +47,8 @@ HEADER = b"\xff\xff"
 INST_PING = 0x01
 INST_READ = 0x02
 INST_WRITE = 0x03
-INST_SYNC_READ = 0x83
+INST_SYNC_READ = 0x82
+INST_SYNC_WRITE = 0x83
 
 REG_TORQUE_ENABLE = 40
 REG_PRESENT_POSITION = 56
@@ -81,6 +84,8 @@ def decode_packet(buffer: bytes) -> tuple[int | None, int | None, bytes | None, 
         return None, None, None, buffer[idx:]
 
     length = buffer[idx + 3]
+    if length < 2:
+        return None, None, None, buffer[idx + 2 :]
     total_len = 4 + length
     if len(buffer) < idx + total_len:
         return None, None, None, buffer[idx:]
@@ -187,7 +192,25 @@ class PosixSerialTransport(LeaderTransport):
             )
 
     def write(self, data: bytes) -> None:
-        os.write(self.fd, data)
+        view = memoryview(data)
+        total = len(view)
+        written = 0
+        deadline = time.monotonic() + 1.0
+        while written < total:
+            _, w, _ = select.select([], [self.fd], [], 0.1)
+            if not w:
+                if time.monotonic() > deadline:
+                    raise LeaderError(f"write timeout on serial port {self.port} ({written}/{total} bytes written)")
+                continue
+            try:
+                n = os.write(self.fd, view[written:])
+                if n <= 0:
+                    raise LeaderError(f"write EOF on serial port {self.port}")
+                written += n
+            except BlockingIOError:
+                continue
+            except OSError as exc:
+                raise LeaderError(f"write failed on serial port {self.port}: {exc}") from exc
 
     def read(self, n: int, timeout: float = 0.05) -> bytes:
         out = bytearray()
@@ -341,6 +364,43 @@ class GripperCalib:
     open_tick: int = 3072
 
 
+def _parse_joint_calib(entry: dict, name: str) -> JointCalib:
+    if not isinstance(entry, dict):
+        raise LeaderError(f"{name}: joint calibration entry must be a dict, got {type(entry).__name__}")
+
+    if "center" not in entry:
+        if "homing_offset" in entry:
+            raise LeaderError(
+                f"{name}: raw EEPROM 'homing_offset' without 'center' tick cannot be calibrated; specify 'center'"
+            )
+        center = DEFAULT_CENTER_TICK
+    else:
+        try:
+            center = int(entry["center"])
+        except (ValueError, TypeError) as exc:
+            raise LeaderError(f"{name}: invalid 'center' tick {entry.get('center')!r}") from exc
+
+    if "sign" in entry:
+        try:
+            sign = int(entry["sign"])
+        except (ValueError, TypeError) as exc:
+            raise LeaderError(f"{name}: invalid 'sign' {entry.get('sign')!r}") from exc
+        if sign not in (-1, 1):
+            raise LeaderError(f"{name}: 'sign' must be 1 or -1, got {sign}")
+    elif "drive_mode" in entry:
+        dm = entry["drive_mode"]
+        if dm in (0, False):
+            sign = 1
+        elif dm in (1, True):
+            sign = -1
+        else:
+            raise LeaderError(f"{name}: invalid 'drive_mode' {dm!r}; must be 0 (normal) or 1 (inverted)")
+    else:
+        sign = 1
+
+    return JointCalib(center=center, sign=sign)
+
+
 class LeaderCalibration:
     """Converts 6-DOF leader raw ticks to follower radians."""
 
@@ -350,8 +410,23 @@ class LeaderCalibration:
         gripper: GripperCalib | None = None,
         servo_ids: Sequence[int] = (1, 2, 3, 4, 5, 6),
     ) -> None:
-        self.servo_ids = list(servo_ids)
+        self.servo_ids = [int(s) for s in servo_ids]
+        if len(self.servo_ids) != 6:
+            raise LeaderError(f"servo_ids must contain exactly 6 servo IDs, got {len(self.servo_ids)}")
+        if len(set(self.servo_ids)) != 6 or any(not (1 <= s <= 253) for s in self.servo_ids):
+            raise LeaderError(f"servo_ids must be 6 unique integers between 1 and 253, got {self.servo_ids}")
+
         self.joints = list(joints or [JointCalib() for _ in range(5)])
+        if len(self.joints) != 5:
+            raise LeaderError(f"joints must contain exactly 5 joint calibrations, got {len(self.joints)}")
+        for i, j in enumerate(self.joints):
+            if not isinstance(j, JointCalib):
+                raise LeaderError(f"joint {i + 1} must be a JointCalib instance, got {type(j)}")
+            if j.sign not in (-1, 1):
+                raise LeaderError(f"joint {i + 1} sign must be -1 or 1, got {j.sign}")
+            if not (0 <= j.center < TICKS_PER_REV):
+                raise LeaderError(f"joint {i + 1} center must be in [0, {TICKS_PER_REV}), got {j.center}")
+
         self.gripper = gripper or GripperCalib()
 
     @classmethod
@@ -376,19 +451,18 @@ class LeaderCalibration:
                     raise LeaderError(f"calibration file {p} is not valid JSON or YAML: {exc}") from exc
 
         joints: list[JointCalib] = []
-        if "joints" in d and isinstance(d["joints"], list):
-            for j in d["joints"]:
-                c = int(j.get("center", j.get("homing_offset", DEFAULT_CENTER_TICK)))
-                s = int(j.get("sign", j.get("drive_mode", 1)))
-                joints.append(JointCalib(center=c, sign=s))
+        if "joints" in d:
+            if not isinstance(d["joints"], list):
+                raise LeaderError("'joints' must be a list of 5 joint calibrations")
+            if len(d["joints"]) != 5:
+                raise LeaderError(f"'joints' list must contain exactly 5 joints, got {len(d['joints'])}")
+            joints = [_parse_joint_calib(j, f"joint_{i + 1}") for i, j in enumerate(d["joints"])]
         else:
             for i in range(5):
                 name = f"joint_{i + 1}"
                 if name in d:
                     entry = d[name]
-                    c = int(entry.get("center", entry.get("homing_offset", DEFAULT_CENTER_TICK)))
-                    s = int(entry.get("sign", entry.get("drive_mode", 1)))
-                    joints.append(JointCalib(center=c, sign=s))
+                    joints.append(_parse_joint_calib(entry, name))
                 else:
                     joints.append(JointCalib())
 
@@ -463,6 +537,13 @@ class LeaderTeleopBridge:
         operator_present: bool = False,
         park_on_exit: bool = True,
     ) -> None:
+        if not (isinstance(fps, (int, float)) and fps > 0):
+            raise LeaderError(f"fps must be positive, got {fps!r}")
+        if not (isinstance(max_gap_rad, (int, float)) and math.isfinite(max_gap_rad) and max_gap_rad > 0):
+            raise LeaderError(f"max_gap_rad must be positive and finite, got {max_gap_rad!r}")
+        if not (isinstance(ramp_seconds, (int, float)) and math.isfinite(ramp_seconds) and ramp_seconds >= 0.2):
+            raise LeaderError(f"ramp_seconds must be >= 0.2, got {ramp_seconds!r}")
+
         self.bus = bus
         self.session = session
         self.schema = schema
@@ -476,15 +557,65 @@ class LeaderTeleopBridge:
         self.limits: list[tuple[float, float]] = [
             (float(lim.min_position), float(lim.max_position)) for lim in schema.limits
         ]
-        self.closed_rad = 0.0
-        self.open_rad = 1.5
-        policy = schema.gripper_policy or {}
-        if "closed_rad" in policy and "open_rad" in policy:
-            self.closed_rad = float(policy["closed_rad"])
-            self.open_rad = float(policy["open_rad"])
+        self.gripper_joint = schema.gripper_joint
+        self.closed_rad, self.open_rad = units.resolve_schema_gripper_bounds(
+            schema.gripper_policy, self.limits, self.gripper_joint
+        )
 
         self._stop = False
+        self._activated = False
         self.frames_sent = 0
+
+        self._last_obs_timestamp: float | None = None
+        self._last_obs_frames: int | None = None
+        self._last_obs_time: float = time.monotonic()
+
+    def _check_follower_healthy(self, obs: Any, *, require_torqued: bool = True) -> None:
+        if obs is None:
+            raise LeaderError("no observation received from follower")
+        if getattr(obs, "is_stopped", False) or getattr(obs, "safety_state", None) in ("EStop", "Fault"):
+            state = getattr(obs, "safety_state", "Fault")
+            reason = getattr(obs, "fault_code", None) or getattr(obs, "fault_reason", None)
+            raise LeaderError(
+                f"follower is in {state} ({reason}); check it and clear the fault in the cockpit"
+            )
+        collision = getattr(obs, "collision", None)
+        if collision and collision.get("active"):
+            raise LeaderError("follower collision hold active; wait until it resumes")
+        ml = getattr(obs, "motion_limit", None)
+        if ml and ml.get("reason") in ("blocked", "torque"):
+            raise LeaderError(f"follower motion limit active: {ml.get('reason')} on joint {ml.get('joint')}")
+        if require_torqued:
+            is_torqued = getattr(obs, "is_torqued", False)
+            is_operational = getattr(obs, "is_operational", False)
+            if not is_torqued or not is_operational:
+                raise LeaderError(
+                    f"follower is not torqued/operational (state {getattr(obs, 'safety_state', 'Unknown')}, "
+                    f"torque {'on' if is_torqued else 'off'})"
+                )
+        lease_lost = getattr(self.session, "lease_lost", None)
+        if isinstance(lease_lost, dict):
+            raise LeaderError(f"follower lease lost: {lease_lost}")
+
+        now = time.monotonic()
+        ts = getattr(obs, "timestamp", None)
+        frames = getattr(self.session, "_frames", None)
+        if self._last_obs_timestamp is None:
+            self._last_obs_timestamp = ts
+            self._last_obs_frames = frames
+            self._last_obs_time = now
+        elif (ts is not None and ts != self._last_obs_timestamp) or (
+            frames is not None and frames != self._last_obs_frames
+        ):
+            self._last_obs_timestamp = ts
+            self._last_obs_frames = frames
+            self._last_obs_time = now
+        else:
+            stale_threshold = max(0.5, 5.0 / self.fps)
+            if (now - self._last_obs_time) > stale_threshold:
+                raise LeaderError(
+                    f"follower telemetry is stale (unchanged for {now - self._last_obs_time:.2f}s > {stale_threshold:.2f}s)"
+                )
 
     def stop(self) -> None:
         self._stop = True
@@ -503,16 +634,16 @@ class LeaderTeleopBridge:
 
     def align_and_ramp(self) -> None:
         """Verify alignment against the follower arm and perform a smooth quintic ramp-in."""
-        obs = self.session.wait_for_observation(timeout=5.0)
-        if obs.is_stopped:
+        if self.schema.dof != 6 or self.schema.arm_dof != 5:
             raise LeaderError(
-                f"follower is in {obs.safety_state} ({obs.fault_code or obs.fault_reason}); "
-                "check it and clear the fault in the cockpit"
+                f"expected 6 DOF for SO-ARM101 (schema.dof={self.schema.dof}, "
+                f"schema.arm_dof={self.schema.arm_dof})"
             )
-        if obs.collision and obs.collision.get("active"):
-            raise LeaderError("follower collision hold active; wait until it resumes")
 
-        if self.schema.dof != 6 or self.schema.arm_dof != 5 or len(obs.positions) != 6:
+        obs = self.session.wait_for_observation(timeout=5.0)
+        self._check_follower_healthy(obs, require_torqued=False)
+
+        if len(obs.positions) != 6:
             raise LeaderError(
                 f"expected 6 DOF for SO-ARM101 (schema.dof={self.schema.dof}, "
                 f"schema.arm_dof={self.schema.arm_dof}, follower_positions={len(obs.positions)})"
@@ -527,11 +658,18 @@ class LeaderTeleopBridge:
 
         gap = max(abs(ldr - flw) for ldr, flw in zip(leader_target, follower_start))
         log.info("initial alignment gap: %.3f rad (threshold: %.3f rad)", gap, self.max_gap_rad)
+        if gap > HARD_MAX_GAP_RAD:
+            raise LeaderError(
+                f"initial alignment gap {gap:.3f} rad exceeds hard limit {HARD_MAX_GAP_RAD:.3f} rad (pi); "
+                "re-align leader arm before proceeding"
+            )
         if gap > self.max_gap_rad and not self.operator_present:
             raise LeaderError(
                 f"alignment gap {gap:.3f} rad exceeds --max-gap-rad {self.max_gap_rad:.3f}; "
                 "align the leader arm with the follower or pass --i-am-at-the-arm"
             )
+
+        self._activated = True
 
         if not obs.is_torqued or not obs.is_operational:
             log.info("enabling follower torque before ramp ...")
@@ -542,17 +680,10 @@ class LeaderTeleopBridge:
                 if time.monotonic() >= deadline:
                     raise LeaderError("timed out waiting for follower to enable torque and become operational")
                 obs = self.session.wait_for_observation(timeout=min(1.0, rem))
-                if obs.is_stopped:
-                    raise LeaderError(
-                        f"follower is in {obs.safety_state} ({obs.fault_code or obs.fault_reason}); "
-                        "check it and clear the fault in the cockpit"
-                    )
+                self._check_follower_healthy(obs, require_torqued=False)
             if len(obs.positions) != 6:
                 raise LeaderError(f"expected 6 follower positions after enabling torque, got {len(obs.positions)}")
             follower_start = list(obs.positions)
-
-        if self.ramp_seconds <= 0.0:
-            return
 
         ramp_steps = max(1, int(round(self.ramp_seconds * self.fps)))
         period = 1.0 / self.fps
@@ -561,6 +692,8 @@ class LeaderTeleopBridge:
             if self._stop:
                 break
             due = t0 + step * period
+            cur_obs = self.session.latest_observation() or obs
+            self._check_follower_healthy(cur_obs, require_torqued=True)
             s = step / ramp_steps
             # Quintic polynomial: 10s^3 - 15s^4 + 6s^5 (smooth acceleration & deceleration)
             alpha = 10.0 * (s**3) - 15.0 * (s**4) + 6.0 * (s**5)
@@ -586,20 +719,9 @@ class LeaderTeleopBridge:
             if due > now:
                 time.sleep(due - now)
 
-            # Check telemetry / safety
-            obs = self.session.latest_observation()
-            if obs:
-                if obs.safety_state == "EStop":
-                    log.error("follower latched E-stop")
-                    break
-                if obs.safety_state == "Fault":
-                    log.error("follower latched Fault: %s", obs.fault_code or obs.fault_reason)
-                    break
-                if obs.collision and obs.collision.get("active"):
-                    log.warning("follower collision hold active")
-                    break
-
             try:
+                obs = self.session.latest_observation()
+                self._check_follower_healthy(obs, require_torqued=True)
                 target = self.read_leader_target()
                 self.session.servo(target)
                 self.frames_sent += 1
@@ -611,7 +733,7 @@ class LeaderTeleopBridge:
     def close(self) -> None:
         """Clean shutdown: park and release lease."""
         try:
-            if self.park_on_exit:
+            if self.park_on_exit and self._activated:
                 log.info("parking follower arm ...")
                 self.session.unload(wait=True, timeout=15.0)
         except Exception as exc:
@@ -664,53 +786,78 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"rebot-teleop-leader: failed to open {port}: {exc}", file=sys.stderr)
         return 1
 
-    bus = FeetechSerialBus(transport)
-    client = ArmdClient(host_url("http", args.arm_host, ARMD_PORT))
+    session: ArmSession | None = None
+    bridge: LeaderTeleopBridge | None = None
+    bus: FeetechSerialBus | None = None
     try:
-        schema = client.get_schema()
-    except Exception as exc:
-        print(f"rebot-teleop-leader: failed to fetch armd schema: {exc}", file=sys.stderr)
-        transport.close()
-        return 1
+        bus = FeetechSerialBus(transport)
+        client = ArmdClient(host_url("http", args.arm_host, ARMD_PORT))
+        try:
+            schema = client.get_schema()
+        except Exception as exc:
+            print(f"rebot-teleop-leader: failed to fetch armd schema: {exc}", file=sys.stderr)
+            return 1
 
-    if schema.dof != 6 or schema.arm_dof != 5:
-        print(
-            f"rebot-teleop-leader: unsupported arm schema (dof={schema.dof}, arm_dof={schema.arm_dof}); "
-            "expected 6 DOF (5 arm + 1 gripper) for SO-ARM101",
-            file=sys.stderr,
+        if schema.dof != 6 or schema.arm_dof != 5:
+            print(
+                f"rebot-teleop-leader: unsupported arm schema (dof={schema.dof}, arm_dof={schema.arm_dof}); "
+                "expected 6 DOF (5 arm + 1 gripper) for SO-ARM101",
+                file=sys.stderr,
+            )
+            return 1
+
+        follower = None
+        try:
+            describe = client.get_safety_describe()
+            if isinstance(describe, dict):
+                device_info = describe.get("device")
+                if isinstance(device_info, dict):
+                    follower = device_info.get("follower")
+        except Exception as exc:
+            log.info("safety describe unavailable: %s", exc)
+
+        if follower not in ("mock", "sim") and not args.i_am_at_the_arm:
+            print(
+                f"rebot-teleop-leader: follower is {follower or 'unknown'} (not mock/sim): "
+                "leader teleop will move a real arm. Stand at the arm with a way to cut power and pass --i-am-at-the-arm.",
+                file=sys.stderr,
+            )
+            return 1
+
+        calib = LeaderCalibration.load(args.calib)
+        session = ArmSession(client, safe_exit="off").open()
+        bridge = LeaderTeleopBridge(
+            bus,
+            session,
+            schema,
+            calib=calib,
+            fps=args.fps,
+            ramp_seconds=args.ramp_seconds,
+            max_gap_rad=args.max_gap_rad,
+            operator_present=args.i_am_at_the_arm,
+            park_on_exit=not args.no_park,
         )
-        transport.close()
-        return 1
 
-    calib = LeaderCalibration.load(args.calib)
-    session = ArmSession(client, safe_exit="off").open()
-    bridge = LeaderTeleopBridge(
-        bus,
-        session,
-        schema,
-        calib=calib,
-        fps=args.fps,
-        ramp_seconds=args.ramp_seconds,
-        max_gap_rad=args.max_gap_rad,
-        operator_present=args.i_am_at_the_arm,
-        park_on_exit=not args.no_park,
-    )
+        def _sig_handler(*_: Any) -> None:
+            if bridge:
+                bridge.stop()
 
-    def _sig_handler(*_: Any) -> None:
-        bridge.stop()
+        signal.signal(signal.SIGINT, _sig_handler)
+        signal.signal(signal.SIGTERM, _sig_handler)
 
-    signal.signal(signal.SIGINT, _sig_handler)
-    signal.signal(signal.SIGTERM, _sig_handler)
-
-    try:
         bridge.run()
+        return 0
     finally:
-        bridge.close()
-        session.close()
+        if bridge is not None:
+            bridge.close()
+        if session is not None:
+            try:
+                session.close()
+            except Exception:
+                pass
         transport.close()
-        print(f"leader teleop closed: {bridge.frames_sent} frames sent, {bus.dropouts} dropouts")
-
-    return 0
+        if bridge is not None and bus is not None:
+            print(f"leader teleop closed: {bridge.frames_sent} frames sent, {bus.dropouts} dropouts")
 
 
 if __name__ == "__main__":
