@@ -390,12 +390,29 @@ def annotate(snap: Snapshot, dets: Sequence[Detection], min_score: float = 0.0, 
             continue
         x0, y0, x1, y1 = d.box_norm
         box = (round(x0 * (w - 1)), round(y0 * (h - 1)), round(x1 * (w - 1)), round(y1 * (h - 1)))
-        draw.rectangle(box, outline=(140, 198, 63), width=lw)
+        if d.obb_corners_norm and len(d.obb_corners_norm) == 4:
+            pts = [(round(u * (w - 1)), round(v * (h - 1))) for u, v in d.obb_corners_norm]
+            draw.line(pts + [pts[0]], fill=(140, 198, 63), width=lw)
+        else:
+            draw.rectangle(box, outline=(140, 198, 63), width=lw)
         text = f"{d.label} {d.score:.2f}"
+        if d.angle_deg is not None:
+            disp_deg = (round(d.angle_deg) + 90) % 180 - 90
+            text += f" {disp_deg}deg"
+        tx = max(0, min(w - 1, box[0] + lw))
         ty = box[1] - 12 if box[1] >= 12 else box[1] + lw
-        tb = draw.textbbox((box[0] + lw, ty), text)
+        ty = max(0, min(h - 1, ty))
+        tb = draw.textbbox((tx, ty), text)
+        badge_w = tb[2] - tb[0]
+        badge_h = tb[3] - tb[1]
+        if tx + badge_w > w:
+            tx = max(0, w - badge_w)
+            tb = draw.textbbox((tx, ty), text)
+        if ty + badge_h > h:
+            ty = max(0, h - badge_h)
+            tb = draw.textbbox((tx, ty), text)
         draw.rectangle(tb, fill=(0, 0, 0))
-        draw.text((box[0] + lw, ty), text, fill=(255, 255, 255))
+        draw.text((tx, ty), text, fill=(255, 255, 255))
     buf = io.BytesIO()
     img.save(buf, "JPEG", quality=int(quality))
     return replace(snap, jpeg=buf.getvalue(), width=w, height=h)

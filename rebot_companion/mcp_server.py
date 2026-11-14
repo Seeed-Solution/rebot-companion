@@ -724,7 +724,9 @@ def build_server(ctrl: Controller, allow_clear_fault: bool = False, allow_preemp
 
     @tool(
         "Run one detector inference on a fresh frame. Boxes are normalised [x0, y0, x1, y1] in the "
-        "image (0..1). pipelines: yolo (objects), aruco (markers) or both (default); honoured by "
+        "image (0..1). Rotated / OBB detections include angle_deg (wrapped to [-90, 90) deg), angle_conf, "
+        "grasp_width_px, obb_corners_norm (4 un-clamped corners), and mask_focus when reported. "
+        "pipelines: yolo (objects), aruco (markers) or both (default); honoured by "
         "rebot-vision >= 1.3, older detectors run their current mode. The result's pipelines lists "
         "what ran (null when the detector does not report it)."
     )
