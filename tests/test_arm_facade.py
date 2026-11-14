@@ -10,6 +10,7 @@ from fake_armd import HOME, open_arm
 from rebot import (
     Arm,
     ArmCommandRejected,
+    ActionFailed,
     ArmConnectionError,
     ArmFaultError,
     ArmStatus,
@@ -462,3 +463,81 @@ def test_close_from_another_thread_keeps_sigterm_restorable(armd):
         assert signal.getsignal(signal.SIGTERM) is previous
     finally:
         signal.signal(signal.SIGTERM, old)
+
+
+def _cup(score=0.9):
+    return {"format": "xywh_center", "class_name": "cup", "confidence": score, "x": 0.4, "y": 0.4, "w": 0.1, "h": 0.1}
+
+
+def test_grasp_task_is_sent_in_body(armd):
+    armd.grasp_tasks_cap = True
+    armd.detections = [_cup()]
+    with open_arm(armd) as arm:
+        det = arm.detect("cup")[0]
+        assert arm.grasp_dry_run(det, task="cup") == (True, None, None)
+        assert armd.action_bodies[-1][1]["task"] == "cup" and armd.action_bodies[-1][1]["dry_run"] is True
+        arm.grasp(det, task="flat")
+        assert armd.action_bodies[-1][1]["task"] == "flat"
+        arm.grasp(det)
+        assert "task" not in armd.action_bodies[-1][1]
+
+
+def test_grasp_task_without_capability_raises_unsupported_before_sending(armd):
+    armd.detections = [_cup()]
+    with open_arm(armd) as arm:
+        det = arm.detect("cup")[0]
+        n = len(armd.action_bodies)
+        for call in (
+            lambda: arm.grasp(det, task="cup"),
+            lambda: arm.grasp_dry_run(det, task="cup"),
+            lambda: arm.grasp_any("cup", task="cup"),
+        ):
+            with pytest.raises(UnsupportedError):
+                call()
+        assert len(armd.action_bodies) == n
+
+
+def test_grasp_dry_run_unsupported_task_returns_tuple(armd):
+    armd.grasp_tasks_cap = True
+    armd.dry_run_reply = {"reachable": True, "task_supported": False, "task_reason": "needs a segment model"}
+    armd.detections = [_cup()]
+    with open_arm(armd) as arm:
+        det = arm.detect("cup")[0]
+        assert arm.grasp_dry_run(det, task="cup") == (False, "TASK_UNSUPPORTED", "needs a segment model")
+    armd.dry_run_reply = {"reachable": True}
+    armd.unsupported_tasks = {"cup"}  # armd answers the dry run with a command rejection instead
+    with open_arm(armd) as arm:
+        res = arm.grasp_dry_run(det, task="cup")
+        assert res[:2] == (False, "TASK_UNSUPPORTED")
+        with pytest.raises(ArmCommandRejected) as exc:
+            arm.grasp(det, task="cup")
+        assert exc.value.code == "TASK_UNSUPPORTED"
+
+
+def test_grasp_any_task_unsupported_raises_once(armd):
+    armd.grasp_tasks_cap = True
+    armd.dry_run_reply = {"reachable": True, "task_supported": False, "task_reason": "needs depth"}
+    armd.detections = [_cup(0.9), _cup(0.8), _cup(0.7)]
+    with open_arm(armd) as arm:
+        with pytest.raises(ActionFailed) as exc:
+            arm.grasp_any("cup", task="cup")
+        assert exc.value.code == "TASK_UNSUPPORTED" and "needs depth" in exc.value.message
+        assert [b["dry_run"] for _, b in armd.action_bodies if "dry_run" in b] == [True]  # one dry run only
+
+
+def test_grasp_any_with_task_zero_candidates_unchanged(armd):
+    armd.grasp_tasks_cap = True
+    armd.detections = []
+    with open_arm(armd) as arm:
+        with pytest.raises(ActionFailed) as exc:
+            arm.grasp_any("cup", task="cup")
+        assert exc.value.code == "IK_UNREACHABLE" and "no detections" in exc.value.message
+        assert armd.action_bodies == []
+
+
+def test_grasp_any_with_task_grasps_first_reachable(armd):
+    armd.grasp_tasks_cap = True
+    armd.detections = [_cup()]
+    with open_arm(armd) as arm:
+        assert arm.grasp_any("cup", task="cup").holding is True
+        assert armd.action_bodies[-1][1]["task"] == "cup"

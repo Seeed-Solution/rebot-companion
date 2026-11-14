@@ -72,6 +72,7 @@ SERVO_MIN_RATE_HZ = 10.0  # armd motion_frame_timeout is 200 ms
 GRIPPER_INDEX = 6  # 7-DOF B601-DM: joints 0..5 arm, 6 gripper
 SAFE_EXIT_POLICIES = ("off", "error", "always")
 ACTION_MAX_TIMEOUT_S = 60.0
+TASK_UNSUPPORTED = "TASK_UNSUPPORTED"  # armd: the loaded vision model/depth cannot serve the grasp task
 CAPABILITIES_DEVPLAT = 6  # capabilities.version with obs_rate / fault_codes / poses / keepout / ...
 
 
@@ -347,6 +348,13 @@ class ObservationSchema:
     def capabilities_version(self) -> int:
         return int(self.capabilities.get("version") or 0)
 
+    def require_grasp_tasks(self) -> None:
+        """Raise :class:`UnsupportedError` unless armd reports the top-level ``grasp_tasks: true``."""
+        if self.capabilities.get("grasp_tasks") is not True:
+            raise UnsupportedError(
+                "Grasp tasks need an armd that reports capability 'grasp_tasks'. Update rebot-armd."
+            )
+
     def has(self, capability: str, min_version: int = CAPABILITIES_DEVPLAT) -> bool:
         """``capabilities[capability]`` is true and ``capabilities.version >= min_version``."""
         return self.capabilities_version >= min_version and self.capabilities.get(capability) is True
@@ -421,8 +429,15 @@ class ArmdClient:
         overrides: dict | None = None,
         tag: str | None = None,
         timeout: float | None = None,
+        task: str | None = None,
     ) -> tuple[bool, str | None, str | None]:
-        """Check grasp reachability over REST (no lease required)."""
+        """Check grasp reachability over REST (no lease required).
+
+        With ``task`` (needs capability ``grasp_tasks``, else :class:`UnsupportedError`) an unsupported task
+        returns ``(False, "TASK_UNSUPPORTED", reason)``.
+        """
+        if task is not None:
+            self.get_schema().require_grasp_tasks()
         body: dict = {
             "label": str(label),
             "box_norm": [float(v) for v in box_norm],
@@ -436,8 +451,15 @@ class ArmdClient:
             body["overrides"] = dict(overrides)
         if tag is not None:
             body["tag"] = str(tag)
-        data = self._post("/api/v1/action/grasp", json=body, timeout=timeout)
-        return bool(data.get("reachable", False)), data.get("code"), data.get("message")
+        if task is not None:
+            body["task"] = str(task)
+        try:
+            data = self._post("/api/v1/action/grasp", json=body, timeout=timeout)
+        except _http.HttpStatusError as exc:
+            data = _json_dict(exc.response)
+            if data.get("code") != TASK_UNSUPPORTED:
+                raise
+        return _dry_run_tuple(data)
 
     def get_observation(self) -> ArmStatus:
         """``GET /api/v1/observation`` (no lease required)."""
@@ -502,6 +524,21 @@ class ArmdClient:
     def session(self, client_id: str | None = None, **kwargs: Any) -> ArmSession:
         """Create (not yet opened) control session. Use as a context manager."""
         return ArmSession(self, client_id=client_id, **kwargs)
+
+
+def _dry_run_tuple(data: dict) -> tuple[bool, str | None, str | None]:
+    """``(reachable, code, message)`` from a dry-run reply; ``task_supported: false`` -> TASK_UNSUPPORTED."""
+    if data.get("task_supported") is False:
+        return False, TASK_UNSUPPORTED, data.get("task_reason") or data.get("message")
+    return bool(data.get("reachable", False)), data.get("code"), data.get("message")
+
+
+def _json_dict(response: Any) -> dict:
+    try:
+        data = response.json()
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def _vec(v: Sequence[float] | None, n: int, name: str) -> list[float]:
@@ -1274,12 +1311,17 @@ class ArmSession:
         overrides: dict | None = None,
         tag: str | None = None,
         timeout: float | None = None,
+        task: str | None = None,
     ) -> ActionResult:
         """``/api/v1/action/grasp``: armd centres on the box, descends, closes and lifts.
 
         ``box_norm`` is ``[x0, y0, x1, y1]`` normalised to the detector image. The result's
         ``action.holding`` tells whether an object is in the gripper. Default timeout 120 s.
+        ``task`` names a stored grasp task (capability ``grasp_tasks``, else :class:`UnsupportedError`);
+        armd rejects it with ``TASK_UNSUPPORTED`` when the loaded vision model cannot serve it.
         """
+        if task is not None:
+            self.schema().require_grasp_tasks()
         body: dict = {"label": str(label), "box_norm": _vec(box_norm, 4, "box_norm")}
         if frame_id is not None:
             body["frame_id"] = int(frame_id)
@@ -1289,6 +1331,8 @@ class ArmSession:
             body["overrides"] = dict(overrides)
         if tag is not None:
             body["tag"] = str(tag)
+        if task is not None:
+            body["task"] = str(task)
         return self._action("/api/v1/action/grasp", body, 120.0 if timeout is None else timeout, legacy_wait=None)
 
     def grasp_dry_run(
@@ -1300,8 +1344,15 @@ class ArmSession:
         overrides: dict | None = None,
         tag: str | None = None,
         timeout: float | None = None,
+        task: str | None = None,
     ) -> tuple[bool, str | None, str | None]:
-        """Check grasp reachability over WebSocket (returns (reachable, code, message))."""
+        """Check grasp reachability over WebSocket (returns (reachable, code, message)).
+
+        With ``task`` (capability ``grasp_tasks``, else :class:`UnsupportedError`) an unsupported task
+        returns ``(False, "TASK_UNSUPPORTED", reason)``.
+        """
+        if task is not None:
+            self.schema().require_grasp_tasks()
         body: dict = {
             "label": str(label),
             "box_norm": _vec(box_norm, 4, "box_norm"),
@@ -1315,8 +1366,15 @@ class ArmSession:
             body["overrides"] = dict(overrides)
         if tag is not None:
             body["tag"] = str(tag)
-        ack = self.command("/api/v1/action/grasp", body, timeout=timeout)
-        return bool(ack.get("reachable", False)), ack.get("code"), ack.get("message")
+        if task is not None:
+            body["task"] = str(task)
+        try:
+            ack = self.command("/api/v1/action/grasp", body, timeout=timeout)
+        except ArmCommandRejected as exc:
+            if exc.code != TASK_UNSUPPORTED:
+                raise
+            return False, TASK_UNSUPPORTED, str(exc.raw.get("message") or "grasp task not supported")
+        return _dry_run_tuple(ack)
 
     # ---- developer platform (capabilities version 6) -------------------------
 

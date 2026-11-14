@@ -460,12 +460,17 @@ class Arm:
         target: Union[Detection, str],
         box: Optional[Sequence[float]] = None,
         timeout: Optional[float] = None,
+        task: Optional[str] = None,
     ) -> ActionResult:
         """Pick up a detected object: ``arm.grasp(detection)`` or ``arm.grasp("cup", box=(x0, y0, x1, y1))``.
 
         armd centres the camera on the box, descends, closes and lifts. ``result.holding`` is True
         when the object is in the gripper. A lost target raises :class:`ActionFailed`
         (``TARGET_LOST``, ``NOT_HOLDING``, ...).
+
+        ``task`` names a grasp task stored in armd. Without the ``grasp_tasks`` capability this raises
+        :class:`UnsupportedError`; when the loaded vision model/depth cannot serve the task armd rejects the
+        command with ``TASK_UNSUPPORTED`` (:class:`ArmCommandRejected`) before the arm moves.
         """
         if isinstance(target, Detection):
             label, box_norm, frame_id, ts_ms = target.label, target.box_norm, target.frame_id, target.ts_ms
@@ -478,8 +483,10 @@ class Arm:
             raise UnsupportedError(
                 "this armd has no grasp action (needs a profile with kinematics, gripper and grasp setup)"
             )
+        if task is not None:
+            self.schema.require_grasp_tasks()
         return self._motion(
-            lambda: self.session.grasp(label, box_norm, frame_id=frame_id, ts_ms=ts_ms, timeout=timeout),
+            lambda: self.session.grasp(label, box_norm, frame_id=frame_id, ts_ms=ts_ms, timeout=timeout, task=task),
             f"grasp of '{label}'",
             timeout,
         )
@@ -489,10 +496,13 @@ class Arm:
         target: Union[Detection, str],
         box: Optional[Sequence[float]] = None,
         timeout: Optional[float] = None,
+        task: Optional[str] = None,
     ) -> Tuple[bool, Optional[str], Optional[str]]:
         """Check reachability of a detection without moving the arm.
 
-        Returns (reachable, code, message).
+        Returns (reachable, code, message). With ``task`` (capability ``grasp_tasks``, else
+        :class:`UnsupportedError`) a task the loaded vision model/depth cannot serve returns
+        ``(False, "TASK_UNSUPPORTED", reason)``.
         """
         if isinstance(target, Detection):
             label, box_norm, frame_id, ts_ms = target.label, target.box_norm, target.frame_id, target.ts_ms
@@ -502,9 +512,11 @@ class Arm:
                     "grasp_dry_run(label) needs box=(x0, y0, x1, y1); or pass a detection from arm.detect()"
                 )
             label, box_norm, frame_id, ts_ms = str(target), tuple(box), None, None
+        if task is not None:
+            self.schema.require_grasp_tasks()
         return self._run(
             lambda: self.session.grasp_dry_run(
-                label=label, box_norm=box_norm, frame_id=frame_id, ts_ms=ts_ms, timeout=timeout
+                label=label, box_norm=box_norm, frame_id=frame_id, ts_ms=ts_ms, timeout=timeout, task=task
             )
         )
 
@@ -514,22 +526,31 @@ class Arm:
         min_score: float = 0.3,
         max_candidates: int = 5,
         timeout: Optional[float] = None,
+        task: Optional[str] = None,
     ) -> ActionResult:
         """Detect objects, dry-run in score order, and grasp the first reachable one.
 
         detect(), keep matching label and score, sort by score, dry-run each in order,
         grasp the first reachable one; raise ActionFailed with code IK_UNREACHABLE (or
         the last dry-run code) when none is reachable. Bounded loop.
+
+        With ``task`` the requirement is global, so the first candidate's dry-run decides: if armd answers
+        ``TASK_UNSUPPORTED``, :class:`ActionFailed` with that code is raised at once. Without the
+        ``grasp_tasks`` capability :class:`UnsupportedError` is raised before anything is sent.
         """
+        if task is not None:
+            self.schema.require_grasp_tasks()
         candidates = self.detect(label=label, min_score=min_score)
         bounded_candidates = candidates[:max(0, int(max_candidates))]
         last_code: Optional[str] = None
         last_message: Optional[str] = None
         for d in bounded_candidates:
             self.feed()
-            reachable, code, message = self.grasp_dry_run(d, timeout=timeout)
+            reachable, code, message = self.grasp_dry_run(d, timeout=timeout, task=task)
+            if code == "TASK_UNSUPPORTED" and not reachable:
+                raise ActionFailed(code, message or "grasp task not supported by the loaded vision model")
             if reachable:
-                return self.grasp(d, timeout=timeout)
+                return self.grasp(d, timeout=timeout, task=task)
             last_code = code
             last_message = message
         raise ActionFailed(
