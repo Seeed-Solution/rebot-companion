@@ -905,9 +905,29 @@ class ArmSession:
             now = time.monotonic()
             if self._last_schema_attempt is not None and now - self._last_schema_attempt < _SCHEMA_RETRY_COOLDOWN_S:
                 raise ArmConnectionError("schema fetch in cooldown after previous failure")
-            self._last_schema_attempt = now
-            self._schema = self.client.get_schema()
+            try:
+                self._schema = self.client.get_schema()
+                self._last_schema_attempt = None
+            except Exception:
+                self._last_schema_attempt = time.monotonic()
+                raise
         return self._schema
+
+    def _cached_gripper_joint(self, pos_len: int | None = None) -> int | None:
+        if self._schema is not None:
+            return self._schema.gripper_joint
+        if self._gripper_joint is not _GRIPPER_UNSET:
+            return self._gripper_joint  # type: ignore[return-value]
+        obs = None
+        try:
+            obs = self.latest_observation()
+        except ArmConnectionError:
+            pass
+        if obs is not None:
+            return 6 if len(obs.positions) == 7 else None
+        if pos_len is not None:
+            return 6 if pos_len == 7 else None
+        return None
 
     @property
     def gripper_joint(self) -> int | None:
@@ -1645,7 +1665,7 @@ class ArmSession:
         else:
             obs = self.latest_observation()
             ref = obs.positions if obs is not None else None
-        gj = self.gripper_joint
+        gj = self._cached_gripper_joint(len(target))
         if ref is not None and len(ref) == len(target):
             for i, (t, r) in enumerate(zip(target, ref)):
                 if gj is not None and i == gj:

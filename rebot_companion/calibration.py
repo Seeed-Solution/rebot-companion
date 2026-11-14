@@ -97,8 +97,11 @@ def check_b601_compatibility(schema_or_profile: Any) -> None:
     if isinstance(schema_or_profile, dict):
         profile_id = schema_or_profile.get("profile_id")
         arm_dof = schema_or_profile.get("arm_dof")
-    if profile_id is not None and "b601" not in str(profile_id).lower():
-        raise ValueError(f"Local B601 kinematics cannot be used for arm with profile_id '{profile_id}'")
+    if profile_id is not None:
+        norm = str(profile_id).lower().replace("_", "-")
+        allowed = ("b601", "rebot-dm", "rebot-rs")
+        if not any(a in norm for a in allowed):
+            raise ValueError(f"Local B601 kinematics cannot be used for arm with profile_id '{profile_id}'")
     if arm_dof is not None and arm_dof != 6:
         raise ValueError(f"Local B601 kinematics requires arm_dof=6, got {arm_dof}")
 

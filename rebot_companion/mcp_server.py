@@ -270,6 +270,31 @@ def gripper_fraction(
     return max(0.0, min(1.0, (rad - closed_rad) / span))
 
 
+def _tcp_rpy_rad(obs_tcp: Any) -> list[float] | None:
+    """Extract TCP orientation as [roll, pitch, yaw] in radians from obs_tcp.
+
+    Tries rpy_rad first; if missing or < 3 items, tries quat_wxyz ([w, x, y, z]).
+    """
+    if obs_tcp is None:
+        return None
+    rpy_rad = obs_tcp.get("rpy_rad") if hasattr(obs_tcp, "get") else getattr(obs_tcp, "rpy_rad", None)
+    if rpy_rad is not None and len(rpy_rad) >= 3 and all(math.isfinite(x) for x in rpy_rad[:3]):
+        return [float(x) for x in rpy_rad[:3]]
+    quat = (
+        obs_tcp.get("quat_wxyz") if hasattr(obs_tcp, "get") else getattr(obs_tcp, "quat_wxyz", None)
+    ) or (
+        obs_tcp.get("quat") if hasattr(obs_tcp, "get") else getattr(obs_tcp, "quat", None)
+    )
+    if quat is not None and len(quat) == 4 and all(math.isfinite(x) for x in quat):
+        norm_sq = sum(float(x) * float(x) for x in quat)
+        if norm_sq > 1e-9:
+            q = [float(x) for x in quat]
+            # Rotation.from_quat expects [x, y, z, w]; quat_wxyz is [w, x, y, z]
+            euler = Rotation.from_quat([q[1], q[2], q[3], q[0]]).as_euler("xyz")
+            return [float(v) for v in euler]
+    return None
+
+
 class Controller:
     """Lease and SDK state behind the MCP tools (synchronous; tools call it from worker threads)."""
 
@@ -302,11 +327,12 @@ class Controller:
                     return self._cached_fallback_schema
                 dof = len(self.observation().positions) if self.observation() else 7
                 return ObservationSchema.from_dict({"dof": dof})
-            self._last_schema_attempt = now
             try:
                 self._schema = self.client.get_schema()
+                self._last_schema_attempt = None
                 self._cached_fallback_schema = None
             except Exception as exc:
+                self._last_schema_attempt = time.monotonic()
                 log.warning("observation schema unavailable: %s", exc)
                 dof = len(self.observation().positions) if self.observation() else 7
                 self._cached_fallback_schema = ObservationSchema.from_dict({"dof": dof})
@@ -341,7 +367,7 @@ class Controller:
         if obs_tcp is not None:
             raw_xyz = obs_tcp.get("xyz_m") if hasattr(obs_tcp, "get") else getattr(obs_tcp, "xyz_m", [])
             xyz = [_r(v) for v in raw_xyz or []]
-            rpy_rad = obs_tcp.get("rpy_rad") if hasattr(obs_tcp, "get") else getattr(obs_tcp, "rpy_rad", None)
+            rpy_rad = _tcp_rpy_rad(obs_tcp)
             quat = (
                 obs_tcp.get("quat_wxyz") if hasattr(obs_tcp, "get") else getattr(obs_tcp, "quat_wxyz", None)
             ) or (
@@ -541,46 +567,69 @@ class Controller:
         sch = self.schema()
         orient_dof = sch.orientation_dof or (2 if sch.arm_dof == 5 else 3)
         auto_yaw = None
-        if orient_dof == 2:
-            # 2-DOF orientation arm (e.g. 5-arm): pitch/roll controllable, yaw is not independent.
-            # When all orientation angles are omitted, pass rpy=None.
-            if roll_deg is None and pitch_deg is None and yaw_deg is None:
-                rpy = None
-            elif yaw_deg is None and (roll_deg is not None or pitch_deg is not None):
-                obs = s.latest_observation()
-                cur_tcp = self.format_tcp(obs.tcp, obs.commanded_positions or obs.positions) if obs else None
-                cur = cur_tcp.get("rpy_deg") if cur_tcp else None
-                if not cur or len(cur) < 3:
-                    cur = [0.0, 0.0, 0.0]
-                rpy = [
-                    math.radians(roll_deg if roll_deg is not None else cur[0]),
-                    math.radians(pitch_deg if pitch_deg is not None else cur[1]),
-                    0.0,
-                ]
-                auto_yaw = True
-            else:
-                obs = s.latest_observation()
-                cur_tcp = self.format_tcp(obs.tcp, obs.commanded_positions or obs.positions) if obs else None
-                cur = cur_tcp.get("rpy_deg") if cur_tcp else None
-                if not cur or len(cur) < 3:
-                    cur = [0.0, 0.0, 0.0]
-                rpy = [
-                    math.radians(roll_deg if roll_deg is not None else cur[0]),
-                    math.radians(pitch_deg if pitch_deg is not None else cur[1]),
-                    math.radians(yaw_deg),
-                ]
-                auto_yaw = None
-        elif any(v is not None for v in (roll_deg, pitch_deg, yaw_deg)):
+
+        if quat is not None:
+            rpy = None
+        elif roll_deg is None and pitch_deg is None and yaw_deg is None:
+            rpy = None
+        else:
             obs = s.latest_observation()
-            cur_tcp = self.format_tcp(obs.tcp, obs.commanded_positions or obs.positions) if obs else None
-            cur = cur_tcp.get("rpy_deg") if cur_tcp else None
-            if not cur or len(cur) < 3:
-                cur = (tcp_dict(obs.commanded_positions or obs.positions, self.joint_map()) or {}).get(
-                    "rpy_deg", [0.0, 0.0, 0.0]
-                )
-            if not cur or len(cur) < 3:
-                cur = [0.0, 0.0, 0.0]
-            rpy = [math.radians(v if v is not None else c) for v, c in zip((roll_deg, pitch_deg, yaw_deg), cur)]
+            cur_rpy: list[float] | None = None
+            if obs is not None and getattr(obs, "tcp", None) is not None:
+                cur_rpy = _tcp_rpy_rad(obs.tcp)
+            if cur_rpy is None and obs is not None:
+                dof = sch.dof if sch else len(obs.positions)
+                if (dof == 7 or sch.arm_dof == 6) and len(obs.positions) >= 6:
+                    fk = tcp_dict(obs.commanded_positions or obs.positions, self.joint_map())
+                    if fk and fk.get("rpy_deg"):
+                        cur_rpy = [math.radians(v) for v in fk["rpy_deg"]]
+
+            if orient_dof == 2:
+                # 2-DOF orientation arm: pitch/roll controllable, yaw is coupled
+                if yaw_deg is None:
+                    if roll_deg is None or pitch_deg is None:
+                        if cur_rpy is None:
+                            raise ToolFail(
+                                "INVALID_ARGUMENT",
+                                "current TCP orientation unavailable to fill omitted orientation angles",
+                            )
+                        roll = roll_deg if roll_deg is not None else math.degrees(cur_rpy[0])
+                        pitch = pitch_deg if pitch_deg is not None else math.degrees(cur_rpy[1])
+                    else:
+                        roll = roll_deg
+                        pitch = pitch_deg
+                    rpy = [math.radians(roll), math.radians(pitch), 0.0]
+                    auto_yaw = True
+                else:
+                    if roll_deg is None or pitch_deg is None:
+                        if cur_rpy is None:
+                            raise ToolFail(
+                                "INVALID_ARGUMENT",
+                                "current TCP orientation unavailable to fill omitted orientation angles",
+                            )
+                        roll = roll_deg if roll_deg is not None else math.degrees(cur_rpy[0])
+                        pitch = pitch_deg if pitch_deg is not None else math.degrees(cur_rpy[1])
+                    else:
+                        roll = roll_deg
+                        pitch = pitch_deg
+                    rpy = [math.radians(roll), math.radians(pitch), math.radians(yaw_deg)]
+                    auto_yaw = None
+            else:
+                if any(v is None for v in (roll_deg, pitch_deg, yaw_deg)):
+                    if cur_rpy is None:
+                        raise ToolFail(
+                            "INVALID_ARGUMENT",
+                            "current TCP orientation unavailable to fill omitted orientation angles",
+                        )
+                    roll = roll_deg if roll_deg is not None else math.degrees(cur_rpy[0])
+                    pitch = pitch_deg if pitch_deg is not None else math.degrees(cur_rpy[1])
+                    yaw = yaw_deg if yaw_deg is not None else math.degrees(cur_rpy[2])
+                else:
+                    roll = roll_deg
+                    pitch = pitch_deg
+                    yaw = yaw_deg
+                rpy = [math.radians(roll), math.radians(pitch), math.radians(yaw)]
+                auto_yaw = None
         move_kwargs = {}
         if auto_yaw is not None:
             move_kwargs["auto_yaw"] = auto_yaw

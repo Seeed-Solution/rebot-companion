@@ -1503,7 +1503,7 @@ def test_schema_cooldown_initial_sentinel_allows_early_monotonic(monkeypatch):
     res = session.schema()
     assert res == schema
     assert client.get_schema.call_count == 1
-    assert session._last_schema_attempt == 1.0
+    assert session._last_schema_attempt is None
 
     # 2. Controller in mcp_server
     from rebot_companion.mcp_server import Controller
@@ -1514,7 +1514,7 @@ def test_schema_cooldown_initial_sentinel_allows_early_monotonic(monkeypatch):
     res_mcp = controller.schema()
     assert res_mcp == schema
     assert mcp_client.get_schema.call_count == 1
-    assert controller._last_schema_attempt == 1.0
+    assert controller._last_schema_attempt is None
 
 
 def test_operator_present_enforces_max_gap_unless_allow_large_gap():
@@ -1672,9 +1672,14 @@ def test_auto_detect_leader_port_and_ping_ids(monkeypatch):
         def close(self):
             pass
 
-    monkeypatch.setattr(leader_teleop, "open_serial_transport", lambda *a, **k: NonRespondingTransport())
+    transport = NonRespondingTransport()
+    monkeypatch.setattr(leader_teleop, "open_serial_transport", lambda *a, **k: transport)
+    mock_session_cls = MagicMock()
+    monkeypatch.setattr(leader_teleop, "ArmSession", mock_session_cls)
     rc = leader_teleop.main(["--leader-port", "/dev/ttyUSB0", "--arm-host", "127.0.0.1"])
     assert rc == 1
+    mock_session_cls.assert_not_called()
+    assert not any(0xFE in pkt for pkt in [transport.written])
 
 
 def test_mcp_server_gripper_fraction_schema_bounds():
@@ -1847,4 +1852,244 @@ def test_sine_policy_schema_resolution():
         mp.setattr("rebot_companion.policy_runner.ArmSession.open", lambda self: mock_sess)
         runner.run()
     assert mock_sess._schema == runner.schema
+
+
+def test_leader_bridge_align_and_ramp_stop_preflight():
+    bus = MagicMock()
+    bus.read_positions_sync.return_value = {1: 2048, 2: 2048, 3: 2048, 4: 2048, 5: 2048, 6: 2048}
+    mock_session = MagicMock()
+    idle_obs = MagicMock()
+    idle_obs.positions = [0.0] * 6
+    idle_obs.safety_state = "Idle"
+    idle_obs.is_stopped = False
+    idle_obs.is_torqued = False
+    idle_obs.is_operational = False
+    idle_obs.collision = None
+    mock_session.wait_for_observation.return_value = idle_obs
+    schema = ObservationSchema.from_dict({
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "limits": [
+            {"name": f"j{i}", "min_position": -3.14, "max_position": 3.14, "max_velocity": 2.0, "max_acceleration": 5.0}
+            for i in range(6)
+        ],
+    })
+    # Case 1: bridge already stopped at start
+    bridge = LeaderTeleopBridge(bus, mock_session, schema, fps=10, ramp_seconds=0.2, max_gap_rad=0.5)
+    bridge.stop()
+    bridge.align_and_ramp()
+    assert bridge._activated is False
+    mock_session.torque.assert_not_called()
+    mock_session.servo.assert_not_called()
+
+    # Case 2: stop signal received inside the wait-for-torque loop
+    bridge2 = LeaderTeleopBridge(bus, mock_session, schema, fps=10, ramp_seconds=0.2, max_gap_rad=0.5)
+
+    call_count = 0
+
+    def stop_during_wait(*a, **k):
+        nonlocal call_count
+        call_count += 1
+        if call_count > 1:
+            bridge2.stop()
+        return idle_obs
+
+    mock_session.wait_for_observation.side_effect = stop_during_wait
+    bridge2.align_and_ramp()
+    assert bridge2._activated is False
+    mock_session.servo.assert_not_called()
+
+
+def test_leader_bridge_quintic_ramp_step_limit_extended(monkeypatch):
+    bus = MagicMock()
+    bus.read_positions_sync.return_value = {1: 2048, 2: 2048, 3: 2048, 4: 2048, 5: 2048, 6: 2048}
+    mock_session = MagicMock()
+    mock_session._frames = 0
+    armed_obs = MagicMock()
+    armed_obs.positions = [math.pi - 0.01] + [0.0] * 5
+    armed_obs.safety_state = "Armed"
+    armed_obs.is_stopped = False
+    armed_obs.is_torqued = True
+    armed_obs.is_operational = True
+    armed_obs.collision = None
+    mock_session.wait_for_observation.return_value = armed_obs
+    mock_session.latest_observation.return_value = armed_obs
+
+    def fake_sleep(dur):
+        mock_session._frames += 1
+
+    monkeypatch.setattr(time, "sleep", fake_sleep)
+
+    schema = ObservationSchema.from_dict({
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "limits": [
+            {"name": f"j{i}", "min_position": -3.14, "max_position": 3.14, "max_velocity": 2.0, "max_acceleration": 5.0}
+            for i in range(6)
+        ],
+    })
+    bridge = LeaderTeleopBridge(
+        bus, mock_session, schema, fps=10, ramp_seconds=0.2, max_gap_rad=0.5, allow_large_gap=True
+    )
+    bridge.align_and_ramp()
+    assert bridge.frames_sent >= 18
+    calls = [c.args[0] for c in mock_session.servo.call_args_list]
+    prev = armed_obs.positions
+    for frame in calls:
+        step_deltas = [abs(f - p) for f, p in zip(frame, prev)]
+        assert max(step_deltas) <= 0.35 + 1e-4
+        prev = frame
+
+
+def test_arm_session_servo_zero_http_and_schema_cooldown_failure():
+    from rebot.client import ArmConnectionError
+    mock_client = MagicMock()
+    mock_client.get_schema.side_effect = ArmConnectionError("schema timeout")
+    session = ArmSession(mock_client)
+    assert session._last_schema_attempt is None
+    with pytest.raises(ArmConnectionError):
+        session.schema()
+    assert session._last_schema_attempt is not None
+
+    # servo() must not trigger get_schema()
+    mock_client.get_schema.reset_mock()
+    obs = MagicMock()
+    obs.positions = [0.0] * 6
+    session._obs = obs
+    session._ws = MagicMock()
+    session._has_lease = True
+    session._generation = 1
+    session._epoch = 1
+
+    session.servo([0.0] * 6)
+    mock_client.get_schema.assert_not_called()
+
+
+def test_sine_policy_joint6_rejected_and_unit_enforcement():
+    from rebot_companion.policy_runner import SinePolicy, PolicyRunner, RunnerError
+    schema_so101 = ObservationSchema.from_dict({
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "limits": [
+            {"name": f"j{i}", "min_position": -3.14, "max_position": 3.14, "max_velocity": 2.0, "max_acceleration": 5.0}
+            for i in range(6)
+        ],
+    })
+    # 1. SinePolicy targeting joint_6 on SO-ARM101 (gripper_joint=5, dof=6) without joint_names
+    p = SinePolicy("joint_6", amp=0.1, period=1.0)
+    with pytest.raises(RunnerError, match="unknown joint name 'joint_6' in sine policy"):
+        p.bind_schema(schema_so101)
+
+    # 2. When joint_names is populated, target not in joint_names must be rejected
+    schema_named = ObservationSchema.from_dict({
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "joint_names": ["waist", "shoulder", "elbow", "wrist_pitch", "wrist_roll", "gripper"],
+        "limits": [
+            {"name": f"j{i}", "min_position": -3.14, "max_position": 3.14, "max_velocity": 2.0, "max_acceleration": 5.0}
+            for i in range(6)
+        ],
+    })
+    with pytest.raises(RunnerError, match="unknown joint name 'joint_6' in sine policy"):
+        p.bind_schema(schema_named)
+
+    # 3. PolicyRunner unit mode enforcement
+    client = MagicMock()
+    client.get_safety_describe.return_value = {"device": {"follower": "mock"}}
+    client.request.return_value.json.return_value = {
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "limits": [
+            {"name": f"j{i}", "min_position": -3.14, "max_position": 3.14, "max_velocity": 2.0, "max_acceleration": 5.0}
+            for i in range(6)
+        ],
+    }
+    client.request.return_value.raise_for_status = lambda: None
+
+    valid_sine = SinePolicy(1, amp=0.1, period=1.0)
+    runner = PolicyRunner(client, valid_sine, action_units="auto", state_units="auto")
+    runner._read_arm()
+    assert runner.action_units == "rad"
+    assert runner.state_units == "rad"
+
+    runner_bad = PolicyRunner(client, valid_sine, action_units="deg", state_units="auto")
+    with pytest.raises(RunnerError, match="sine policy works in radians only"):
+        runner_bad._read_arm()
+
+
+def test_mcp_format_tcp_and_move_to_quat_and_partial_orientation():
+    from rebot_companion.mcp_server import Controller, ToolFail
+    client = MagicMock()
+    ctrl = Controller(client, MagicMock(), MagicMock(), auto_lease=False)
+
+    # 1. format_tcp derives rpy_deg from quat_wxyz when rpy_rad is absent
+    tcp_quat = {"xyz_m": [0.2, 0.0, 0.1], "quat_wxyz": [1.0, 0.0, 0.0, 0.0]}
+    res = ctrl.format_tcp(tcp_quat, [0.0] * 6)
+    assert res is not None
+    assert res["rpy_deg"] == [0.0, 0.0, 0.0]
+
+    # 2. move_to with 2-DOF arm where obs.tcp has quat_wxyz but no rpy_rad
+    schema_so101 = ObservationSchema.from_dict({
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "limits": [
+            {"name": f"j{i}", "min_position": -3.14, "max_position": 3.14, "max_velocity": 2.0, "max_acceleration": 5.0}
+            for i in range(6)
+        ],
+    })
+    client.get_schema.return_value = schema_so101
+    mock_session = MagicMock()
+    mock_session.has_lease = True
+    mock_session.closed_reason = None
+    mock_session.lease_lost = None
+    ctrl.session = mock_session
+    obs = MagicMock()
+    obs.tcp = {"xyz_m": [0.2, 0.0, 0.1], "quat_wxyz": [1.0, 0.0, 0.0, 0.0], "rpy_rad": None}
+    obs.positions = [0.0] * 6
+    obs.commanded_positions = [0.0] * 6
+    mock_session.latest_observation.return_value = obs
+
+    ctrl.move_to(0.25, 0.0, 0.15, roll_deg=None, pitch_deg=30.0, yaw_deg=None, quat=None, speed_mps=None, timeout_s=None)
+    called_rpy = mock_session.move_pose.call_args[1]["rpy"]
+    assert math.isclose(called_rpy[0], 0.0, abs_tol=1e-4)
+    assert math.isclose(called_rpy[1], math.radians(30.0), abs_tol=1e-4)
+
+    # 3. When both rpy_rad and quat_wxyz are unavailable, partial orientation raises ToolFail
+    obs_no_orient = MagicMock()
+    obs_no_orient.tcp = {"xyz_m": [0.2, 0.0, 0.1], "quat_wxyz": None, "rpy_rad": None}
+    obs_no_orient.positions = [0.0] * 6
+    obs_no_orient.commanded_positions = [0.0] * 6
+    mock_session.latest_observation.return_value = obs_no_orient
+
+    with pytest.raises(ToolFail, match="current TCP orientation unavailable to fill omitted orientation angles"):
+        ctrl.move_to(0.25, 0.0, 0.15, roll_deg=None, pitch_deg=30.0, yaw_deg=None, quat=None, speed_mps=None, timeout_s=None)
+
+
+def test_lerobot_recorder_rejects_unit_mode_auto(tmp_path):
+    with pytest.raises(ValueError, match="unit_mode must be one of"):
+        LeRobotRecorder(tmp_path / "rec_auto", "test/repo", unit_mode="auto", armd_host=None, camera_url=None)
+
+
+def test_check_b601_compatibility_allows_dm_rs_and_rejects_so101():
+    from rebot_companion.calibration import check_b601_compatibility
+
+    # Allowed: b601, rebot-dm, rebot_dm, rebot-rs, rebot_rs, None
+    check_b601_compatibility({"profile_id": "b601", "arm_dof": 6})
+    check_b601_compatibility({"profile_id": "rebot-dm", "arm_dof": 6})
+    check_b601_compatibility({"profile_id": "rebot_dm", "arm_dof": 6})
+    check_b601_compatibility({"profile_id": "rebot-rs", "arm_dof": 6})
+    check_b601_compatibility({"profile_id": "rebot_rs", "arm_dof": 6})
+    check_b601_compatibility({"profile_id": None, "arm_dof": 6})
+
+    # Rejected: so-arm101
+    with pytest.raises(ValueError, match="Local B601 kinematics cannot be used"):
+        check_b601_compatibility({"profile_id": "so-arm101", "arm_dof": 6})
+    with pytest.raises(ValueError, match="arm_dof=6"):
+        check_b601_compatibility({"profile_id": "rebot-dm", "arm_dof": 5})
 

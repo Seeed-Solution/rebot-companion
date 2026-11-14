@@ -168,7 +168,11 @@ def from_armd(
     closed_rad: float | None = None,
     open_rad: float | None = None,
 ) -> list[float]:
-    """Convert armd internal radians to requested unit mode ('rad', 'so101_norm', 'deg')."""
+    """Convert armd internal radians to requested unit mode ('rad', 'so101_norm', 'deg').
+
+    Note: ``so101_norm`` normalizes against armd's configured joint limits ([min_position, max_position])
+    and gripper bounds for round-trip compatibility with rebot-record, rather than external LeRobot motor tick ranges.
+    """
     if mode == "rad":
         return [float(x) for x in values]
 
@@ -223,7 +227,11 @@ def to_armd(
     closed_rad: float | None = None,
     open_rad: float | None = None,
 ) -> list[float]:
-    """Convert requested unit mode ('rad', 'so101_norm', 'deg') back to armd internal radians."""
+    """Convert requested unit mode ('rad', 'so101_norm', 'deg') back to armd internal radians.
+
+    Note: ``so101_norm`` normalizes against armd's configured joint limits ([min_position, max_position])
+    and gripper bounds for round-trip compatibility with rebot-record, rather than external LeRobot motor tick ranges.
+    """
     if mode == "rad":
         return [float(x) for x in values]
 

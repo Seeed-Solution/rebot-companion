@@ -686,7 +686,7 @@ class LeaderTeleopBridge:
         follower_positions: Sequence[float],
         *,
         stage: str,
-    ) -> None:
+    ) -> float:
         if len(leader_target) != 6 or len(follower_positions) != 6:
             raise LeaderError(
                 f"expected 6 DOF for SO-ARM101 ({stage}: got follower={len(follower_positions)}, leader={len(leader_target)})"
@@ -703,9 +703,13 @@ class LeaderTeleopBridge:
                 f"{stage} alignment gap {gap:.3f} rad exceeds --max-gap-rad {self.max_gap_rad:.3f}; "
                 "align the leader arm with the follower or pass --allow-large-gap"
             )
+        return gap
 
     def align_and_ramp(self) -> None:
         """Verify alignment against the follower arm and perform a smooth quintic ramp-in."""
+        if self._stop:
+            return
+
         if self.schema.dof != 6 or self.schema.arm_dof != 5:
             raise LeaderError(
                 f"expected 6 DOF for SO-ARM101 (schema.dof={self.schema.dof}, "
@@ -723,15 +727,31 @@ class LeaderTeleopBridge:
 
         follower_start = list(obs.positions)
         leader_target = self.read_leader_target()
-        self._check_alignment_gap(leader_target, follower_start, stage="initial")
+        gap = self._check_alignment_gap(leader_target, follower_start, stage="initial")
 
-        self._activated = True
+        ramp_steps = max(1, int(round(self.ramp_seconds * self.fps)))
+        if ramp_steps > 0 and (1.875 * gap / ramp_steps) > 0.34:
+            safe_steps = max(ramp_steps, math.ceil(1.875 * gap / 0.34))
+            log.warning(
+                "Extending ramp from %d to %d steps (%.2fs) so quintic peak step stays within armd 0.35 rad servo limit",
+                ramp_steps,
+                safe_steps,
+                safe_steps / self.fps,
+            )
+            ramp_steps = safe_steps
+
+        if self._stop:
+            return
 
         if not obs.is_torqued or not obs.is_operational:
+            if self._stop:
+                return
             log.info("enabling follower torque before ramp ...")
             self.session.torque(True)
             deadline = time.monotonic() + 5.0
             while not (obs.is_torqued and obs.is_operational):
+                if self._stop:
+                    return
                 rem = max(0.1, deadline - time.monotonic())
                 if time.monotonic() >= deadline:
                     raise LeaderError("timed out waiting for follower to enable torque and become operational")
@@ -741,9 +761,22 @@ class LeaderTeleopBridge:
                 raise LeaderError(f"expected 6 follower positions after enabling torque, got {len(obs.positions)}")
             follower_start = list(obs.positions)
             leader_target = self.read_leader_target()
-            self._check_alignment_gap(leader_target, follower_start, stage="post-torque")
+            post_gap = self._check_alignment_gap(leader_target, follower_start, stage="post-torque")
+            if ramp_steps > 0 and (1.875 * post_gap / ramp_steps) > 0.34:
+                safe_steps = max(ramp_steps, math.ceil(1.875 * post_gap / 0.34))
+                log.warning(
+                    "Extending ramp from %d to %d steps (%.2fs) so quintic peak step stays within armd 0.35 rad servo limit",
+                    ramp_steps,
+                    safe_steps,
+                    safe_steps / self.fps,
+                )
+                ramp_steps = safe_steps
 
-        ramp_steps = max(1, int(round(self.ramp_seconds * self.fps)))
+        if self._stop:
+            return
+
+        self._activated = True
+
         period = 1.0 / self.fps
         t0 = time.monotonic()
         for step in range(1, ramp_steps + 1):
@@ -829,7 +862,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument(
         "--i-am-at-the-arm",
         action="store_true",
-        help="required when initial gap exceeds threshold: confirms operator is watching follower arm",
+        help="required on real hardware (non-mock/sim follower): confirms operator is standing at the follower arm with a way to cut power",
     )
     p.add_argument(
         "--max-gap-rad",
@@ -910,21 +943,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             return 1
 
-        session = ArmSession(client, safe_exit="off").open()
-        session._schema = schema
-        bridge = LeaderTeleopBridge(
-            bus,
-            session,
-            schema,
-            calib=calib,
-            fps=args.fps,
-            ramp_seconds=args.ramp_seconds,
-            max_gap_rad=args.max_gap_rad,
-            operator_present=args.i_am_at_the_arm,
-            allow_large_gap=args.allow_large_gap,
-            park_on_exit=not args.no_park,
-        )
-
         def _sig_handler(*_: Any) -> None:
             if bridge:
                 bridge.stop()
@@ -941,6 +959,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 1
+
+        session = ArmSession(client, safe_exit="off").open()
+        session._schema = schema
+        bridge = LeaderTeleopBridge(
+            bus,
+            session,
+            schema,
+            calib=calib,
+            fps=args.fps,
+            ramp_seconds=args.ramp_seconds,
+            max_gap_rad=args.max_gap_rad,
+            operator_present=args.i_am_at_the_arm,
+            allow_large_gap=args.allow_large_gap,
+            park_on_exit=not args.no_park,
+        )
 
         bridge.run()
         if bridge._error is not None:

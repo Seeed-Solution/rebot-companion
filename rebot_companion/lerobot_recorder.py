@@ -534,7 +534,9 @@ class LeRobotRecorder:
         self.robot_type = robot_type
         self.joint_names = list(joint_names)
         self.connect_timeout = connect_timeout
-        self.unit_mode = units.resolve_unit_mode(unit_mode)
+        if unit_mode == "auto" or unit_mode not in ("rad", "so101_norm", "deg"):
+            raise ValueError(f"unit_mode must be one of ('rad', 'so101_norm', 'deg'), got {unit_mode!r}")
+        self.unit_mode = unit_mode
         self.armd_host = armd_host
         self.schema = None
         self.profile_id: str | None = None

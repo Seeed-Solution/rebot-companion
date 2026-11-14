@@ -245,13 +245,23 @@ class SinePolicy(Policy):
 
         if isinstance(self.target_joint, str) and not self.target_joint.isdigit():
             target = self.target_joint
-            if target in joint_names:
-                self.joint = joint_names.index(target)
-            elif target in JOINT_NAMES and JOINT_NAMES.index(target) < dof:
-                self.joint = JOINT_NAMES.index(target)
+            if joint_names:
+                if target in joint_names:
+                    self.joint = joint_names.index(target)
+                else:
+                    raise RunnerError(
+                        f"unknown joint name {target!r} in sine policy (schema joints: {joint_names})"
+                    )
+            elif target in JOINT_NAMES:
+                idx = JOINT_NAMES.index(target)
+                if idx >= dof or (gripper_joint is not None and idx == gripper_joint):
+                    raise RunnerError(
+                        f"unknown joint name {target!r} in sine policy (schema joints: {JOINT_NAMES[:dof]})"
+                    )
+                self.joint = idx
             else:
                 raise RunnerError(
-                    f"unknown joint name {target!r} in sine policy (schema joints: {joint_names or JOINT_NAMES[:dof]})"
+                    f"unknown joint name {target!r} in sine policy (schema joints: {JOINT_NAMES[:dof]})"
                 )
             return
 
@@ -966,12 +976,18 @@ class PolicyRunner:
             elif not is_so_arm:
                 log.warning("LeRobotPolicy metadata/stats unavailable; falling back to rad units on 7-DOF arm")
 
-        self.action_units = units.resolve_unit_mode(
-            self.action_units_requested, policy_info, require_metadata=require_meta
-        )
-        self.state_units = units.resolve_unit_mode(
-            self.state_units_requested, policy_info, require_metadata=require_meta
-        )
+        if isinstance(self.policy, SinePolicy):
+            if self.action_units_requested not in ("auto", "rad") or self.state_units_requested not in ("auto", "rad"):
+                raise RunnerError("sine policy works in radians only; omit --state-units/--action-units or pass 'rad'")
+            self.action_units = "rad"
+            self.state_units = "rad"
+        else:
+            self.action_units = units.resolve_unit_mode(
+                self.action_units_requested, policy_info, require_metadata=require_meta
+            )
+            self.state_units = units.resolve_unit_mode(
+                self.state_units_requested, policy_info, require_metadata=require_meta
+            )
 
     def _observation(self, obs: ArmStatus) -> dict[str, np.ndarray]:
         positions = units.from_armd(
