@@ -83,6 +83,7 @@ class SafeExitOutcome:
 
     ``action``: ``not_needed`` (torque already off), ``unloaded``, ``unsupported`` (armd has no
     resting-pose profile; arm left torqued), ``estop`` (E-stop latched; not cleared automatically),
+    ``fault`` (non-recoverable fault; not cleared automatically),
     ``no_lease`` (lease lost; nothing can be commanded) or ``failed``.
     """
 
@@ -451,8 +452,14 @@ class ObservationSchema:
         else:
             arm_dof = 6 if dof == 7 else (dof if dof < 6 else None)
 
-        raw_gripper_joint = d.get("gripper_joint")
-        gripper_joint = int(raw_gripper_joint) if raw_gripper_joint is not None else (6 if dof == 7 else None)
+        if "gripper_joint" in d:
+            raw_gripper_joint = d["gripper_joint"]
+            gripper_joint = int(raw_gripper_joint) if raw_gripper_joint is not None else None
+        else:
+            gripper_joint = 6 if dof == 7 and arm_dof != 7 else None
+
+        if gripper_joint is not None and not (0 <= gripper_joint < dof):
+            raise ValueError(f"gripper_joint {gripper_joint} out of range for dof={dof}")
 
         raw_orientation_dof = d.get("orientation_dof")
         if raw_orientation_dof is not None:
@@ -850,7 +857,22 @@ class ArmSession:
             if obs.e_stopped:
                 return SafeExitOutcome("estop", "EStop is latched; not cleared automatically, arm left holding")
             if obs.faulted:
-                self.clear_fault(obs, recheck=lambda o: o.faulted and not o.e_stopped)
+                def _is_rec(o: ArmStatus) -> bool:
+                    if o.fault is not None:
+                        return bool(o.recoverable)
+                    if self._schema is not None and self._schema.has("fault_codes"):
+                        return False
+                    return o.fault_reason in ("WatchdogTimeout", "ControlDeadline", "HandoverUnsettled")
+
+                if not _is_rec(obs):
+                    return SafeExitOutcome(
+                        "fault",
+                        f"Fault ({obs.fault_code or obs.fault_reason or obs.safety_state}) is not recoverable; not cleared automatically, arm left holding",
+                    )
+                self.clear_fault(
+                    obs,
+                    recheck=lambda o: o.faulted and not o.e_stopped and _is_rec(o),
+                )
                 obs = self.wait_for_observation(timeout=1.0)
             if not obs.is_operational:
                 self.torque(True)  # re-arm after clear_fault; plans no motion
@@ -1685,7 +1707,7 @@ class ArmSession:
             for i, (t, r) in enumerate(zip(target, ref)):
                 if gj is not None and i == gj:
                     continue
-                if gj is None and i == GRIPPER_INDEX and len(target) >= 7:
+                if self._schema is None and gj is None and i == GRIPPER_INDEX and len(target) >= 7:
                     continue
                 if abs(t - r) > SERVO_MAX_STEP:
                     raise ServoJumpError(
@@ -1751,7 +1773,7 @@ class ArmSession:
             gj = self.gripper_joint
             if gj is not None and len(target) > gj:
                 tol[gj] = None
-            elif gj is None and len(target) >= 7:
+            elif self._schema is None and gj is None and len(target) >= 7:
                 tol[6] = None
             return tol
         if isinstance(tolerance, (int, float)):

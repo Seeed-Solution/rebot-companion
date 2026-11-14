@@ -637,7 +637,7 @@ class Controller:
                 # 2-DOF orientation arm: pitch/roll controllable, yaw is coupled
                 if yaw_deg is None:
                     caps = sch.capabilities or {}
-                    if caps.get("auto_yaw") is False:
+                    if caps.get("auto_yaw") is not True:
                         raise ToolFail("UNSUPPORTED", "armd does not advertise auto_yaw capability")
                     if roll_deg is None or pitch_deg is None:
                         if cur_rpy is None:

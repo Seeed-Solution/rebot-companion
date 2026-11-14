@@ -93,6 +93,10 @@ class HandEyeResult:
 B601_COMPATIBLE_PROFILES = frozenset(
     {
         "b601",
+        "b601-dm",
+        "b601-rs",
+        "b601dm",
+        "b601rs",
         "rebot-b601",
         "rebot-b601dm",
         "rebot-b601-dm",

@@ -590,12 +590,12 @@ class LeRobotRecorder:
             schema = client.get_schema()
             if self.unit_mode != "rad":
                 if not schema.limits:
-                    raise RuntimeError(
+                    raise RecorderError(
                         f"armd schema joint limits required for non-radian unit_mode {self.unit_mode!r}"
                     )
                 if self.unit_mode == "so101_norm" and schema.gripper_joint is None:
                     if schema.arm_dof != 6:
-                        raise RuntimeError(
+                        raise RecorderError(
                             f"armd schema gripper_joint required for unit_mode {self.unit_mode!r} "
                             f"(arm_dof={schema.arm_dof} != 6)"
                         )
@@ -612,8 +612,10 @@ class LeRobotRecorder:
                 )
             self._schema_fetched = True
         except Exception as exc:
+            if isinstance(exc, RecorderError):
+                raise
             if self.unit_mode != "rad":
-                raise RuntimeError(
+                raise RecorderError(
                     f"failed to fetch schema from armd at {self.armd_host} for unit_mode {self.unit_mode!r}: {exc}"
                 ) from exc
             log.info("schema fetch skipped or unavailable: %s", exc)
@@ -716,8 +718,8 @@ class LeRobotRecorder:
         if i == 0:
             self._dof = len(state)
             if self.arm_dof is None:
-                self.arm_dof = 6 if self._dof >= 6 else self._dof
-            if self.gripper_joint is None and self._dof == 7:
+                self.arm_dof = (6 if self._dof >= 6 else self._dof) if self.schema is not None else None
+            if self.gripper_joint is None and self._dof == 7 and self.schema is not None:
                 self.gripper_joint = 6
         if len(state) != self._dof or len(action) != self._dof:
             raise ValueError(f"state and action need {self._dof} values")

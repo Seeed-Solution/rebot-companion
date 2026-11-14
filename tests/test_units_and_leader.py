@@ -658,9 +658,8 @@ def test_leader_bridge_rejects_7dof_before_torque_or_servo():
         ],
     })
 
-    bridge = LeaderTeleopBridge(bus, mock_session, schema)
-
     with pytest.raises(LeaderError, match="expected 6 DOF for SO-ARM101"):
+        bridge = LeaderTeleopBridge(bus, mock_session, schema)
         bridge.align_and_ramp()
 
     # Crucial safety check: torque and servo MUST NOT have been called
@@ -866,6 +865,7 @@ def test_mcp_server_auto_yaw_on_orient_dof_2():
         "arm_dof": 5,
         "gripper_joint": 5,
         "orientation_dof": 2,
+        "capabilities": {"version": 7, "auto_yaw": True},
         "limits": [
             {"name": f"j{i}", "min_position": -3.14, "max_position": 3.14, "max_velocity": 2.0, "max_acceleration": 5.0}
             for i in range(6)
@@ -2052,6 +2052,7 @@ def test_sine_policy_joint6_rejected_and_unit_enforcement():
         "dof": 6,
         "arm_dof": 5,
         "gripper_joint": 5,
+        "capabilities": {"version": 7, "auto_yaw": True},
         "limits": [
             {"name": f"j{i}", "min_position": -3.14, "max_position": 3.14, "max_velocity": 2.0, "max_acceleration": 5.0}
             for i in range(6)
@@ -2117,6 +2118,7 @@ def test_mcp_format_tcp_and_move_to_quat_and_partial_orientation():
         "dof": 6,
         "arm_dof": 5,
         "gripper_joint": 5,
+        "capabilities": {"version": 7, "auto_yaw": True},
         "limits": [
             {"name": f"j{i}", "min_position": -3.14, "max_position": 3.14, "max_velocity": 2.0, "max_acceleration": 5.0}
             for i in range(6)
@@ -2638,7 +2640,13 @@ def test_leader_bridge_velocity_bounded_ramp_and_settle():
     bridge = LeaderTeleopBridge(
         bus, mock_session, schema, fps=50, ramp_seconds=0.2, max_gap_rad=1.0, allow_large_gap=True
     )
-    with patch("time.sleep", return_value=None):
+    cur_t = 1000.0
+    def fake_sleep(d):
+        nonlocal cur_t
+        cur_t += d
+    def fake_monotonic():
+        return cur_t
+    with patch("time.sleep", side_effect=fake_sleep), patch("time.monotonic", side_effect=fake_monotonic):
         bridge.align_and_ramp()
 
     assert bridge._activated is True
@@ -3183,3 +3191,202 @@ def test_lerobot_homing_offset_preserves_center_over_feetech_zero_step():
         assert bridge.calib.joints[i].center == 2048
         assert bridge.calib.joints[i].explicit_center is True
         assert getattr(bridge.calib.joints[i], "defaulted", False) is False
+
+
+def test_leader_teleop_run_rapid_swing_frame_step_clamp():
+    """Rapid swing (+0.30 -> -0.30 rad) with static obs.commanded_positions does not jump > 0.30 rad between consecutive frames."""
+    from unittest.mock import patch
+
+    bus = MagicMock()
+    targets = [
+        [0.30, 0.0, 0.0, 0.0, 0.0, 0.0],
+        [-0.30, 0.0, 0.0, 0.0, 0.0, 0.0],
+    ]
+    step = 0
+    def read_sync(sids):
+        nonlocal step
+        target = targets[min(step, len(targets) - 1)]
+        return {sid: int(2048 + target[i] * 4096 / (2 * math.pi)) for i, sid in enumerate(sids)}
+
+    bus.read_positions_sync.side_effect = read_sync
+
+    mock_session = MagicMock()
+    mock_session.client.get_safety_describe.return_value = {"device": {"follower": "mock"}}
+    mock_obs = MagicMock()
+    mock_obs.positions = [0.0] * 6
+    mock_obs.commanded_positions = [0.0] * 6
+    mock_obs.safety_state = "Armed"
+    mock_obs.is_stopped = False
+    mock_obs.is_torqued = True
+    mock_obs.is_operational = True
+    mock_obs.collision = None
+    mock_session.wait_for_observation.return_value = mock_obs
+    mock_session.latest_observation.return_value = mock_obs
+
+    schema = ObservationSchema.from_dict({
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "limits": [
+            {"name": f"j{i}", "min_position": -3.14, "max_position": 3.14, "max_velocity": 2.0, "max_acceleration": 5.0}
+            for i in range(6)
+        ],
+    })
+
+    sent_frames = []
+    def on_servo(cmd):
+        nonlocal step
+        sent_frames.append(list(cmd))
+        step += 1
+        if len(sent_frames) >= 2:
+            bridge.stop()
+
+    mock_session.servo.side_effect = on_servo
+
+    bridge = LeaderTeleopBridge(bus, mock_session, schema, fps=50)
+    with patch.object(bridge, "align_and_ramp"):
+        with patch("time.sleep", return_value=None):
+            bridge.run()
+
+    assert len(sent_frames) >= 2
+    delta_j0 = abs(sent_frames[1][0] - sent_frames[0][0])
+    assert delta_j0 <= 0.300001, f"Frame jumped {delta_j0} rad (> 0.30 rad)"
+    assert sent_frames[0][0] == pytest.approx(0.30, abs=1e-3)
+    assert sent_frames[1][0] == pytest.approx(0.00, abs=1e-3)
+
+
+def test_policy_runner_normalization_bounds_validation():
+    from rebot_companion.policy_runner import PolicyRunner, RunnerError
+    mock_client = MagicMock()
+    mock_client.request.return_value.json.return_value = {
+        "dof": 6, "arm_dof": 5, "gripper_joint": 5, "limits": [
+            {"name": f"j{i}", "min_position": -2.0, "max_position": 2.0, "max_velocity": 2.0, "max_acceleration": 5.0}
+            for i in range(6)
+        ],
+        "profile_id": "so-arm101",
+    }
+    mock_client.request.return_value.raise_for_status = lambda: None
+    mock_client.get_safety_describe.return_value = {"device": {"follower": "mock"}}
+
+    policy = MagicMock()
+    policy.action_dim = 6
+    policy.inputs = ("observation.state",)
+    policy.image_key = None
+
+    # 1. lo == hi in limits
+    policy.info = {"unit_mode": "so101_norm", "normalization_bounds": {"limits": [[1.0, 1.0]] + [[-2.0, 2.0]] * 5}}
+    runner = PolicyRunner(mock_client, policy, action_units="so101_norm", state_units="so101_norm", fps=10)
+    with pytest.raises(RunnerError, match="range must satisfy abs"):
+        runner._read_arm()
+
+    # 2. NaN in limits
+    policy.info = {"unit_mode": "so101_norm", "normalization_bounds": {"limits": [[float("nan"), 1.0]] + [[-2.0, 2.0]] * 5}}
+    runner = PolicyRunner(mock_client, policy, action_units="so101_norm", state_units="so101_norm", fps=10)
+    with pytest.raises(RunnerError, match="must be finite floats"):
+        runner._read_arm()
+
+    # 3. Invalid closed_rad
+    policy.info = {"unit_mode": "so101_norm", "normalization_bounds": {"closed_rad": "not-a-float"}}
+    runner = PolicyRunner(mock_client, policy, action_units="so101_norm", state_units="so101_norm", fps=10)
+    with pytest.raises(RunnerError, match="closed_rad must be float"):
+        runner._read_arm()
+
+    # 4. open_rad == closed_rad
+    policy.info = {"unit_mode": "so101_norm", "normalization_bounds": {"closed_rad": 1.0, "open_rad": 1.0}}
+    runner = PolicyRunner(mock_client, policy, action_units="so101_norm", state_units="so101_norm", fps=10)
+    with pytest.raises(RunnerError, match="abs.open_rad - closed_rad. > 1e-6"):
+        runner._read_arm()
+
+
+def test_policy_runner_recorded_closed_rad_without_limits():
+    from rebot_companion.policy_runner import PolicyRunner
+    mock_client = MagicMock()
+    mock_client.request.return_value.json.return_value = {
+        "dof": 6, "arm_dof": 5, "gripper_joint": 5, "limits": [
+            {"name": f"j{i}", "min_position": -2.0, "max_position": 2.0, "max_velocity": 2.0, "max_acceleration": 5.0}
+            for i in range(6)
+        ],
+        "profile_id": "so-arm101",
+    }
+    mock_client.request.return_value.raise_for_status = lambda: None
+    mock_client.get_safety_describe.return_value = {"device": {"follower": "mock"}}
+
+    policy = MagicMock()
+    policy.action_dim = 6
+    policy.inputs = ("observation.state",)
+    policy.image_key = None
+    policy.info = {
+        "unit_mode": "so101_norm",
+        "normalization_bounds": {"closed_rad": 0.1, "open_rad": 1.4},  # No limits key!
+    }
+
+    runner = PolicyRunner(mock_client, policy, action_units="so101_norm", state_units="so101_norm", fps=10)
+    runner._read_arm()
+    assert runner._recorded_limits is None
+    assert runner._recorded_closed_rad == 0.1
+    assert runner._recorded_open_rad == 1.4
+
+    obs = ArmStatus(
+        timestamp=1.0, positions=[0.0] * 6, velocities=[0.0] * 6, torques=[0.0] * 6,
+        temperatures=[25.0] * 6, is_torqued=True, safety_state="Armed", epoch_id=1,
+    )
+    res = runner._observation(obs)
+    assert len(res["observation.state"]) == 6
+
+
+def test_policy_runner_post_conversion_nan_guard():
+    import numpy as np
+    from rebot_companion.policy_runner import PolicyRunner
+    mock_client = MagicMock()
+    mock_client.request.return_value.json.return_value = {
+        "dof": 6, "arm_dof": 5, "gripper_joint": 5, "limits": [
+            {"name": f"j{i}", "min_position": -2.0, "max_position": 2.0, "max_velocity": 2.0, "max_acceleration": 5.0}
+            for i in range(6)
+        ],
+        "profile_id": "so-arm101",
+    }
+    mock_client.request.return_value.raise_for_status = lambda: None
+    mock_client.get_safety_describe.return_value = {"device": {"follower": "mock"}}
+
+    policy = MagicMock()
+    policy.action_dim = 6
+    policy.inputs = ("observation.state",)
+    policy.image_key = None
+    policy.info = {"unit_mode": "rad"}
+    policy._inference_thread = None
+    policy.async_infer = False
+
+    runner = PolicyRunner(mock_client, policy, action_units="so101_norm", state_units="so101_norm", fps=10, max_seconds=1.0)
+    runner.dof = 6
+    runner.action_units = "so101_norm"
+    runner.limits = [(-2.0, 2.0)] * 6
+    runner.gripper_joint = 5
+    runner.closed_rad = 0.0
+    runner.open_rad = 1.0
+
+    # Policy returns action that results in NaN after conversion (or units.to_armd returns NaN)
+    from unittest.mock import patch
+    mock_session = MagicMock()
+    mock_session.is_open = True
+    mock_session.has_lease = True
+    mock_session.lease_lost = None
+    mock_session.close = MagicMock()
+    mock_session.set_schema = MagicMock()
+    mock_obs = ArmStatus(
+        timestamp=1.0, positions=[0.0] * 6, velocities=[0.0] * 6, torques=[0.0] * 6,
+        temperatures=[25.0] * 6, is_torqued=True, safety_state="Armed", epoch_id=1,
+    )
+    mock_session.wait_for_observation.return_value = mock_obs
+    mock_session.latest_observation_timed.side_effect = lambda: (time.monotonic(), mock_obs)
+    mock_session.latest_observation.return_value = mock_obs
+
+    runner._start_sender = MagicMock()
+    runner._stop_sender = MagicMock(return_value=True)
+    runner._finish = MagicMock()
+    runner._infer = MagicMock(return_value=(True, [0.0] * 6))
+
+    with patch("rebot_companion.policy_runner.ArmSession.open", return_value=mock_session), \
+         patch("rebot_companion.units.to_armd", return_value=[0.0, 0.0, 0.0, float("nan"), 0.0, 0.0]):
+        runner.run()
+
+    assert runner.result.reason == "bad_action"

@@ -1030,11 +1030,48 @@ class PolicyRunner:
                             f"normalization_bounds limits length ({len(rec_lims) if isinstance(rec_lims, (list, tuple)) else 'invalid'}) "
                             f"does not match arm DOF ({self.dof})"
                         )
-                    self._recorded_limits = [(float(lim[0]), float(lim[1])) for lim in rec_lims]
-                if norm_b.get("closed_rad") is not None:
-                    self._recorded_closed_rad = float(norm_b["closed_rad"])
-                if norm_b.get("open_rad") is not None:
-                    self._recorded_open_rad = float(norm_b["open_rad"])
+                    parsed_lims = []
+                    for i, lim in enumerate(rec_lims):
+                        if not isinstance(lim, (list, tuple)) or len(lim) != 2:
+                            raise RunnerError(f"normalization_bounds limits[{i}] must be sequence of length 2, got {lim!r}")
+                        try:
+                            lo = float(lim[0])
+                            hi = float(lim[1])
+                        except (ValueError, TypeError) as exc:
+                            raise RunnerError(f"normalization_bounds limits[{i}] values must be floats, got {lim!r}: {exc}") from exc
+                        if not (math.isfinite(lo) and math.isfinite(hi)):
+                            raise RunnerError(f"normalization_bounds limits[{i}] values must be finite floats, got ({lo}, {hi})")
+                        if abs(hi - lo) <= 1e-6:
+                            raise RunnerError(f"normalization_bounds limits[{i}] range must satisfy abs(hi - lo) > 1e-6, got ({lo}, {hi})")
+                        parsed_lims.append((lo, hi))
+                    self._recorded_limits = parsed_lims
+
+                if "closed_rad" in norm_b and norm_b.get("closed_rad") is not None:
+                    val = norm_b["closed_rad"]
+                    try:
+                        c_rad = float(val)
+                    except (ValueError, TypeError) as exc:
+                        raise RunnerError(f"normalization_bounds closed_rad must be float, got {val!r}: {exc}") from exc
+                    if not math.isfinite(c_rad):
+                        raise RunnerError(f"normalization_bounds closed_rad must be finite, got {val!r}")
+                    self._recorded_closed_rad = c_rad
+
+                if "open_rad" in norm_b and norm_b.get("open_rad") is not None:
+                    val = norm_b["open_rad"]
+                    try:
+                        o_rad = float(val)
+                    except (ValueError, TypeError) as exc:
+                        raise RunnerError(f"normalization_bounds open_rad must be float, got {val!r}: {exc}") from exc
+                    if not math.isfinite(o_rad):
+                        raise RunnerError(f"normalization_bounds open_rad must be finite, got {val!r}")
+                    self._recorded_open_rad = o_rad
+
+                if self._recorded_closed_rad is not None and self._recorded_open_rad is not None:
+                    if abs(self._recorded_open_rad - self._recorded_closed_rad) <= 1e-6:
+                        raise RunnerError(
+                            f"normalization_bounds open_rad ({self._recorded_open_rad}) and closed_rad ({self._recorded_closed_rad}) "
+                            f"must satisfy abs(open_rad - closed_rad) > 1e-6"
+                        )
             elif (
                 (self.action_units == "so101_norm" or self.state_units == "so101_norm")
                 and not (isinstance(policy_info, dict) and policy_info.get("rebot_unit_mode"))
@@ -1050,14 +1087,10 @@ class PolicyRunner:
             limits = self._lerobot_limits
             closed_rad = self._lerobot_closed_rad
             open_rad = self._lerobot_open_rad
-        elif self._recorded_limits is not None:
-            limits = self._recorded_limits
+        else:
+            limits = self._recorded_limits if self._recorded_limits is not None else self.limits
             closed_rad = self._recorded_closed_rad if self._recorded_closed_rad is not None else self.closed_rad
             open_rad = self._recorded_open_rad if self._recorded_open_rad is not None else self.open_rad
-        else:
-            limits = self.limits
-            closed_rad = self.closed_rad
-            open_rad = self.open_rad
         positions = units.from_armd(
             obs.positions,
             self.state_units,
@@ -1419,16 +1452,12 @@ class PolicyRunner:
                     limits = self._lerobot_limits
                     closed_rad = self._lerobot_closed_rad
                     open_rad = self._lerobot_open_rad
-                elif self._recorded_limits is not None:
-                    limits = self._recorded_limits
+                else:
+                    limits = self._recorded_limits if self._recorded_limits is not None else self.limits
                     closed_rad = (
                         self._recorded_closed_rad if self._recorded_closed_rad is not None else self.closed_rad
                     )
                     open_rad = self._recorded_open_rad if self._recorded_open_rad is not None else self.open_rad
-                else:
-                    limits = self.limits
-                    closed_rad = self.closed_rad
-                    open_rad = self.open_rad
                 action_rad = units.to_armd(
                     action.tolist(),
                     self.action_units,
@@ -1437,7 +1466,10 @@ class PolicyRunner:
                     closed_rad=closed_rad,
                     open_rad=open_rad,
                 )
-                action = np.asarray(action_rad, dtype=np.float64)
+                action = np.asarray(action_rad, dtype=np.float64).reshape(-1)
+                if action.shape[0] != self.dof or not np.all(np.isfinite(action)):
+                    self.request_stop("bad_action", f"post-conversion action returned {action.tolist()}")
+                    break
             self._publish(action)
             self.result.steps = k + 1
             if self._log_file is not None:

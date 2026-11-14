@@ -333,7 +333,7 @@ def test_safe_exit_clears_fault_then_unloads(armd):
     with pytest.raises(ArmFaultError):
         with armd.client.session(client_id="flt") as s:
             s.torque(True)
-            threading.Timer(0.1, armd.trigger_fault, args=("Other",)).start()
+            threading.Timer(0.1, armd.trigger_fault, args=("WatchdogTimeout",)).start()
             s.move_to(q(0.6), duration=1.0)
     assert s.safe_exit_outcome.action == "unloaded"
     assert armd.commands[-3:] == ["/api/v1/safety/clear_fault", "/api/v1/torque", "/api/v1/motion/unload"]

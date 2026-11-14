@@ -120,6 +120,9 @@ class LeaderTransport:
     def flush(self) -> None:
         pass
 
+    def drain(self) -> None:
+        pass
+
     def close(self) -> None:
         pass
 
@@ -240,6 +243,15 @@ class PosixSerialTransport(LeaderTransport):
         except Exception:
             pass
 
+    def drain(self) -> None:
+        import termios
+
+        if getattr(self, "fd", -1) >= 0:
+            try:
+                termios.tcdrain(self.fd)
+            except Exception:
+                pass
+
     def close(self) -> None:
         if getattr(self, "fd", -1) >= 0:
             try:
@@ -266,7 +278,12 @@ class PySerialTransport(LeaderTransport):
 
     def flush(self) -> None:
         self.ser.reset_input_buffer()
-        self.ser.reset_output_buffer()
+
+    def drain(self) -> None:
+        try:
+            self.ser.flush()
+        except Exception:
+            pass
 
     def close(self) -> None:
         self.ser.close()
@@ -349,6 +366,7 @@ class FeetechSerialBus:
         self.transport.write(encode_packet(0xFE, INST_WRITE, [REG_TORQUE_ENABLE, 0]))
         for sid in servo_ids:
             self.transport.write(encode_packet(sid, INST_WRITE, [REG_TORQUE_ENABLE, 0]))
+        self.transport.drain()
 
     def read_positions_sequential(
         self,
@@ -632,8 +650,10 @@ class LeaderCalibration:
             else:
                 if g_closed is None:
                     g_closed = 2048
+                    has_defaulted = True
                 if g_open is None:
                     g_open = 3072
+                    has_defaulted = True
 
         if not (0 <= g_closed <= 4095) or not (0 <= g_open <= 4095) or g_closed == g_open:
             raise LeaderError(
@@ -731,6 +751,12 @@ class LeaderTeleopBridge:
         if not (isinstance(ramp_seconds, (int, float)) and math.isfinite(ramp_seconds) and ramp_seconds >= 0.2):
             raise LeaderError(f"ramp_seconds must be >= 0.2, got {ramp_seconds!r}")
 
+        if schema.dof != 6 or schema.arm_dof not in (5, None) or schema.gripper_joint != 5:
+            raise LeaderError(
+                f"expected 6 DOF for SO-ARM101 (schema.dof={schema.dof}, "
+                f"schema.arm_dof={schema.arm_dof}, schema.gripper_joint={schema.gripper_joint})"
+            )
+
         self.bus = bus
         self.session = session
         self.schema = schema
@@ -820,6 +846,7 @@ class LeaderTeleopBridge:
         self._stop = False
         self._activated = False
         self._error: BaseException | None = None
+        self._last_servo_cmd: list[float] | None = None
         self.frames_sent = 0
 
         self._last_obs_timestamp: float | None = None
@@ -933,10 +960,10 @@ class LeaderTeleopBridge:
         if self._stop:
             return
 
-        if self.schema.dof != 6 or self.schema.arm_dof != 5:
+        if self.schema.dof != 6 or self.schema.arm_dof not in (5, None) or self.schema.gripper_joint != 5:
             raise LeaderError(
                 f"expected 6 DOF for SO-ARM101 (schema.dof={self.schema.dof}, "
-                f"schema.arm_dof={self.schema.arm_dof})"
+                f"schema.arm_dof={self.schema.arm_dof}, schema.gripper_joint={self.schema.gripper_joint})"
             )
         if len(self.limits) != 6:
             raise LeaderError(f"expected 6 joint limits for SO-ARM101, got {len(self.limits)}")
@@ -1021,7 +1048,7 @@ class LeaderTeleopBridge:
         period = 1.0 / self.fps
         t0 = time.monotonic()
         prev_cmd = list(follower_start)
-        prev_t = t0
+        prev_t = t0 - period
         v_cap = max_ramp_vel
         for step in range(1, ramp_steps + 1):
             if self._stop:
@@ -1042,7 +1069,7 @@ class LeaderTeleopBridge:
                 break
             interp = [(1.0 - alpha) * flw + alpha * ldr for flw, ldr in zip(follower_start, cur_leader)]
             now = time.monotonic()
-            dt = min(max(now - prev_t, period), 3.0 * period)
+            dt = min(max(now - prev_t, 1e-3), 3.0 * period)
             prev_t = now
             for j in range(min(len(interp), len(ref))):
                 if j != self.gripper_joint and j < 5:
@@ -1051,9 +1078,12 @@ class LeaderTeleopBridge:
                     interp[j] = min(max(interp[j], ref[j] - self.arm_lead), ref[j] + self.arm_lead)
             prev_cmd = list(interp)
             self.session.servo(interp)
+            self._last_servo_cmd = list(interp)
             self.frames_sent += 1
             if due > now:
                 time.sleep(due - now)
+            elif now > due:
+                t0 += now - due
             if self._stop:
                 break
 
@@ -1076,7 +1106,7 @@ class LeaderTeleopBridge:
                     settle_steps,
                 )
                 t_settle_start = time.monotonic()
-                prev_t = t_settle_start
+                prev_t = t_settle_start - period
                 for step in range(1, settle_steps + 1):
                     if self._stop:
                         break
@@ -1101,7 +1131,7 @@ class LeaderTeleopBridge:
                         break
                     settle_cmd = list(cur_leader)
                     now = time.monotonic()
-                    dt = min(max(now - prev_t, period), 3.0 * period)
+                    dt = min(max(now - prev_t, 1e-3), 3.0 * period)
                     prev_t = now
                     for j in range(min(len(settle_cmd), len(ref))):
                         if j != self.gripper_joint and j < 5:
@@ -1110,9 +1140,12 @@ class LeaderTeleopBridge:
                             settle_cmd[j] = min(max(settle_cmd[j], ref[j] - self.arm_lead), ref[j] + self.arm_lead)
                     prev_cmd = list(settle_cmd)
                     self.session.servo(settle_cmd)
+                    self._last_servo_cmd = list(settle_cmd)
                     self.frames_sent += 1
                     if due > now:
                         time.sleep(due - now)
+                    elif now > due:
+                        t_settle_start += now - due
                 if arm_gap > 0.08:
                     log.warning(
                         "Settle phase finished with arm_gap=%.3f rad remaining (> 0.08 rad)",
@@ -1157,11 +1190,14 @@ class LeaderTeleopBridge:
                 if self._stop:
                     break
                 clamped_target = list(target)
+                prev = self._last_servo_cmd or list(ref)
+                max_frame_step = 0.30
                 saturated = False
                 for j in range(min(len(clamped_target), len(ref))):
                     if j != self.gripper_joint and j < 5:
                         orig_val = clamped_target[j]
                         clamped_val = min(max(orig_val, ref[j] - self.arm_lead), ref[j] + self.arm_lead)
+                        clamped_val = min(max(clamped_val, prev[j] - max_frame_step), prev[j] + max_frame_step)
                         if clamped_val != orig_val:
                             saturated = True
                         clamped_target[j] = clamped_val
@@ -1183,6 +1219,7 @@ class LeaderTeleopBridge:
                     self._lead_clamp_consecutive = 0
 
                 self.session.servo(clamped_target)
+                self._last_servo_cmd = list(clamped_target)
                 self.frames_sent += 1
             except (LeaderError, ServoRejected, LeaseError, ArmConnectionError, RebotError, OSError) as exc:
                 self._error = exc
@@ -1280,7 +1317,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"rebot-teleop-leader: failed to fetch armd schema: {exc}", file=sys.stderr)
             return 1
 
-        if schema.dof != 6 or schema.arm_dof != 5:
+        if schema.dof != 6 or schema.arm_dof not in (5, None) or schema.gripper_joint != 5:
             print(
                 f"rebot-teleop-leader: unsupported arm schema (dof={schema.dof}, arm_dof={schema.arm_dof}); "
                 "expected 6 DOF (5 arm + 1 gripper) for SO-ARM101",
@@ -1312,8 +1349,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             stop_requested.set()
             if bridge is not None:
                 bridge.stop()
-            else:
-                raise KeyboardInterrupt
 
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
@@ -1335,7 +1370,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         if stop_requested.is_set():
             return 0
 
-        session = ArmSession(client, safe_exit="off").open()
+        session = ArmSession(client, safe_exit="off")
+        session.open()
+        if stop_requested.is_set():
+            return 0
         if hasattr(session, "set_schema"):
             session.set_schema(schema)
         else:

@@ -372,6 +372,13 @@ class Arm:
         ``speed``: m/s (armd default 0.05).
         ``auto_yaw``: when True on 5-DOF arms (orient_dof=2), armd solves yaw from position.
         """
+        if auto_yaw is True:
+            caps = getattr(getattr(self, "schema", None), "capabilities", None) or {}
+            if caps.get("auto_yaw") is not True:
+                raise UnsupportedError(
+                    "armd does not advertise auto_yaw capability",
+                    code="UNSUPPORTED",
+                )
         return self._motion(
             lambda: self.session.move_pose(xyz, rpy=rpy, linear_speed=speed, timeout=timeout, auto_yaw=auto_yaw),
             f"target {_fmt(xyz)}",

@@ -491,6 +491,7 @@ def test_mcp_server_move_to_2_dof_orientation():
             "gripper_joint": 5,
             "orientation_dof": 2,
             "profile_id": "so-arm101",
+            "capabilities": {"version": 7, "auto_yaw": True},
             "limits": [],
         }
     )
@@ -520,15 +521,57 @@ def test_mcp_server_move_to_2_dof_orientation():
     session.move_pose.return_value = action_res
     ctrl.session = session
 
-    # 1. All angles omitted -> rpy must be None
+    # 1. All angles omitted on 2-DOF arm with auto_yaw: True -> auto_yaw=True, derives roll/pitch from current
     ctrl.move_to(0.25, 0.0, 0.15, None, None, None, None, None, None)
-    session.move_pose.assert_called_with([0.25, 0.0, 0.15], rpy=None, quat=None, linear_speed=None, timeout=None)
+    session.move_pose.assert_called_with([0.25, 0.0, 0.15], rpy=[0.0, 0.5, 0.0], quat=None, linear_speed=None, timeout=None, auto_yaw=True)
 
-    # 2. Only pitch_deg specified, yaw_deg omitted on 2-DOF arm -> does not crash, yaw derives from current
+    # 2. Only pitch_deg specified, yaw_deg omitted on 2-DOF arm with auto_yaw: True -> auto_yaw=True
     ctrl.move_to(0.25, 0.0, 0.15, None, 45.0, None, None, None, None)
     called_rpy = session.move_pose.call_args[1]["rpy"]
     assert len(called_rpy) == 3
     assert math.isclose(called_rpy[1], math.radians(45.0), abs_tol=1e-4)
+    assert session.move_pose.call_args[1]["auto_yaw"] is True
+
+    # 3. auto_yaw omitted/None in capabilities raises UNSUPPORTED
+    no_auto_yaw_sch = ObservationSchema.from_dict({
+        "dof": 6, "arm_dof": 5, "gripper_joint": 5, "orientation_dof": 2,
+        "profile_id": "so-arm101", "capabilities": {"version": 7}, "limits": [],
+    })
+    client.get_schema.return_value = no_auto_yaw_sch
+    ctrl._schema = no_auto_yaw_sch
+    with pytest.raises(ToolFail) as exc_info:
+        ctrl.move_to(0.25, 0.0, 0.15, None, 45.0, None, None, None, None)
+    assert exc_info.value.code == "UNSUPPORTED"
+
+    # 4. auto_yaw False in capabilities raises UNSUPPORTED
+    false_auto_yaw_sch = ObservationSchema.from_dict({
+        "dof": 6, "arm_dof": 5, "gripper_joint": 5, "orientation_dof": 2,
+        "profile_id": "so-arm101", "capabilities": {"version": 7, "auto_yaw": False}, "limits": [],
+    })
+    client.get_schema.return_value = false_auto_yaw_sch
+    ctrl._schema = false_auto_yaw_sch
+    with pytest.raises(ToolFail) as exc_info:
+        ctrl.move_to(0.25, 0.0, 0.15, None, 45.0, None, None, None, None)
+    assert exc_info.value.code == "UNSUPPORTED"
+
+    # 5. Arm.move_to(..., auto_yaw=True) raises UnsupportedError when absent/False
+    from rebot import Arm, UnsupportedError
+    real_arm = object.__new__(Arm)
+    real_arm.schema = no_auto_yaw_sch
+    with pytest.raises(UnsupportedError) as exc_arm:
+        real_arm.move_to([0.2, 0.0, 0.1], auto_yaw=True)
+    assert exc_arm.value.code == "UNSUPPORTED"
+
+    real_arm.schema = false_auto_yaw_sch
+    with pytest.raises(UnsupportedError) as exc_arm:
+        real_arm.move_to([0.2, 0.0, 0.1], auto_yaw=True)
+    assert exc_arm.value.code == "UNSUPPORTED"
+
+    real_arm.schema = schema
+    real_arm.session = session
+    real_arm._motion = lambda fn, *args: fn()
+    real_arm.move_to([0.2, 0.0, 0.1], auto_yaw=True)
+    session.move_pose.assert_called_with([0.2, 0.0, 0.1], rpy=None, linear_speed=None, timeout=None, auto_yaw=True)
 
 
 # ==============================================================================
@@ -815,3 +858,115 @@ def test_mcp_server_auto_yaw_unsupported_when_explicitly_false():
         ctrl.move_to(0.2, 0.0, 0.2, roll_deg=10.0, pitch_deg=20.0, yaw_deg=None, quat=None, speed_mps=None, timeout_s=None)
     assert exc_info.value.code == "UNSUPPORTED"
     assert "armd does not advertise auto_yaw capability" in exc_info.value.message
+
+
+def test_safe_exit_fault_recovery_respects_capabilities():
+    # 1. Nonrecoverable fault (FOLLOWING_ERROR, recoverable: False) does NOT send clear_fault
+    # and returns outcome.action == "fault", outcome.ok is False.
+    s = object.__new__(ArmSession)
+    s._ws = MagicMock()
+    s._closed_reason = None
+    s._generation = 1
+    s._lease_lost = None
+    s.clear_fault = MagicMock()
+    s.unload = MagicMock()
+    s.torque = MagicMock()
+    s._schema = ObservationSchema.from_dict({
+        "dof": 6, "arm_dof": 5, "capabilities": {"version": 6, "fault_codes": True}, "limits": []
+    })
+
+    obs_nonrec = ArmStatus(
+        timestamp=1.0, positions=[0.0] * 6, velocities=[0.0] * 6, torques=[0.0] * 6,
+        temperatures=[25.0] * 6, is_torqued=True, safety_state="Fault", epoch_id=2,
+        fault={"code": "FOLLOWING_ERROR", "message": "stall", "recoverable": False},
+    )
+    s.wait_for_observation = MagicMock(return_value=obs_nonrec)
+
+    outcome = s._safe_exit(timeout=10.0)
+    assert outcome.action == "fault"
+    assert outcome.ok is False
+    assert "not recoverable" in outcome.message
+    s.clear_fault.assert_not_called()
+    s.unload.assert_not_called()
+
+    # 2. Recoverable fault (WATCHDOG_TIMEOUT, recoverable: True) DOES send clear_fault and unloads.
+    obs_rec = ArmStatus(
+        timestamp=1.0, positions=[0.0] * 6, velocities=[0.0] * 6, torques=[0.0] * 6,
+        temperatures=[25.0] * 6, is_torqued=True, safety_state="Fault", epoch_id=3,
+        fault={"code": "WATCHDOG_TIMEOUT", "message": "heartbeat timeout", "recoverable": True},
+    )
+    obs_idle = ArmStatus(
+        timestamp=1.1, positions=[0.0] * 6, velocities=[0.0] * 6, torques=[0.0] * 6,
+        temperatures=[25.0] * 6, is_torqued=True, safety_state="Armed", epoch_id=4,
+    )
+    s.wait_for_observation = MagicMock(side_effect=[obs_rec, obs_idle])
+    outcome = s._safe_exit(timeout=10.0)
+    assert outcome.action == "unloaded"
+    assert outcome.ok is True
+    s.clear_fault.assert_called_once()
+    s.unload.assert_called_once()
+
+
+def test_b601_profile_compatibility_variants():
+    for p in ("b601-dm", "b601-rs", "b601dm", "b601rs", "b601_dm", "b601_rs"):
+        check_b601_compatibility({"profile_id": p, "arm_dof": 6})
+
+    for bad in ("so-arm101", "so-arm100", "unknown_robot"):
+        with pytest.raises(ValueError, match="Local B601 kinematics cannot be used"):
+            check_b601_compatibility({"profile_id": bad, "arm_dof": 6})
+
+
+def test_schema_gripper_joint_and_tolerances():
+    # Explicit None on 7-DOF arm preserves None
+    sch_none = ObservationSchema.from_dict({"dof": 7, "gripper_joint": None, "limits": []})
+    assert sch_none.gripper_joint is None
+
+    # Omitted gripper_joint on 7-DOF arm defaults to 6
+    sch_omitted = ObservationSchema.from_dict({"dof": 7, "limits": []})
+    assert sch_omitted.gripper_joint == 6
+
+    # Out of range gripper_joint raises ValueError
+    with pytest.raises(ValueError, match="gripper_joint 7 out of range for dof=7"):
+        ObservationSchema.from_dict({"dof": 7, "gripper_joint": 7, "limits": []})
+    with pytest.raises(ValueError, match="gripper_joint -1 out of range for dof=7"):
+        ObservationSchema.from_dict({"dof": 7, "gripper_joint": -1, "limits": []})
+
+    # ArmSession._tolerances with schema.gripper_joint = None on 7-DOF arm
+    s = object.__new__(ArmSession)
+    s._schema = sch_none
+    s._gripper_joint = None
+    tol = s._tolerances([0.0] * 7, tolerance=None)
+    assert tol[6] == 0.03  # NOT None
+
+    # ArmSession.servo checks joint 6 when schema.gripper_joint is None
+    import threading
+    import time
+    s._state = threading.Condition()
+    s._servo_error = None
+    s._last_servo = (time.monotonic(), [0.0] * 7)
+    s._check_lease = MagicMock(return_value=1)
+    s._servo_seq = 0
+    s._epoch = 1
+    s.client_id = "test"
+    s._send = MagicMock()
+    s._last_cmd = [0.0] * 7
+    s.latest_observation = MagicMock(return_value=None)
+    from rebot import ServoJumpError
+    with pytest.raises(ServoJumpError, match="servo frame joint 7 steps"):
+        s.servo([0.0] * 6 + [0.40])
+
+
+def test_recorder_error_and_arm_dof_none(tmp_path: Path):
+    from rebot_companion.lerobot_recorder import LeRobotRecorder, RecorderError
+
+    # Schema fetch failure raises RecorderError in non-rad mode
+    rec = LeRobotRecorder(tmp_path / "rec", "test/repo", unit_mode="so101_norm", armd_host="invalid.host.nonexistent:9999", connect_timeout=0.01)
+    with pytest.raises(RecorderError):
+        rec._fetch_schema()
+
+    # When schema is None, add_frame keeps arm_dof as None
+    rec_rad = LeRobotRecorder(tmp_path / "rec2", "test/repo2", unit_mode="rad", armd_host=None, camera_url=None, task="t")
+    assert rec_rad.schema is None
+    rec_rad.start_episode(sample=False)
+    rec_rad.add_frame(state=[0.0] * 6, action=[0.0] * 6)
+    assert rec_rad.arm_dof is None
