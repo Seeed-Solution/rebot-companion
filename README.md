@@ -237,9 +237,9 @@ ssh <user>@192.168.42.1 'cd ~/arm && python3 main.py'
 | `gripper_zero_check(store_offset=False, threshold_rad=0.10)` | mechanical zero check; result has `stop_rad`, `offset_rad`, `pass_` (`.passed`) |
 | `gripper_calibration()`, `set_gripper_calibration(points, offset_rad=None)` | read calibration (GET); write opening table and/or offset (WS) |
 | `detect(label=None, pipelines=("yolo",), min_score=0.3)` | one detector run through armd; list of detections |
-| `grasp(detection)` or `grasp("cup", box=(x0, y0, x1, y1))` | armd's grasp action; `.holding` in the result |
-| `grasp_dry_run(detection)` | check reachability of a detection without moving or lease |
-| `grasp_any(label=None, min_score=0.3, max_candidates=5)` | detect, dry-run in order, grasp first reachable target |
+| `grasp(detection, task=None)` or `grasp("cup", box=(x0, y0, x1, y1))` | armd's grasp action; `.holding` in the result; `task` names a stored grasp task (capability `grasp_tasks`) |
+| `grasp_dry_run(detection, task=None)` | check reachability of a detection without moving or lease; unsupported task gives `(False, "TASK_UNSUPPORTED", reason)` |
+| `grasp_any(label=None, min_score=0.3, max_candidates=5, task=None)` | detect, dry-run in order, grasp first reachable target; `TASK_UNSUPPORTED` raises `ActionFailed` once |
 | `state()` | latest observation (`positions`, `safety_state`, `is_torqued`, `fault`, ...) |
 | `poses()`, `save_pose(name)`, `delete_pose(name)`, `move_to_pose(name, speed_scale=1.0)` | named poses stored in armd |
 | `place(pose=None, position=None, rpy=None, approach_height_m=0.08, release=True, retreat=True, speed_scale=1.0)` | put the held object down: lift, approach, descend, open, retreat (capability `place`) |

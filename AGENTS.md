@@ -65,9 +65,9 @@ with Arm() as arm:  # $REBOT_HOST or 127.0.0.1; takes control, torque on
 | `poses()`, `save_pose(name)`, `delete_pose(name)`, `move_to_pose(name, speed_scale)` | capability `poses` |
 | `place(pose=None, position=None, rpy=None, approach_height_m=0.08, release=True, retreat=True, speed_scale=1.0)` | exactly one of `pose` / `position`; capability `place` |
 | `detect(label=None, pipelines=("yolo",), min_score=0.3)` | list of `Detection` |
-| `grasp(detection)` | `result.holding` is True when an object is held |
-| `grasp_dry_run(detection)` | `(reachable, code, message)` without moving or lease |
-| `grasp_any(label=None, min_score=0.3, max_candidates=5)` | detect, dry-run in order, grasp first reachable; raises `ActionFailed` |
+| `grasp(detection, task=None)` | `result.holding` is True when an object is held; `task` names a grasp task stored in armd (capability `grasp_tasks`, else `UnsupportedError`) |
+| `grasp_dry_run(detection, task=None)` | `(reachable, code, message)` without moving or lease; an unsupported task gives `(False, "TASK_UNSUPPORTED", reason)` |
+| `grasp_any(label=None, min_score=0.3, max_candidates=5, task=None)` | detect, dry-run in order, grasp first reachable; raises `ActionFailed`; with `task`, the first dry-run decides and `TASK_UNSUPPORTED` is raised once |
 | `gripper_open()`, `gripper_close(grasp=True)`, `gripper_move(fraction)` | 0 closed .. 1 open |
 | `gripper_zero_check(store_offset=False, threshold_rad=0.10)` | mechanical zero check; result has `stop_rad`, `offset_rad`, `pass_` (`.passed`) |
 | `gripper_calibration()`, `set_gripper_calibration(points, offset_rad=None)` | read calibration (GET); write opening table and/or offset (WS) |
@@ -130,6 +130,7 @@ Every call blocks until armd reports the result and raises a `RebotError` subcla
 | `TARGET_LOST` | the object disappeared during the grasp | same as `NOT_HOLDING` |
 | `IK_UNREACHABLE`, `IK_BRANCH_FLIP` | target out of reach | move the object or the pose closer; do not loop on the same target |
 | `WORKSPACE_VIOLATION` | target outside the workspace or inside a keep-out box | change the target or the box |
+| `TASK_UNSUPPORTED` | the loaded vision model or depth cannot serve this grasp task | load the model the task requires or use another task; do not retry the same task |
 | `POSE_NOT_FOUND` | pose name not saved | `list_poses`; teach the pose |
 | `TRACKING_STALL` | the arm did not follow, possibly blocked | stop, ask the user to check the scene |
 | `PLACE_TIMEOUT`, `GRIPPER_TIMEOUT`, `MOTION_TIMEOUT` | action did not finish | stop; check the scene before retrying |

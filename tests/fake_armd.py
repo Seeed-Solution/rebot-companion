@@ -105,6 +105,9 @@ class FakeArmd:
         self.action_duration = 0.3
         self.action_failure: tuple[str, str] | None = None
         self.action_reject: tuple[int, str] | None = None
+        self.grasp_tasks_cap = False  # capabilities.grasp_tasks
+        self.dry_run_reply: dict = {"reachable": True}  # ack fields of a grasp dry run
+        self.unsupported_tasks: set[str] = set()  # tasks armd rejects with TASK_UNSUPPORTED
         self.gripper_contact: float | None = -2.0
         self.action: dict | None = None
         self.action_gen: int | None = None
@@ -232,6 +235,8 @@ class FakeArmd:
             caps.update(place=self.place_cap, collision_guard=self.collision_cap)
             caps.update(safety_describe=self.describe_cap)
             caps.update(speed_cap=False, residual_torques=True, tick_stats=False)
+        if self.grasp_tasks_cap:
+            caps["grasp_tasks"] = True
         return caps
 
     def trigger_fault(self, reason: str) -> None:
@@ -404,6 +409,11 @@ class FakeArmd:
         elif kind == "grasp":
             if not isinstance(body.get("label"), str) or len(body.get("box_norm") or []) != 4:
                 return 400, "INVALID_COMMAND"
+            if body.get("task") in self.unsupported_tasks:
+                return 422, "TASK_UNSUPPORTED"
+            if body.get("dry_run"):
+                self.ack_extra = dict(self.dry_run_reply)
+                return None
         elif kind == "gripper":
             if "width_m" in body:
                 return 422, "UNSUPPORTED"
