@@ -48,7 +48,14 @@ def _resolve_gripper_bounds(
     fallback = -5.7 if gripper_joint == 6 else 1.5
     if limits is not None and gripper_joint is not None and 0 <= gripper_joint < len(limits):
         lo, hi = _extract_limit(limits[gripper_joint])
-        o = hi if abs(hi - c) >= abs(lo - c) else lo
+        if gripper_joint == 6:
+            # Preserve B601-DM GRIPPER_OPEN = -5.7 safety margin when within limits
+            if lo <= -5.7 <= hi:
+                o = -5.7
+            else:
+                o = hi if abs(hi - c) >= abs(lo - c) else lo
+        else:
+            o = hi if abs(hi - c) >= abs(lo - c) else lo
         if o == c:
             o = fallback
     else:

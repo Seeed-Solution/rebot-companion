@@ -592,9 +592,11 @@ class LeRobotRecorder:
                         f"armd schema joint limits required for non-radian unit_mode {self.unit_mode!r}"
                     )
                 if self.unit_mode == "so101_norm" and schema.gripper_joint is None:
-                    raise RuntimeError(
-                        f"armd schema gripper_joint required for unit_mode {self.unit_mode!r}"
-                    )
+                    if schema.arm_dof != 6:
+                        raise RuntimeError(
+                            f"armd schema gripper_joint required for unit_mode {self.unit_mode!r} "
+                            f"(arm_dof={schema.arm_dof} != 6)"
+                        )
             self.schema = schema
             self.profile_id = schema.profile_id
             self.arm_dof = schema.arm_dof
@@ -725,9 +727,10 @@ class LeRobotRecorder:
                     f"got limits={self.limits}"
                 )
             if self.unit_mode == "so101_norm" and self.gripper_joint is None:
-                raise RuntimeError(
-                    f"unit_mode {self.unit_mode!r} requires gripper_joint to be set"
-                )
+                if not (self.schema is not None and self.arm_dof == 6):
+                    raise RuntimeError(
+                        f"unit_mode {self.unit_mode!r} requires gripper_joint to be set"
+                    )
             state = units.from_armd(
                 state,
                 self.unit_mode,

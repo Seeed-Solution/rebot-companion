@@ -275,12 +275,40 @@ def open_serial_transport(port: str, baud: int = DEFAULT_BAUD) -> LeaderTranspor
         return PosixSerialTransport(port, baud=baud)
 
 
-def auto_detect_leader_port() -> str:
-    """Find a connected Feetech USB leader device on Linux or macOS."""
-    candidates = glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*") + glob.glob("/dev/cu.usbmodem*")
-    if candidates:
-        return sorted(candidates)[0]
-    return "/dev/ttyACM0"
+def auto_detect_leader_port(
+    baud: int = DEFAULT_BAUD,
+    servo_ids: Sequence[int] = (1, 2, 3, 4, 5, 6),
+) -> str:
+    """Find a connected Feetech USB leader device on Linux or macOS by probing expected servo IDs."""
+    candidates = sorted(
+        set(glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*") + glob.glob("/dev/cu.usbmodem*"))
+    )
+    if not candidates:
+        raise LeaderError(
+            "no USB serial candidate ports found (/dev/ttyACM*, /dev/ttyUSB*, /dev/cu.usbmodem*)"
+        )
+
+    expected = set(servo_ids)
+    for port in candidates:
+        transport: LeaderTransport | None = None
+        try:
+            transport = open_serial_transport(port, baud=baud)
+            bus = FeetechSerialBus(transport)
+            responded = set(bus.ping_ids(servo_ids))
+            if expected.issubset(responded):
+                return port
+        except Exception as exc:
+            log.debug("probing port %s failed: %s", port, exc)
+        finally:
+            if transport is not None:
+                try:
+                    transport.close()
+                except Exception:
+                    pass
+
+    raise LeaderError(
+        f"no leader arm found responding on expected servo IDs {list(servo_ids)} across candidate ports {candidates}"
+    )
 
 
 # --------------------------------------------------------------------------- bus & codec
@@ -293,6 +321,21 @@ class FeetechSerialBus:
         self.transport = transport
         self.dropouts = 0
         self.retries = 0
+
+    def ping(self, servo_id: int, timeout: float = 0.02) -> bool:
+        """Ping a servo ID and return True if it responds with a matching ID."""
+        self.transport.flush()
+        pkt = encode_packet(servo_id, INST_PING, [])
+        self.transport.write(pkt)
+        resp = self.transport.read(6, timeout=timeout)
+        s_id, _err, _params, _rem = decode_packet(resp)
+        return s_id == servo_id
+
+    def ping_ids(
+        self, servo_ids: Sequence[int] = (1, 2, 3, 4, 5, 6), timeout: float = 0.02
+    ) -> list[int]:
+        """Ping expected servo IDs and return the list of IDs that responded."""
+        return [sid for sid in servo_ids if self.ping(sid, timeout=timeout)]
 
     def disable_torque(self, servo_ids: Sequence[int] = (1, 2, 3, 4, 5, 6)) -> None:
         """Disable torque on leader servos so the operator can backdrive them freely."""
@@ -535,6 +578,7 @@ class LeaderTeleopBridge:
         ramp_seconds: float = DEFAULT_RAMP_SECONDS,
         max_gap_rad: float = DEFAULT_MAX_GAP_RAD,
         operator_present: bool = False,
+        allow_large_gap: bool = False,
         park_on_exit: bool = True,
     ) -> None:
         if not (isinstance(fps, (int, float)) and fps > 0):
@@ -552,6 +596,7 @@ class LeaderTeleopBridge:
         self.ramp_seconds = ramp_seconds
         self.max_gap_rad = max_gap_rad
         self.operator_present = operator_present
+        self.allow_large_gap = allow_large_gap
         self.park_on_exit = park_on_exit
 
         self.limits: list[tuple[float, float]] = [
@@ -635,6 +680,30 @@ class LeaderTeleopBridge:
             follower_open_rad=self.open_rad,
         )
 
+    def _check_alignment_gap(
+        self,
+        leader_target: Sequence[float],
+        follower_positions: Sequence[float],
+        *,
+        stage: str,
+    ) -> None:
+        if len(leader_target) != 6 or len(follower_positions) != 6:
+            raise LeaderError(
+                f"expected 6 DOF for SO-ARM101 ({stage}: got follower={len(follower_positions)}, leader={len(leader_target)})"
+            )
+        gap = max(abs(ldr - flw) for ldr, flw in zip(leader_target, follower_positions))
+        log.info("%s alignment gap: %.3f rad (threshold: %.3f rad)", stage, gap, self.max_gap_rad)
+        if gap > HARD_MAX_GAP_RAD:
+            raise LeaderError(
+                f"{stage} alignment gap {gap:.3f} rad exceeds hard limit {HARD_MAX_GAP_RAD:.3f} rad (pi); "
+                "re-align leader arm before proceeding"
+            )
+        if gap > self.max_gap_rad and not self.allow_large_gap:
+            raise LeaderError(
+                f"{stage} alignment gap {gap:.3f} rad exceeds --max-gap-rad {self.max_gap_rad:.3f}; "
+                "align the leader arm with the follower or pass --allow-large-gap"
+            )
+
     def align_and_ramp(self) -> None:
         """Verify alignment against the follower arm and perform a smooth quintic ramp-in."""
         if self.schema.dof != 6 or self.schema.arm_dof != 5:
@@ -654,23 +723,7 @@ class LeaderTeleopBridge:
 
         follower_start = list(obs.positions)
         leader_target = self.read_leader_target()
-        if len(leader_target) != 6:
-            raise LeaderError(
-                f"expected 6 DOF for SO-ARM101 (got follower={len(follower_start)}, leader={len(leader_target)})"
-            )
-
-        gap = max(abs(ldr - flw) for ldr, flw in zip(leader_target, follower_start))
-        log.info("initial alignment gap: %.3f rad (threshold: %.3f rad)", gap, self.max_gap_rad)
-        if gap > HARD_MAX_GAP_RAD:
-            raise LeaderError(
-                f"initial alignment gap {gap:.3f} rad exceeds hard limit {HARD_MAX_GAP_RAD:.3f} rad (pi); "
-                "re-align leader arm before proceeding"
-            )
-        if gap > self.max_gap_rad and not self.operator_present:
-            raise LeaderError(
-                f"alignment gap {gap:.3f} rad exceeds --max-gap-rad {self.max_gap_rad:.3f}; "
-                "align the leader arm with the follower or pass --i-am-at-the-arm"
-            )
+        self._check_alignment_gap(leader_target, follower_start, stage="initial")
 
         self._activated = True
 
@@ -687,6 +740,8 @@ class LeaderTeleopBridge:
             if len(obs.positions) != 6:
                 raise LeaderError(f"expected 6 follower positions after enabling torque, got {len(obs.positions)}")
             follower_start = list(obs.positions)
+            leader_target = self.read_leader_target()
+            self._check_alignment_gap(leader_target, follower_start, stage="post-torque")
 
         ramp_steps = max(1, int(round(self.ramp_seconds * self.fps)))
         period = 1.0 / self.fps
@@ -783,6 +838,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         help=f"maximum allowed initial gap in radians (default {DEFAULT_MAX_GAP_RAD})",
     )
     p.add_argument(
+        "--allow-large-gap",
+        action="store_true",
+        help="allow initial gap exceeding --max-gap-rad up to pi radians ceiling",
+    )
+    p.add_argument(
         "--ramp-seconds",
         type=float,
         default=DEFAULT_RAMP_SECONDS,
@@ -793,7 +853,18 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
-    port = args.leader_port or auto_detect_leader_port()
+    try:
+        calib = LeaderCalibration.load(args.calib)
+    except Exception as exc:
+        print(f"rebot-teleop-leader: failed to load calibration: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        port = args.leader_port or auto_detect_leader_port(baud=args.baud, servo_ids=calib.servo_ids)
+    except Exception as exc:
+        print(f"rebot-teleop-leader: failed to find leader port: {exc}", file=sys.stderr)
+        return 1
+
     log.info("opening leader serial port %s at %d baud", port, args.baud)
     try:
         transport = open_serial_transport(port, baud=args.baud)
@@ -839,7 +910,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             return 1
 
-        calib = LeaderCalibration.load(args.calib)
         session = ArmSession(client, safe_exit="off").open()
         session._schema = schema
         bridge = LeaderTeleopBridge(
@@ -851,6 +921,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             ramp_seconds=args.ramp_seconds,
             max_gap_rad=args.max_gap_rad,
             operator_present=args.i_am_at_the_arm,
+            allow_large_gap=args.allow_large_gap,
             park_on_exit=not args.no_park,
         )
 
@@ -860,6 +931,16 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         signal.signal(signal.SIGINT, _sig_handler)
         signal.signal(signal.SIGTERM, _sig_handler)
+
+        responded = bus.ping_ids(calib.servo_ids)
+        if set(responded) != set(calib.servo_ids):
+            missing = sorted(set(calib.servo_ids) - set(responded))
+            print(
+                f"rebot-teleop-leader: leader arm on {port} did not respond on servo IDs {missing} "
+                f"(responded: {responded}); check wiring and bus before disabling torque",
+                file=sys.stderr,
+            )
+            return 1
 
         bridge.run()
         if bridge._error is not None:

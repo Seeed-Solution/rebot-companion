@@ -1120,7 +1120,14 @@ def test_leader_bridge_hard_gap_ceiling():
     })
 
     bridge = LeaderTeleopBridge(
-        bus, mock_session, schema, fps=50, ramp_seconds=0.2, max_gap_rad=0.5, operator_present=True
+        bus,
+        mock_session,
+        schema,
+        fps=50,
+        ramp_seconds=0.2,
+        max_gap_rad=0.5,
+        operator_present=True,
+        allow_large_gap=True,
     )
     with pytest.raises(LeaderError, match="exceeds hard limit"):
         bridge.align_and_ramp()
@@ -1415,12 +1422,12 @@ def test_recorder_fetch_schema_retry_and_strict_validation(tmp_path: Path, monke
 
         def get_schema(self):
             return ObservationSchema.from_dict({
-                "dof": 6,
-                "arm_dof": 6,
+                "dof": 5,
+                "arm_dof": 5,
                 "gripper_joint": None,
                 "limits": [
                     {"name": f"j{i}", "min_position": -3.14, "max_position": 3.14, "max_velocity": 2.0, "max_acceleration": 5.0}
-                    for i in range(6)
+                    for i in range(5)
                 ],
             })
 
@@ -1508,3 +1515,336 @@ def test_schema_cooldown_initial_sentinel_allows_early_monotonic(monkeypatch):
     assert res_mcp == schema
     assert mcp_client.get_schema.call_count == 1
     assert controller._last_schema_attempt == 1.0
+
+
+def test_operator_present_enforces_max_gap_unless_allow_large_gap():
+    bus = MagicMock()
+    bus.read_positions_sync.return_value = {1: 2048, 2: 2048, 3: 2048, 4: 2048, 5: 2048, 6: 2048}
+    mock_session = MagicMock()
+    mock_obs = MagicMock()
+    mock_obs.positions = [0.8] * 6  # gap 0.8 rad: > max_gap_rad (0.5), < HARD_MAX_GAP_RAD (pi)
+    mock_obs.safety_state = "Armed"
+    mock_obs.is_stopped = False
+    mock_obs.is_torqued = True
+    mock_obs.is_operational = True
+    mock_obs.collision = None
+    mock_session.wait_for_observation.return_value = mock_obs
+    mock_session.latest_observation.return_value = mock_obs
+
+    schema = ObservationSchema.from_dict({
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "limits": [
+            {"name": f"j{i}", "min_position": -3.14, "max_position": 3.14, "max_velocity": 2.0, "max_acceleration": 5.0}
+            for i in range(6)
+        ],
+    })
+
+    # 1. operator_present=True alone MUST NOT bypass max_gap_rad
+    bridge1 = LeaderTeleopBridge(
+        bus, mock_session, schema, fps=50, ramp_seconds=0.2, max_gap_rad=0.5, operator_present=True, allow_large_gap=False
+    )
+    with pytest.raises(LeaderError, match="alignment gap .* exceeds --max-gap-rad"):
+        bridge1.align_and_ramp()
+    assert bridge1._activated is False
+
+    # 2. allow_large_gap=True permits gap exceeding max_gap_rad up to pi
+    bridge2 = LeaderTeleopBridge(
+        bus, mock_session, schema, fps=50, ramp_seconds=0.2, max_gap_rad=0.5, operator_present=False, allow_large_gap=True
+    )
+    bridge2.align_and_ramp()
+    assert bridge2._activated is True
+
+    # 3. allow_large_gap=True STILL enforces HARD_MAX_GAP_RAD (pi)
+    mock_obs.positions = [3.5] * 6
+    bridge3 = LeaderTeleopBridge(
+        bus, mock_session, schema, fps=50, ramp_seconds=0.2, max_gap_rad=0.5, operator_present=True, allow_large_gap=True
+    )
+    with pytest.raises(LeaderError, match="exceeds hard limit"):
+        bridge3.align_and_ramp()
+    assert bridge3._activated is False
+
+
+def test_leader_bridge_post_torque_gap_growth_fails_before_ramp():
+    bus = MagicMock()
+    # Leader starts at 0.1 rad
+    bus.read_positions_sync.return_value = {1: 2048, 2: 2048, 3: 2048, 4: 2048, 5: 2048, 6: 2048}
+
+    idle_obs = MagicMock()
+    idle_obs.positions = [0.0] * 6  # initial gap: 0.1 rad <= 0.5 rad (passes)
+    idle_obs.safety_state = "Idle"
+    idle_obs.is_stopped = False
+    idle_obs.is_torqued = False
+    idle_obs.is_operational = False
+    idle_obs.collision = None
+
+    armed_obs = MagicMock()
+    armed_obs.positions = [0.8] * 6  # post-torque sag: gap grows to 0.8 rad > 0.5 rad!
+    armed_obs.safety_state = "Armed"
+    armed_obs.is_stopped = False
+    armed_obs.is_torqued = True
+    armed_obs.is_operational = True
+    armed_obs.collision = None
+
+    mock_session = MagicMock()
+    mock_session.wait_for_observation.side_effect = [idle_obs, armed_obs]
+    mock_session.latest_observation.return_value = armed_obs
+
+    schema = ObservationSchema.from_dict({
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "limits": [
+            {"name": f"j{i}", "min_position": -3.14, "max_position": 3.14, "max_velocity": 2.0, "max_acceleration": 5.0}
+            for i in range(6)
+        ],
+    })
+
+    bridge = LeaderTeleopBridge(
+        bus, mock_session, schema, fps=10, ramp_seconds=0.2, max_gap_rad=0.5, allow_large_gap=False
+    )
+    with pytest.raises(LeaderError, match="post-torque alignment gap .* exceeds --max-gap-rad"):
+        bridge.align_and_ramp()
+
+    # Torque was requested, but servo was NOT called due to post-torque gap failure
+    mock_session.torque.assert_called_once_with(True)
+    mock_session.servo.assert_not_called()
+
+
+def test_auto_detect_leader_port_and_ping_ids(monkeypatch):
+    from rebot_companion import leader_teleop
+    from rebot_companion.leader_teleop import auto_detect_leader_port
+
+    # 1. FeetechSerialBus ping & ping_ids
+    transport = MockLeaderTransport()
+    bus = FeetechSerialBus(transport)
+
+    # Response packet for servo: FF FF ID 02 00 Checksum
+    def make_ping_resp(sid):
+        body = [sid, 2, 0x00]
+        return bytes([0xFF, 0xFF] + body + [compute_checksum(body)])
+
+    transport.to_read = bytearray(make_ping_resp(1))
+    assert bus.ping(1) is True
+    transport.to_read = bytearray(make_ping_resp(2))
+    assert bus.ping(1) is False  # ID mismatch
+
+    # Feed pings for IDs 1..6
+    transport.to_read = bytearray(b"".join(make_ping_resp(i) for i in range(1, 7)))
+    assert bus.ping_ids([1, 2, 3, 4, 5, 6]) == [1, 2, 3, 4, 5, 6]
+
+    # Feed pings missing ID 4
+    transport.to_read = bytearray(b"".join(make_ping_resp(i) for i in [1, 2, 3, 5, 6]))
+    assert bus.ping_ids([1, 2, 3, 4, 5, 6]) == [1, 2, 3]
+
+    # 2. auto_detect_leader_port selecting correct port
+    monkeypatch.setattr(leader_teleop.glob, "glob", lambda pat: ["/dev/ttyACM0", "/dev/ttyUSB0"] if "ACM" in pat else [])
+
+    class FakeProbeTransport(MockLeaderTransport):
+        def __init__(self, port, **kwargs):
+            super().__init__()
+            self.port = port
+            if port == "/dev/ttyUSB0":
+                self.to_read = bytearray(b"".join(make_ping_resp(i) for i in range(1, 7)) * 5)
+            else:
+                self.to_read = bytearray()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(leader_teleop, "open_serial_transport", lambda port, **k: FakeProbeTransport(port))
+    selected = auto_detect_leader_port(servo_ids=[1, 2, 3, 4, 5, 6])
+    assert selected == "/dev/ttyUSB0"
+
+    # 3. main() rejecting non-responding bus before bridge.run() / disable_torque
+    mock_client = MagicMock()
+    mock_client.get_schema.return_value = ObservationSchema.from_dict({
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "limits": [{"name": f"j{i}", "min_position": -3.14, "max_position": 3.14, "max_velocity": 2.0, "max_acceleration": 5.0} for i in range(6)],
+    })
+    mock_client.get_safety_describe.return_value = {"device": {"follower": "mock"}}
+    monkeypatch.setattr(leader_teleop, "ArmdClient", lambda *a, **k: mock_client)
+
+    class NonRespondingTransport(MockLeaderTransport):
+        def close(self):
+            pass
+
+    monkeypatch.setattr(leader_teleop, "open_serial_transport", lambda *a, **k: NonRespondingTransport())
+    rc = leader_teleop.main(["--leader-port", "/dev/ttyUSB0", "--arm-host", "127.0.0.1"])
+    assert rc == 1
+
+
+def test_mcp_server_gripper_fraction_schema_bounds():
+    from rebot_companion.mcp_server import gripper_fraction
+
+    # Direct function testing
+    assert gripper_fraction(0.0) == pytest.approx(0.0)
+    assert gripper_fraction(-5.7) == pytest.approx(1.0)
+    assert gripper_fraction(-2.85) == pytest.approx(0.5)
+    assert gripper_fraction(0.0, 0.0, 1.5) == pytest.approx(0.0)
+    assert gripper_fraction(1.5, 0.0, 1.5) == pytest.approx(1.0)
+    assert gripper_fraction(0.0, 0.0, 0.0) == 0.0  # near-zero span safe fallback
+
+    # Controller.get_state fallback
+    schema_so101 = ObservationSchema.from_dict({
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "limits": [
+            {"name": f"j{i}", "min_position": -3.14, "max_position": 3.14, "max_velocity": 2.0, "max_acceleration": 5.0}
+            for i in range(5)
+        ] + [{"name": "gripper", "min_position": 0.0, "max_position": 1.5, "max_velocity": 2.0, "max_acceleration": 5.0}],
+    })
+    client = MagicMock()
+    client.get_schema.return_value = schema_so101
+    obs = MagicMock()
+    obs.gripper = None
+    obs.positions = [0.0, 0.0, 0.0, 0.0, 0.0, 1.5]
+    obs.safety_state = "Armed"
+    obs.fault_reason = None
+    obs.is_torqued = True
+    obs.commanded_positions = obs.positions
+    obs.velocities = [0.0] * 6
+    obs.torques = [0.0] * 6
+    obs.temperatures = [30.0] * 6
+    obs.fault = None
+    obs.tcp = None
+    client.get_observation.return_value = obs
+
+    ctrl = Controller(client, MagicMock(), MagicMock())
+    state = ctrl.get_state()
+    assert state["gripper"]["fraction"] == 1.0
+
+
+def test_lerobot_recorder_gripperless_6dof_so101_norm(tmp_path):
+    schema_6dof = ObservationSchema.from_dict({
+        "dof": 6,
+        "arm_dof": 6,
+        "gripper_joint": None,
+        "limits": [
+            {"name": f"j{i}", "min_position": -3.14, "max_position": 3.14, "max_velocity": 2.0, "max_acceleration": 5.0}
+            for i in range(6)
+        ],
+    })
+    rec = LeRobotRecorder(tmp_path / "rec", "test/repo", unit_mode="so101_norm", fps=10, armd_host=None, camera_url=None)
+    rec.schema = schema_6dof
+    rec.arm_dof = 6
+    rec.gripper_joint = None
+    rec.limits = schema_6dof.limits
+    rec._schema_fetched = True
+
+    rec.start_episode(task="test")
+    rec.add_frame([0.0] * 6, [0.0] * 6)
+    assert len(rec._ep.state) == 1
+
+    # Arm with arm_dof=5 and gripper_joint=None must raise
+    rec5 = LeRobotRecorder(tmp_path / "rec5", "test/repo", unit_mode="so101_norm", fps=10, armd_host=None, camera_url=None)
+    rec5.schema = ObservationSchema.from_dict({
+        "dof": 5,
+        "arm_dof": 5,
+        "gripper_joint": None,
+        "limits": [
+            {"name": f"j{i}", "min_position": -3.14, "max_position": 3.14, "max_velocity": 2.0, "max_acceleration": 5.0}
+            for i in range(5)
+        ],
+    })
+    rec5.arm_dof = 5
+    rec5.gripper_joint = None
+    rec5.limits = schema_6dof.limits[:5]
+    rec5._schema_fetched = True
+    rec5.start_episode(task="test5")
+    with pytest.raises(RuntimeError, match="gripper_joint"):
+        rec5.add_frame([0.0] * 5, [0.0] * 5)
+
+
+def test_units_resolve_schema_gripper_bounds_b601_safety_margin():
+    limits_b601 = [
+        {"min_position": -3.14, "max_position": 3.14} for _ in range(6)
+    ] + [{"min_position": -5.75, "max_position": 0.10}]
+
+    # 1. B601 schema without open_rad in gripper_policy must preserve -5.7
+    closed, opened = units.resolve_schema_gripper_bounds(None, limits_b601, 6)
+    assert (closed, opened) == (0.0, -5.7)
+
+    # 2. Explicit gripper_policy overrides
+    closed, opened = units.resolve_schema_gripper_bounds({"open_rad": -5.6}, limits_b601, 6)
+    assert (closed, opened) == (0.0, -5.6)
+
+    # 3. SO-ARM schema (gripper_joint=5) returns dynamic limits
+    limits_so = [
+        {"min_position": -3.14, "max_position": 3.14} for _ in range(5)
+    ] + [{"min_position": -0.1, "max_position": 1.5}]
+    closed, opened = units.resolve_schema_gripper_bounds(None, limits_so, 5)
+    assert (closed, opened) == (0.0, 1.5)
+
+
+def test_sine_policy_schema_resolution():
+    schema_so = ObservationSchema.from_dict({
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "joint_names": ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"],
+        "limits": [
+            {"name": f"j{i}", "min_position": -3.14, "max_position": 3.14, "max_velocity": 2.0, "max_acceleration": 5.0}
+            for i in range(6)
+        ],
+    })
+
+    # "gripper" resolves to index 5
+    p_grip = parse_policy("sine:gripper:0.1:2.0")
+    p_grip.bind_schema(schema_so)
+    assert p_grip.joint == 5
+
+    # "wrist_roll" resolves to index 4
+    p_wrist = parse_policy("sine:wrist_roll:0.1:2.0")
+    p_wrist.bind_schema(schema_so)
+    assert p_wrist.joint == 4
+
+    # Unknown joint name raises RunnerError
+    p_bad = parse_policy("sine:unknown_joint:0.1:2.0")
+    with pytest.raises(RunnerError, match="unknown joint name"):
+        p_bad.bind_schema(schema_so)
+
+    # Gripper on gripperless arm raises RunnerError
+    schema_no_grip = ObservationSchema.from_dict({
+        "dof": 6,
+        "arm_dof": 6,
+        "gripper_joint": None,
+        "limits": [
+            {"name": f"j{i}", "min_position": -3.14, "max_position": 3.14, "max_velocity": 2.0, "max_acceleration": 5.0}
+            for i in range(6)
+        ],
+    })
+    p_grip2 = parse_policy("sine:gripper:0.1:2.0")
+    with pytest.raises(RunnerError, match="no gripper joint"):
+        p_grip2.bind_schema(schema_no_grip)
+
+    # PolicyRunner pre-seeds session._schema
+    client = MagicMock()
+    client.get_schema.return_value = schema_so
+    client.get_safety_describe.return_value = {"device": {"follower": "mock"}}
+    client.request.return_value.json.return_value = {
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "joint_names": ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"],
+        "limits": [
+            {"name": f"j{i}", "min_position": -3.14, "max_position": 3.14, "max_velocity": 2.0, "max_acceleration": 5.0}
+            for i in range(6)
+        ],
+    }
+    client.request.return_value.raise_for_status = lambda: None
+
+    runner = PolicyRunner(client, parse_policy("sine:1:0.05:1"), max_seconds=0.01)
+    mock_sess = MagicMock()
+    mock_sess._schema = None
+    runner._loop = lambda: None
+    runner._prepare = lambda: None
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("rebot_companion.policy_runner.ArmSession.open", lambda self: mock_sess)
+        runner.run()
+    assert mock_sess._schema == runner.schema
+

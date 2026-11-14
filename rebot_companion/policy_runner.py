@@ -191,24 +191,81 @@ class ReplayPolicy(Policy):
 class SinePolicy(Policy):
     """``start + amp * sin(2 pi t / period)`` on one joint; the other joints hold their start position."""
 
-    def __init__(self, joint: int, amp: float, period: float) -> None:
-        if not 0 <= joint < len(JOINT_NAMES):
-            raise ValueError(f"joint must be 1..{len(JOINT_NAMES)} or one of {JOINT_NAMES}")
+    def __init__(self, joint: int | str, amp: float, period: float, target_joint: str | int | None = None) -> None:
         if not 0 < amp <= 0.5:
             raise ValueError("amp must be in (0, 0.5] rad")
         if period < 0.5:
             raise ValueError("period must be >= 0.5 s")
-        self.joint, self.amp, self.period = joint, float(amp), float(period)
-        self.name = f"sine:{JOINT_NAMES[joint]}:{amp:g}:{period:g}"
+
+        self.amp, self.period = float(amp), float(period)
         self._start: np.ndarray | None = None
+
+        if isinstance(joint, str):
+            self.target_joint: str | int = joint
+            if joint.isdigit():
+                val = int(joint)
+                if not 1 <= val <= len(JOINT_NAMES):
+                    raise ValueError(f"joint must be 1..{len(JOINT_NAMES)} or one of {JOINT_NAMES}")
+                self.joint = val - 1
+            elif joint == "gripper":
+                self.joint = 6
+            elif joint in JOINT_NAMES:
+                self.joint = JOINT_NAMES.index(joint)
+            else:
+                if not joint.isidentifier():
+                    raise ValueError(f"invalid joint specification {joint!r}")
+                self.joint = -1
+        else:
+            if not 0 <= joint < len(JOINT_NAMES):
+                raise ValueError(f"joint must be 1..{len(JOINT_NAMES)} or one of {JOINT_NAMES}")
+            self.joint = int(joint)
+            self.target_joint = target_joint if target_joint is not None else (self.joint + 1)
+
+        name_target = str(self.target_joint) if not isinstance(self.target_joint, int) else (
+            JOINT_NAMES[self.joint] if 0 <= self.joint < len(JOINT_NAMES) else str(self.target_joint)
+        )
+        self.name = f"sine:{name_target}:{self.amp:g}:{self.period:g}"
 
     def reset(self) -> None:
         self._start = None
+
+    def bind_schema(self, schema: ObservationSchema) -> None:
+        """Resolve symbolic joint names and validate joint target against arm schema."""
+        dof = schema.dof
+        gripper_joint = schema.gripper_joint
+        joint_names = list(schema.joint_names) if schema.joint_names else []
+
+        if self.target_joint == "gripper":
+            if gripper_joint is None:
+                raise RunnerError("sine:gripper specified but arm has no gripper joint in schema")
+            if not 0 <= gripper_joint < dof:
+                raise RunnerError(f"schema gripper_joint {gripper_joint} out of range for dof {dof}")
+            self.joint = gripper_joint
+            return
+
+        if isinstance(self.target_joint, str) and not self.target_joint.isdigit():
+            target = self.target_joint
+            if target in joint_names:
+                self.joint = joint_names.index(target)
+            elif target in JOINT_NAMES and JOINT_NAMES.index(target) < dof:
+                self.joint = JOINT_NAMES.index(target)
+            else:
+                raise RunnerError(
+                    f"unknown joint name {target!r} in sine policy (schema joints: {joint_names or JOINT_NAMES[:dof]})"
+                )
+            return
+
+        # 1-based integer or 0-based joint index
+        if self.joint < 0 or self.joint >= dof:
+            one_based = self.joint + 1 if self.joint >= 0 else self.target_joint
+            raise RunnerError(f"sine policy joint index {one_based} exceeds arm DOF {dof}")
 
     def select(self, obs: dict[str, np.ndarray], step: int, t: float) -> np.ndarray | None:
         if self._start is None:
             self._start = np.asarray(obs[STATE_KEY], dtype=np.float64).copy()
         out = self._start.copy()
+        if not 0 <= self.joint < len(out):
+            raise RunnerError(f"sine policy joint {self.joint} out of bounds for state dim {len(out)}")
         out[self.joint] += self.amp * math.sin(2 * math.pi * t / self.period)
         return out
 
@@ -498,10 +555,9 @@ def parse_policy(spec: str, device: str | None = None, task: str = "") -> Policy
         if not 1 <= len(parts) <= 3:
             raise ValueError("sine policy: sine:<joint>[:<amp rad>[:<period s>]]")
         j = parts[0]
-        joint = int(j) - 1 if j.isdigit() else (JOINT_NAMES.index(j) if j in JOINT_NAMES else -1)
         amp = float(parts[1]) if len(parts) > 1 else 0.05
         period = float(parts[2]) if len(parts) > 2 else 4.0
-        return SinePolicy(joint, amp, period)
+        return SinePolicy(j, amp, period)
     if spec.startswith("scripted:"):
         raise ValueError(f"unknown scripted policy {spec!r}: replay:<root>:<episode> or sine:<joint>:<amp>:<period>")
     # a Hub repo id ("org/name") has no colon: "<word>:..." is a mistyped prefix unless it is a local directory
@@ -885,8 +941,8 @@ class PolicyRunner:
         if policy_dof is not None and policy_dof != self.dof:
             raise RunnerError(f"policy action dimension ({policy_dof}) does not match arm DOF ({self.dof})")
 
-        if isinstance(self.policy, SinePolicy) and self.policy.joint >= self.dof:
-            raise RunnerError(f"sine policy joint index {self.policy.joint + 1} exceeds arm DOF {self.dof}")
+        if isinstance(self.policy, SinePolicy):
+            self.policy.bind_schema(schema)
 
         prof = (schema.profile_id or "").lower()
         is_so_arm = (
@@ -1093,6 +1149,8 @@ class PolicyRunner:
                 obs_hz=self.obs_hz,
                 send_timeout=self.send_timeout_s,
             ).open()
+            if getattr(self.session, "_schema", None) is None:
+                self.session._schema = self.schema
             try:
                 self._prepare()
                 t_start = time.monotonic()

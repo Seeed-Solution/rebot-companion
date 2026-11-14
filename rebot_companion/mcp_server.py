@@ -64,7 +64,7 @@ from rebot.detection import (
 )
 from rebot.errors import UnsupportedError
 
-from . import kinematics
+from . import kinematics, units
 from .snapshot import (
     CameraUnavailable,
     SnapshotError,
@@ -259,8 +259,15 @@ def tcp_dict(positions: list[float], joint_map: kinematics.JointMap = kinematics
     }
 
 
-def gripper_fraction(rad: float) -> float:
-    return max(0.0, min(1.0, (rad - GRIP_CLOSED_RAD) / (GRIP_OPEN_RAD - GRIP_CLOSED_RAD)))
+def gripper_fraction(
+    rad: float,
+    closed_rad: float = GRIP_CLOSED_RAD,
+    open_rad: float = GRIP_OPEN_RAD,
+) -> float:
+    span = open_rad - closed_rad
+    if abs(span) < 1e-6:
+        return 0.0
+    return max(0.0, min(1.0, (rad - closed_rad) / span))
 
 
 class Controller:
@@ -312,6 +319,23 @@ class Controller:
         except Exception:
             obs = self.observation()
             return 6 if obs and len(obs.positions) == 7 else None
+
+    def gripper_bounds(self) -> tuple[float, float]:
+        sch = None
+        try:
+            sch = self.schema()
+        except Exception:
+            pass
+        if sch is not None:
+            gj = getattr(sch, "gripper_joint", None)
+            if gj is None:
+                gj = self.gripper_joint()
+            return units.resolve_schema_gripper_bounds(
+                getattr(sch, "gripper_policy", None),
+                getattr(sch, "limits", None),
+                gj,
+            )
+        return GRIP_CLOSED_RAD, GRIP_OPEN_RAD
 
     def format_tcp(self, obs_tcp: Any, positions: list[float]) -> dict | None:
         if obs_tcp is not None:
@@ -460,7 +484,8 @@ class Controller:
             gj = self.gripper_joint()
             if gj is not None and len(obs.positions) > gj:
                 grip = obs.positions[gj]
-                gripper = {"rad": _r(grip), "fraction": _r(gripper_fraction(grip), 3)}
+                closed_rad, open_rad = self.gripper_bounds()
+                gripper = {"rad": _r(grip), "fraction": _r(gripper_fraction(grip, closed_rad, open_rad), 3)}
             else:
                 gripper = None
         return {
@@ -580,7 +605,8 @@ class Controller:
             frac = obs.gripper.fraction
         else:
             grip = obs.positions[gj] if len(obs.positions) > gj else 0.0
-            frac = gripper_fraction(grip)
+            closed_rad, open_rad = self.gripper_bounds()
+            frac = gripper_fraction(grip, closed_rad, open_rad)
         torque = _r(obs.torques[gj], 3) if len(obs.torques) > gj else None
         return {
             "state": a.state if a else "done",
