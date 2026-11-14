@@ -82,13 +82,20 @@ def resolve_schema_gripper_bounds(
     return _resolve_gripper_bounds(limits, gripper_joint, closed_rad, open_rad)
 
 
-def resolve_unit_mode(requested: str, info_meta: dict[str, Any] | None = None) -> str:
+def resolve_unit_mode(
+    requested: str,
+    info_meta: dict[str, Any] | None = None,
+    *,
+    require_metadata: bool = False,
+) -> str:
     """Resolve unit mode from user requested string and optional dataset/policy metadata.
 
     When ``requested == "auto"``:
     - Inspects ``info_meta`` for ``unit_mode`` or ``rebot_unit_mode``.
     - Checks heuristic range on ``stats`` (both ``observation.state`` and ``action``).
       If non-radian values are present without explicit metadata, raises ``ValueError``.
+    - If ``require_metadata=True`` and ``info_meta`` has neither explicit ``unit_mode``/``rebot_unit_mode``
+      nor usable ``observation.state``/``action`` stats (finite min/max), raises ``ValueError``.
     - Defaults to ``"rad"``.
     """
     if requested != "auto":
@@ -96,6 +103,7 @@ def resolve_unit_mode(requested: str, info_meta: dict[str, Any] | None = None) -
             raise ValueError(f"unsupported unit mode {requested!r}; choose from {SUPPORTED_UNIT_MODES} or 'auto'")
         return requested
 
+    has_usable_stats = False
     if isinstance(info_meta, dict):
         raw_mode = info_meta.get("unit_mode") or info_meta.get("rebot_unit_mode")
         if raw_mode is not None:
@@ -124,14 +132,22 @@ def resolve_unit_mode(requested: str, info_meta: dict[str, Any] | None = None) -
                         for v in items:
                             try:
                                 fv = float(v)
-                                if math.isfinite(fv) and abs(fv) > threshold:
-                                    raise ValueError(
-                                        "cannot infer unit mode 'auto' from non-radian stats without 'unit_mode' "
-                                        "in metadata; pass --action-units / --state-units explicitly ('so101_norm' or 'deg')"
-                                    )
+                                if math.isfinite(fv):
+                                    has_usable_stats = True
+                                    if abs(fv) > threshold:
+                                        raise ValueError(
+                                            "cannot infer unit mode 'auto' from non-radian stats without 'unit_mode' "
+                                            "in metadata; pass --action-units / --state-units explicitly ('so101_norm' or 'deg')"
+                                        )
                             except (TypeError, ValueError) as exc:
                                 if "cannot infer unit mode" in str(exc):
                                     raise
+
+    if require_metadata and not has_usable_stats:
+        raise ValueError(
+            "cannot infer unit mode 'auto' without metadata or stats on this platform; "
+            "pass --action-units / --state-units explicitly ('rad', 'so101_norm', or 'deg')"
+        )
 
     return "rad"
 

@@ -74,6 +74,7 @@ SAFE_EXIT_POLICIES = ("off", "error", "always")
 ACTION_MAX_TIMEOUT_S = 60.0
 CAPABILITIES_DEVPLAT = 6  # capabilities.version with obs_rate / fault_codes / poses / keepout / ...
 _GRIPPER_UNSET = object()
+_SCHEMA_RETRY_COOLDOWN_S = 5.0
 
 
 @dataclass
@@ -716,6 +717,7 @@ class ArmSession:
         self._threads: list[threading.Thread] = []
         self._schema: ObservationSchema | None = None
         self._gripper_joint: int | None | object = _GRIPPER_UNSET
+        self._last_schema_attempt: float | None = None
         self._unload_pending = False
         self._last_servo: tuple[float, list[float]] | None = None  # (monotonic time, positions)
 
@@ -900,6 +902,10 @@ class ArmSession:
 
     def schema(self) -> ObservationSchema:
         if self._schema is None:
+            now = time.monotonic()
+            if self._last_schema_attempt is not None and now - self._last_schema_attempt < _SCHEMA_RETRY_COOLDOWN_S:
+                raise ArmConnectionError("schema fetch in cooldown after previous failure")
+            self._last_schema_attempt = now
             self._schema = self.client.get_schema()
         return self._schema
 
@@ -909,6 +915,10 @@ class ArmSession:
             return self._schema.gripper_joint
         if self._gripper_joint is not _GRIPPER_UNSET:
             return self._gripper_joint  # type: ignore[return-value]
+        now = time.monotonic()
+        if self._last_schema_attempt is not None and now - self._last_schema_attempt < _SCHEMA_RETRY_COOLDOWN_S:
+            obs = self.latest_observation()
+            return 6 if obs is not None and len(obs.positions) == 7 else None
         try:
             self._gripper_joint = self.schema().gripper_joint
             return self._gripper_joint  # type: ignore[return-value]

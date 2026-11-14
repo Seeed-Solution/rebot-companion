@@ -78,6 +78,7 @@ log = logging.getLogger("rebot_mcp")
 GRIP_CLOSED_RAD = 0.0  # armd GripperPolicy::rebot_dm closed_rad (cockpit CFG.gripClosed)
 GRIP_OPEN_RAD = -5.7  # open_rad (cockpit CFG.gripOpen)
 MAX_LINEAR_MPS = 0.15
+_SCHEMA_RETRY_COOLDOWN_S = 5.0
 MAX_STEP_M = 0.30
 MAX_ROT_DEG = 90.0
 
@@ -283,15 +284,26 @@ class Controller:
         self._lock = threading.RLock()
         self._joint_map: kinematics.JointMap | None = None
         self._schema: ObservationSchema | None = None
+        self._last_schema_attempt: float | None = None
+        self._cached_fallback_schema: ObservationSchema | None = None
 
     def schema(self) -> ObservationSchema:
         if self._schema is None:
+            now = time.monotonic()
+            if self._last_schema_attempt is not None and now - self._last_schema_attempt < _SCHEMA_RETRY_COOLDOWN_S:
+                if self._cached_fallback_schema is not None:
+                    return self._cached_fallback_schema
+                dof = len(self.observation().positions) if self.observation() else 7
+                return ObservationSchema.from_dict({"dof": dof})
+            self._last_schema_attempt = now
             try:
                 self._schema = self.client.get_schema()
+                self._cached_fallback_schema = None
             except Exception as exc:
                 log.warning("observation schema unavailable: %s", exc)
                 dof = len(self.observation().positions) if self.observation() else 7
-                return ObservationSchema.from_dict({"dof": dof})
+                self._cached_fallback_schema = ObservationSchema.from_dict({"dof": dof})
+                return self._cached_fallback_schema
         return self._schema
 
     def gripper_joint(self) -> int | None:

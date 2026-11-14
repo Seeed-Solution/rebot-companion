@@ -561,9 +561,12 @@ class LeaderTeleopBridge:
         self.closed_rad, self.open_rad = units.resolve_schema_gripper_bounds(
             schema.gripper_policy, self.limits, self.gripper_joint
         )
+        if getattr(session, "_schema", None) is None:
+            session._schema = schema
 
         self._stop = False
         self._activated = False
+        self._error: BaseException | None = None
         self.frames_sent = 0
 
         self._last_obs_timestamp: float | None = None
@@ -575,7 +578,7 @@ class LeaderTeleopBridge:
             raise LeaderError("no observation received from follower")
         if getattr(obs, "is_stopped", False) or getattr(obs, "safety_state", None) in ("EStop", "Fault"):
             state = getattr(obs, "safety_state", "Fault")
-            reason = getattr(obs, "fault_code", None) or getattr(obs, "fault_reason", None)
+            reason = (obs.fault or {}).get("code") if isinstance(getattr(obs, "fault", None), dict) else getattr(obs, "fault_reason", None)
             raise LeaderError(
                 f"follower is in {state} ({reason}); check it and clear the fault in the cockpit"
             )
@@ -707,8 +710,14 @@ class LeaderTeleopBridge:
 
     def run(self) -> None:
         """Stream servo frames continuously at fps."""
+        self._error = None
         self.bus.disable_torque(self.calib.servo_ids)
-        self.align_and_ramp()
+        try:
+            self.align_and_ramp()
+        except Exception as exc:
+            self._error = exc
+            log.error("leader alignment/ramp failed: %s", exc)
+            return
 
         period = 1.0 / self.fps
         t0 = time.monotonic()
@@ -726,8 +735,14 @@ class LeaderTeleopBridge:
                 self.session.servo(target)
                 self.frames_sent += 1
             except (LeaderError, ServoRejected, LeaseError, ArmConnectionError, RebotError, OSError) as exc:
+                self._error = exc
                 log.error("servo streaming stopped: %s", exc)
                 break
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except BaseException as exc:
+                self._error = exc
+                raise
             k += 1
 
     def close(self) -> None:
@@ -826,6 +841,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         calib = LeaderCalibration.load(args.calib)
         session = ArmSession(client, safe_exit="off").open()
+        session._schema = schema
         bridge = LeaderTeleopBridge(
             bus,
             session,
@@ -846,7 +862,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         signal.signal(signal.SIGTERM, _sig_handler)
 
         bridge.run()
+        if bridge._error is not None:
+            return 1
         return 0
+    except KeyboardInterrupt:
+        return 0
+    except Exception as exc:
+        print(f"rebot-teleop-leader: error: {exc}", file=sys.stderr)
+        return 1
     finally:
         if bridge is not None:
             bridge.close()

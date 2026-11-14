@@ -78,6 +78,7 @@ EXTRAS = {"velocity": ("observation.velocity", "velocities"), "effort": ("observ
 ARMD_PORT = 8765
 CAMERA_PORT = 8001
 STATS_IMAGE_EVERY_S = 0.5  # one camera frame per 0.5 s goes into the image stats
+_SCHEMA_RETRY_COOLDOWN_S = 5.0
 
 
 class RecorderError(RuntimeError):
@@ -543,6 +544,7 @@ class LeRobotRecorder:
         self.closed_rad: float | None = None
         self.open_rad: float | None = None
         self._schema_fetched = False
+        self._last_schema_fetch_attempt: float | None = None
         if obs_source is None and armd_host is not None:
             obs_source = ObservationStream(armd_host, obs_hz=obs_hz or self.fps * 2, connect_timeout=connect_timeout)
         if frame_source is None and camera_url is not None:
@@ -573,12 +575,26 @@ class LeRobotRecorder:
     def _fetch_schema(self) -> None:
         if self._schema_fetched or self.armd_host is None:
             return
-        self._schema_fetched = True
+        now = time.monotonic()
+        if self._last_schema_fetch_attempt is not None and now - self._last_schema_fetch_attempt < _SCHEMA_RETRY_COOLDOWN_S:
+            return
         try:
             from rebot.client import ArmdClient
 
-            client = ArmdClient(armd_url(self.armd_host))
+            try:
+                client = ArmdClient(armd_url(self.armd_host), timeout_sec=min(1.0, self.connect_timeout))
+            except TypeError:
+                client = ArmdClient(armd_url(self.armd_host))
             schema = client.get_schema()
+            if self.unit_mode != "rad":
+                if not schema.limits:
+                    raise RuntimeError(
+                        f"armd schema joint limits required for non-radian unit_mode {self.unit_mode!r}"
+                    )
+                if self.unit_mode == "so101_norm" and schema.gripper_joint is None:
+                    raise RuntimeError(
+                        f"armd schema gripper_joint required for unit_mode {self.unit_mode!r}"
+                    )
             self.schema = schema
             self.profile_id = schema.profile_id
             self.arm_dof = schema.arm_dof
@@ -590,8 +606,15 @@ class LeRobotRecorder:
                 self.closed_rad, self.open_rad = units.resolve_schema_gripper_bounds(
                     schema.gripper_policy, schema.limits, self.gripper_joint
                 )
+            self._schema_fetched = True
         except Exception as exc:
+            if self.unit_mode != "rad":
+                raise RuntimeError(
+                    f"failed to fetch schema from armd at {self.armd_host} for unit_mode {self.unit_mode!r}: {exc}"
+                ) from exc
             log.info("schema fetch skipped or unavailable: %s", exc)
+        finally:
+            self._last_schema_fetch_attempt = time.monotonic()
 
     def open(self) -> LeRobotRecorder:
         """Start the sources and wait for the first observation / camera frame."""
@@ -696,6 +719,15 @@ class LeRobotRecorder:
             raise ValueError(f"state and action need {self._dof} values")
 
         if self.unit_mode != "rad":
+            if not self.limits or len(self.limits) != len(state):
+                raise RuntimeError(
+                    f"unit_mode {self.unit_mode!r} requires joint limits matching state dim {len(state)}, "
+                    f"got limits={self.limits}"
+                )
+            if self.unit_mode == "so101_norm" and self.gripper_joint is None:
+                raise RuntimeError(
+                    f"unit_mode {self.unit_mode!r} requires gripper_joint to be set"
+                )
             state = units.from_armd(
                 state,
                 self.unit_mode,

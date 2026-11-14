@@ -913,10 +913,14 @@ def test_mcp_server_schema_fallback_7dof():
     assert schema.dof == 7
     assert schema.gripper_joint == 6
     assert ctrl.gripper_joint() == 6
+    assert mock_client.get_schema.call_count == 1
+    # Cooldown prevents hammering get_schema on immediate retry
+    ctrl.schema()
+    assert mock_client.get_schema.call_count == 1
     # Must NOT permanently cache synthetic schema
     assert ctrl._schema is None
 
-    # When get_schema recovers, next call returns real schema
+    # When cooldown expires and get_schema recovers, next call returns real schema
     real_schema = ObservationSchema.from_dict({
         "dof": 6,
         "arm_dof": 5,
@@ -925,6 +929,7 @@ def test_mcp_server_schema_fallback_7dof():
     })
     mock_client.get_schema.side_effect = None
     mock_client.get_schema.return_value = real_schema
+    ctrl._last_schema_attempt = 0.0  # simulate cooldown expiry
     schema2 = ctrl.schema()
     assert schema2.dof == 6
     assert ctrl._schema is real_schema
@@ -943,8 +948,13 @@ def test_arm_session_does_not_permanently_cache_failed_schema():
     assert gj == 6
     assert session._schema is None
     assert session._gripper_joint is _GRIPPER_UNSET
+    assert mock_client.get_schema.call_count == 1
 
-    # When get_schema later succeeds, it sets real schema and real gripper_joint
+    # Immediate call within cooldown does not hit get_schema again
+    assert session.gripper_joint == 6
+    assert mock_client.get_schema.call_count == 1
+
+    # When cooldown expires and get_schema later succeeds, it sets real schema and real gripper_joint
     real_schema = ObservationSchema.from_dict({
         "dof": 6,
         "arm_dof": 5,
@@ -953,6 +963,7 @@ def test_arm_session_does_not_permanently_cache_failed_schema():
     })
     mock_client.get_schema.side_effect = None
     mock_client.get_schema.return_value = real_schema
+    session._last_schema_attempt = 0.0  # simulate cooldown expiry
 
     gj2 = session.gripper_joint
     assert gj2 == 5
@@ -1238,3 +1249,262 @@ def test_arm_status_loads_parsing():
     }
     status_none = ArmStatus.from_dict(raw_without_loads)
     assert status_none.loads is None
+
+
+# --------------------------------------------------------------------------- Round 2 review regression tests
+
+
+def test_replay_policy_loads_stats_json_when_missing_in_info(tmp_path: Path):
+    ds = tmp_path / "ds_no_info_stats"
+    (ds / "meta" / "episodes" / "chunk-000").mkdir(parents=True)
+    (ds / "data" / "chunk-000").mkdir(parents=True)
+
+    info = {
+        "fps": 10,
+        "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
+    }
+    (ds / "meta" / "info.json").write_text(json.dumps(info))
+
+    stats = {
+        "observation.state": {
+            "min": [-100.0, -100.0, -100.0, -100.0, -100.0, 0.0],
+            "max": [100.0, 100.0, 100.0, 100.0, 100.0, 100.0],
+        },
+        "action": {
+            "min": [-100.0, -100.0, -100.0, -100.0, -100.0, 0.0],
+            "max": [100.0, 100.0, 100.0, 100.0, 100.0, 100.0],
+        },
+    }
+    (ds / "meta" / "stats.json").write_text(json.dumps(stats))
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    ep_tbl = pa.table({
+        "episode_index": [0],
+        "data/chunk_index": [0],
+        "data/file_index": [0],
+    })
+    pq.write_table(ep_tbl, ds / "meta" / "episodes" / "chunk-000" / "file-000.parquet")
+
+    data_tbl = pa.table({
+        "episode_index": [0, 0],
+        "action": [[0.0] * 6, [10.0] * 6],
+    })
+    pq.write_table(data_tbl, ds / "data" / "chunk-000" / "file-000.parquet")
+
+    from rebot_companion.policy_runner import ReplayPolicy
+
+    pol = ReplayPolicy(ds, 0)
+    assert "stats" in pol.info
+    assert pol.info["stats"]["observation.state"]["min"][0] == -100.0
+
+    with pytest.raises(ValueError, match="cannot infer unit mode 'auto' from non-radian stats"):
+        units.resolve_unit_mode("auto", pol.info)
+
+
+def test_pretrained_info_finds_stats_without_info_json(tmp_path: Path):
+    ds = tmp_path / "ds_stats_only"
+    (ds / "meta").mkdir(parents=True)
+    stats = {"observation.state": {"min": [-3.14], "max": [3.14]}}
+    (ds / "meta" / "stats.json").write_text(json.dumps(stats))
+
+    info = pretrained_info(ds)
+    assert info is not None
+    assert "stats" in info
+    assert info["stats"]["observation.state"]["min"] == [-3.14]
+
+
+def test_resolve_unit_mode_require_metadata():
+    # Backward compatibility: require_metadata=False defaults to "rad"
+    assert units.resolve_unit_mode("auto", {}) == "rad"
+    assert units.resolve_unit_mode("auto", None) == "rad"
+    assert units.resolve_unit_mode("auto", {}, require_metadata=False) == "rad"
+
+    # require_metadata=True fails closed if metadata/stats missing
+    with pytest.raises(ValueError, match="cannot infer unit mode 'auto' without metadata or stats"):
+        units.resolve_unit_mode("auto", {}, require_metadata=True)
+    with pytest.raises(ValueError, match="cannot infer unit mode 'auto' without metadata or stats"):
+        units.resolve_unit_mode("auto", None, require_metadata=True)
+
+    # require_metadata=True succeeds when explicit unit_mode is present
+    assert units.resolve_unit_mode("auto", {"unit_mode": "so101_norm"}, require_metadata=True) == "so101_norm"
+    assert units.resolve_unit_mode("auto", {"rebot_unit_mode": "deg"}, require_metadata=True) == "deg"
+
+    # require_metadata=True succeeds when usable radian stats are present
+    usable_meta = {"stats": {"observation.state": {"min": [-2.0], "max": [2.0]}}}
+    assert units.resolve_unit_mode("auto", usable_meta, require_metadata=True) == "rad"
+
+
+def test_policy_runner_fails_closed_on_so_arm_when_metadata_missing():
+    from rebot_companion.policy_runner import ReplayPolicy
+
+    class MockReplay(ReplayPolicy):
+        def __init__(self):
+            self.name = "replay:mock:0"
+            self.fps = 10
+            self.action_dim = 6
+            self.actions = np.zeros((2, 6))
+            self.info = {}  # No unit_mode, no stats
+
+    raw_schema = {
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "profile_id": "so-arm101",
+        "limits": [
+            {"name": f"j{i}", "min_position": -3.14, "max_position": 3.14, "max_velocity": 2.0, "max_acceleration": 5.0}
+            for i in range(6)
+        ],
+    }
+    schema = ObservationSchema.from_dict(raw_schema)
+
+    class FakeClient:
+        def get_schema(self):
+            return schema
+
+        def request(self, method, path, **kwargs):
+            resp = MagicMock()
+            resp.ok = True
+            resp.json.return_value = raw_schema
+            return resp
+
+        def get_safety_describe(self):
+            return {"device": {"follower": "mock"}}
+
+    runner = PolicyRunner(FakeClient(), MockReplay())
+    with pytest.raises(ValueError, match="cannot infer unit mode 'auto' without metadata or stats"):
+        runner._read_arm()
+
+
+def test_recorder_fetch_schema_retry_and_strict_validation(tmp_path: Path, monkeypatch):
+    class FailingClient:
+        def __init__(self, host_or_url: str):
+            pass
+
+        def get_schema(self):
+            raise ConnectionRefusedError("armd down")
+
+    monkeypatch.setattr("rebot.client.ArmdClient", FailingClient)
+
+    rec_rad = LeRobotRecorder(tmp_path / "rec_rad", "test/repo", armd_host="192.168.1.1", fps=10, unit_mode="rad", camera_url=None)
+    rec_rad._fetch_schema()
+    assert rec_rad._schema_fetched is False
+
+    rec_norm = LeRobotRecorder(tmp_path / "rec_norm", "test/repo", armd_host="192.168.1.1", fps=10, unit_mode="so101_norm", camera_url=None)
+    with pytest.raises(RuntimeError, match="failed to fetch schema from armd"):
+        rec_norm._fetch_schema()
+    assert rec_norm._schema_fetched is False
+
+    class NoLimitsClient:
+        def __init__(self, host_or_url: str):
+            pass
+
+        def get_schema(self):
+            return ObservationSchema.from_dict({"dof": 6, "arm_dof": 5, "gripper_joint": 5, "limits": []})
+
+    monkeypatch.setattr("rebot.client.ArmdClient", NoLimitsClient)
+    rec_norm2 = LeRobotRecorder(tmp_path / "rec_norm2", "test/repo", armd_host="192.168.1.1", fps=10, unit_mode="so101_norm", camera_url=None)
+    with pytest.raises(RuntimeError, match="joint limits required for non-radian unit_mode"):
+        rec_norm2._fetch_schema()
+    assert rec_norm2._schema_fetched is False
+
+    class NoGripperClient:
+        def __init__(self, host_or_url: str):
+            pass
+
+        def get_schema(self):
+            return ObservationSchema.from_dict({
+                "dof": 6,
+                "arm_dof": 6,
+                "gripper_joint": None,
+                "limits": [
+                    {"name": f"j{i}", "min_position": -3.14, "max_position": 3.14, "max_velocity": 2.0, "max_acceleration": 5.0}
+                    for i in range(6)
+                ],
+            })
+
+    monkeypatch.setattr("rebot.client.ArmdClient", NoGripperClient)
+    rec_norm3 = LeRobotRecorder(tmp_path / "rec_norm3", "test/repo", armd_host="192.168.1.1", fps=10, unit_mode="so101_norm", camera_url=None)
+    with pytest.raises(RuntimeError, match="gripper_joint required for unit_mode 'so101_norm'"):
+        rec_norm3._fetch_schema()
+
+
+def test_recorder_add_frame_strict_limit_validation(tmp_path: Path):
+    rec = LeRobotRecorder(tmp_path / "rec_strict", "test/repo", fps=10, unit_mode="deg", armd_host=None, camera_url=None)
+    rec.start_episode(sample=False)
+    with pytest.raises(RuntimeError, match="requires joint limits matching state dim"):
+        rec.add_frame([0.0] * 6, [0.0] * 6)
+
+
+def test_leader_teleop_exit_codes_and_fault_code_reporting():
+    bus = MagicMock()
+    session = MagicMock()
+    schema = ObservationSchema.from_dict({
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "limits": [
+            {"name": f"j{i}", "min_position": -3.14, "max_position": 3.14, "max_velocity": 2.0, "max_acceleration": 5.0}
+            for i in range(6)
+        ],
+    })
+
+    bridge = LeaderTeleopBridge(bus, session, schema, fps=10, ramp_seconds=0.2)
+
+    # 1. Fault code reported correctly from dict obs.fault
+    obs_fault = MagicMock()
+    obs_fault.is_stopped = True
+    obs_fault.safety_state = "Fault"
+    obs_fault.fault = {"code": "THERMAL_TRIP", "message": "Motor overheated"}
+    with pytest.raises(LeaderError, match=r"follower is in Fault \(THERMAL_TRIP\)"):
+        bridge._check_follower_healthy(obs_fault)
+
+    # 2. bridge.run() records error on align_and_ramp failure
+    session.wait_for_observation.side_effect = Exception("connection lost")
+    bridge.run()
+    assert bridge._error is not None
+    assert "connection lost" in str(bridge._error)
+
+    # 3. Clean completion without error
+    bridge._error = None
+    bridge._stop = True
+    bridge.align_and_ramp = MagicMock()
+    bridge.run()
+    assert bridge._error is None
+
+    # 4. KeyboardInterrupt propagates without setting bridge._error
+    bridge._error = None
+    bridge.align_and_ramp = MagicMock(side_effect=KeyboardInterrupt("Ctrl-C"))
+    with pytest.raises(KeyboardInterrupt):
+        bridge.run()
+    assert bridge._error is None
+
+
+def test_schema_cooldown_initial_sentinel_allows_early_monotonic(monkeypatch):
+    """When time.monotonic() is small (e.g. 1.0 in a fresh container), first schema call must succeed."""
+    monkeypatch.setattr(time, "monotonic", lambda: 1.0)
+
+    # 1. ArmSession
+    client = MagicMock()
+    schema = ObservationSchema.from_dict({"dof": 7, "arm_dof": 6, "gripper_joint": 6})
+    client.get_schema.return_value = schema
+
+    session = ArmSession(client)
+    assert session._last_schema_attempt is None
+    # First call must make the client call even though monotonic() == 1.0 < 5.0
+    res = session.schema()
+    assert res == schema
+    assert client.get_schema.call_count == 1
+    assert session._last_schema_attempt == 1.0
+
+    # 2. Controller in mcp_server
+    from rebot_companion.mcp_server import Controller
+    mcp_client = MagicMock()
+    mcp_client.get_schema.return_value = schema
+    controller = Controller(mcp_client, MagicMock(), MagicMock())
+    assert controller._last_schema_attempt is None
+    res_mcp = controller.schema()
+    assert res_mcp == schema
+    assert mcp_client.get_schema.call_count == 1
+    assert controller._last_schema_attempt == 1.0

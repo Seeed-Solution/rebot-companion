@@ -140,6 +140,16 @@ class ReplayPolicy(Policy):
 
         root = Path(root)
         info = json.loads((root / "meta" / "info.json").read_text())
+        if "stats" not in info:
+            for stats_file in (root / "meta" / "stats.json", root / "stats.json"):
+                if stats_file.is_file():
+                    try:
+                        stats_data = json.loads(stats_file.read_text())
+                        if isinstance(stats_data, dict):
+                            info["stats"] = stats_data
+                            break
+                    except Exception as exc:
+                        log.warning("failed to read %s: %s", stats_file, exc)
         self.fps = int(info["fps"])
         rows = []
         for f in sorted((root / "meta" / "episodes").glob("*/*.parquet")):
@@ -420,22 +430,34 @@ def pretrained_info(path: str | Path) -> dict | None:
         if found:
             break
 
-    if info_dict is not None and "stats" not in info_dict:
+    stats_data: dict | None = None
+    if info_dict is not None and "stats" in info_dict and isinstance(info_dict["stats"], dict):
+        stats_data = info_dict["stats"]
+    else:
         stats_candidates: list[Path] = []
         if info_path is not None:
             stats_candidates.append(info_path.parent / "stats.json")
+        for root in roots:
+            stats_candidates.append(root / "meta" / "stats.json")
+            stats_candidates.append(root / "stats.json")
         if local.is_dir():
             stats_candidates.append(local / "meta" / "stats.json")
             stats_candidates.append(local / "stats.json")
         for stats_file in stats_candidates:
             if stats_file.is_file():
                 try:
-                    stats_data = json.loads(stats_file.read_text())
-                    if isinstance(stats_data, dict):
-                        info_dict["stats"] = stats_data
+                    s_data = json.loads(stats_file.read_text())
+                    if isinstance(s_data, dict):
+                        stats_data = s_data
                         break
                 except Exception as exc:
                     log.warning("failed to read %s: %s", stats_file, exc)
+
+    if stats_data is not None:
+        if info_dict is None:
+            info_dict = {"stats": stats_data}
+        else:
+            info_dict["stats"] = stats_data
 
     cfg_unit_mode = None
     candidates = [cfg]
@@ -866,9 +888,34 @@ class PolicyRunner:
         if isinstance(self.policy, SinePolicy) and self.policy.joint >= self.dof:
             raise RunnerError(f"sine policy joint index {self.policy.joint + 1} exceeds arm DOF {self.dof}")
 
+        prof = (schema.profile_id or "").lower()
+        is_so_arm = (
+            prof.startswith("so_arm")
+            or prof.startswith("so-arm")
+            or schema.arm_dof == 5
+            or (self.dof == 6 and self.gripper_joint is not None)
+        )
+        is_learned_or_replay = isinstance(self.policy, (LeRobotPolicy, ReplayPolicy))
+        require_meta = is_learned_or_replay and is_so_arm
+
         policy_info = getattr(self.policy, "info", None)
-        self.action_units = units.resolve_unit_mode(self.action_units_requested, policy_info)
-        self.state_units = units.resolve_unit_mode(self.state_units_requested, policy_info)
+        if isinstance(self.policy, LeRobotPolicy) and policy_info is None:
+            extracted_stats = None
+            for proc in (getattr(self.policy, "pre", None), getattr(self.policy, "post", None)):
+                if proc is not None and hasattr(proc, "stats") and isinstance(proc.stats, dict):
+                    extracted_stats = proc.stats
+                    break
+            if extracted_stats:
+                policy_info = {"stats": extracted_stats}
+            elif not is_so_arm:
+                log.warning("LeRobotPolicy metadata/stats unavailable; falling back to rad units on 7-DOF arm")
+
+        self.action_units = units.resolve_unit_mode(
+            self.action_units_requested, policy_info, require_metadata=require_meta
+        )
+        self.state_units = units.resolve_unit_mode(
+            self.state_units_requested, policy_info, require_metadata=require_meta
+        )
 
     def _observation(self, obs: ArmStatus) -> dict[str, np.ndarray]:
         positions = units.from_armd(

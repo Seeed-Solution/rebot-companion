@@ -338,3 +338,48 @@ def test_rebot_companion_re_exports_the_core():
     assert legacy.ArmSession is rebot.client.ArmSession and legacy.GRIPPER_INDEX == 6
     assert rebot_companion.ArmdClient is rebot.client.ArmdClient
     assert rebot_companion.ArmdError is rebot.RebotError
+
+
+def test_dynamic_gripper_bounds_in_pipeline():
+    so_limits = [
+        {"name": f"j{i}", "min_position": -3.14, "max_position": 3.14, "max_velocity": 2.0, "max_acceleration": 5.0}
+        for i in range(5)
+    ] + [{"name": "gripper", "min_position": 0.0, "max_position": 1.745329, "max_velocity": 2.0, "max_acceleration": 5.0}]
+    so_schema = ObservationSchema.from_dict({
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "profile_id": "so-arm101",
+        "limits": so_limits,
+    })
+    arm = MagicMock(spec=ArmdClient)
+    arm.get_schema.return_value = so_schema
+    arm.get_observation.return_value = status("Idle", positions=[0.0] * 6)
+    session = session_mock("Idle", positions=[0.0] * 6)
+    arm.session.return_value.__enter__.return_value = session
+    ik = MagicMock(side_effect=lambda pose: [float(pose.translation[2]), 0, 0, 0, 0, 0.0])
+    cam_to_base = Transform.from_translation_euler([0.1, -0.1, 0.1], 0.0, 0.0, 0.0)
+
+    # Dynamic resolution from SO-ARM schema (no explicit gripper bounds in config)
+    res = DeterministicPickPlacePipeline(
+        marker_scene(), arm, cam_to_base, PipelineConfig(max_allowed_distance=1.0), ik_solver=ik
+    ).run_cycle()
+    assert res.success is True
+    targets = [c.args[0] for c in session.move_to.call_args_list]
+    # In SO-ARM: gripper_joint=5, open=1.745329, closed=0.0
+    assert targets[0][5] == pytest.approx(1.745329)
+    assert [t[5] for t in targets] == pytest.approx([1.745329, 1.745329, 1.745329, 0.0, 0.0, 0.0, 1.745329])
+
+    # Explicit customization overrides schema
+    session2 = session_mock("Idle", positions=[0.0] * 6)
+    arm.session.return_value.__enter__.return_value = session2
+    res2 = DeterministicPickPlacePipeline(
+        marker_scene(),
+        arm,
+        cam_to_base,
+        PipelineConfig(max_allowed_distance=1.0, gripper_open=-2.5, gripper_closed=-0.1),
+        ik_solver=ik,
+    ).run_cycle()
+    assert res2.success is True
+    targets2 = [c.args[0] for c in session2.move_to.call_args_list]
+    assert [t[5] for t in targets2] == pytest.approx([-2.5, -2.5, -2.5, -0.1, -0.1, -0.1, -2.5])

@@ -10,7 +10,7 @@ import numpy as np
 
 from rebot.client import ArmCommandRejected, ArmdClient, ArmdError, ArmSession, ObservationSchema, SafeExitOutcome
 
-from . import kinematics
+from . import kinematics, units
 from .calibration import HandEyeResult, check_b601_compatibility
 from .camera_client import CameraTriggerTimeout, MarkerDetection, ReCameraClient
 from .ik import GRIPPER_CLOSED, GRIPPER_OPEN, B601IkAdapter
@@ -30,9 +30,10 @@ class PipelineConfig:
     lift_duration: float = 1.0
     place_duration: float = 1.5
     gripper_duration: float = 1.0
-    # Gripper joint (index 6 of armd's 7-joint vector) targets; open is negative.
-    gripper_open: float = GRIPPER_OPEN
-    gripper_closed: float = GRIPPER_CLOSED
+    # Gripper joint targets (rad). When None, dynamically resolved from schema
+    # (via units.resolve_schema_gripper_bounds), falling back to B601 bounds (GRIPPER_OPEN, GRIPPER_CLOSED).
+    gripper_open: float | None = None
+    gripper_closed: float | None = None
     enable_torque: bool = True  # arm torque if the arm is Idle; otherwise fail the cycle
     # After the last segment: "unload" (park + torque off), "home", or "hold".
     # With a pipeline-owned session, "home"/"hold" leave the arm torqued without a
@@ -270,7 +271,17 @@ class DeterministicPickPlacePipeline:
                 q[gripper_joint] = value
             return q
 
-        opened, closed = cfg.gripper_open, cfg.gripper_closed
+        if schema is not None:
+            dyn_closed, dyn_open = units.resolve_schema_gripper_bounds(
+                getattr(schema, "gripper_policy", None),
+                getattr(schema, "limits", None),
+                gripper_joint,
+            )
+        else:
+            dyn_closed, dyn_open = GRIPPER_CLOSED, GRIPPER_OPEN
+
+        opened = dyn_open if cfg.gripper_open is None else float(cfg.gripper_open)
+        closed = dyn_closed if cfg.gripper_closed is None else float(cfg.gripper_closed)
 
         def execute(s: ArmSession) -> None:
             obs = s.latest_observation() or s.wait_for_observation()
