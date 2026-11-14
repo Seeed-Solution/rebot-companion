@@ -515,3 +515,274 @@ def test_detect_once_keeps_the_old_trigger_for_api1_and_older_providers():
         res = client.detect_once(wait_ms=100, pipelines=["aruco"])
         assert bodies == [b""] and client.pipelines_supported is False
         assert res["frame_id"] == 3 and res["pipelines"] is None
+
+
+def test_v2_obb_payload_and_to_dict_roundtrip():
+    raw = {
+        "detections": [
+            {
+                "format": "xywh_center",
+                "cx": 0.5,
+                "cy": 0.5,
+                "w": 0.2,
+                "h": 0.1,
+                "score": 0.95,
+                "label": "gear",
+                "obb_corners": [
+                    [0.4, 0.45],
+                    [0.6, 0.45],
+                    [0.6, 0.55],
+                    [0.4, 0.55],
+                ],
+                "angle_deg": 12.34567,
+                "angle_conf": 0.9234,
+                "grasp_width_px": 48.5678,
+                "length_px": 96.0,
+                "mask_focus": True,
+            }
+        ]
+    }
+    (d,) = parse_detections(raw)
+    assert d.label == "gear"
+    assert d.score == pytest.approx(0.95)
+    assert d.corners_norm is None  # ArUco marker corners must remain None
+    assert d.obb_corners_norm == [
+        (0.4, 0.45),
+        (0.6, 0.45),
+        (0.6, 0.55),
+        (0.4, 0.55),
+    ]
+    assert d.angle_deg == pytest.approx(12.34567)
+    assert d.angle_conf == pytest.approx(0.9234)
+    assert d.grasp_width_px == pytest.approx(48.5678)
+    assert d.length_px == pytest.approx(96.0)
+    assert d.mask_focus is True
+
+    # to_dict() test: rounding floats to 4 decimals, bool kept unrounded
+    dct = d.to_dict()
+    assert dct["label"] == "gear"
+    assert dct["score"] == 0.95
+    assert dct["box_norm"] == [0.4, 0.45, 0.6, 0.55]
+    assert dct["center_norm"] == [0.5, 0.5]
+    assert "corners_norm" not in dct
+    assert dct["obb_corners_norm"] == [
+        [0.4, 0.45],
+        [0.6, 0.45],
+        [0.6, 0.55],
+        [0.4, 0.55],
+    ]
+    assert dct["angle_deg"] == 12.3457
+    assert dct["angle_conf"] == 0.9234
+    assert dct["grasp_width_px"] == 48.5678
+    assert dct["length_px"] == 96.0
+    assert dct["mask_focus"] is True
+    assert type(dct["mask_focus"]) is bool
+
+
+def test_border_obb_corner_preserved_and_annotate_no_aabb_outer_pixels():
+    from PIL import Image
+
+    # 200x200 black snapshot
+    img = Image.new("RGB", (200, 200), (0, 0, 0))
+    buf = io.BytesIO()
+    img.save(buf, "JPEG")
+    snap = Snapshot(jpeg=buf.getvalue(), width=200, height=200, device_ts_ms=1000, host_rx_ms=1000)
+
+    # Box centered at 0.85, width 0.3 -> right edge at 1.00, clamped box_norm x1 = 1.0.
+    # Rotated corner extends outside the frame to u=1.08!
+    raw = {
+        "detections": [
+            {
+                "format": "xywh_center",
+                "cx": 0.85,
+                "cy": 0.5,
+                "w": 0.3,
+                "h": 0.2,
+                "score": 0.9,
+                "label": "part",
+                "angle_deg": 30.0,
+                "obb_corners": [
+                    [0.75, 0.4],
+                    [1.08, 0.45],
+                    [0.95, 0.7],
+                    [0.65, 0.5],
+                ],
+            }
+        ]
+    }
+    (d,) = parse_detections(raw)
+    # box_norm is clamped to [0, 1]
+    assert d.box_norm[2] == 1.0
+    # obb_corners_norm preserves u=1.08 unclamped
+    assert d.obb_corners_norm[1][0] == pytest.approx(1.08)
+
+    annotated = annotate(snap, [d], quality=100)
+    ann_img = Image.open(io.BytesIO(annotated.jpeg)).convert("RGB")
+
+    # AABB bottom-left corner at (round(x0 * 199), round(y1 * 199)) = (139, 119)
+    aabb_x0 = round(d.box_norm[0] * 199)
+    aabb_y1 = round(d.box_norm[3] * 199)
+    # The outer corner of the axis-aligned box must NOT be colored green (it is black (0, 0, 0))
+    corner_pixel = ann_img.getpixel((aabb_x0, aabb_y1))
+    assert corner_pixel == (0, 0, 0), f"AABB outer corner pixel ({aabb_x0}, {aabb_y1}) colored: {corner_pixel}"
+
+    # The rotated polygon corner at (0.95, 0.7) -> (round(0.95 * 199), round(0.7 * 199)) = (189, 139)
+    # is on the drawn rotated polygon line and must have a green hue (g > 150)
+    poly_corner = ann_img.getpixel((round(0.95 * 199), round(0.7 * 199)))
+    assert poly_corner[1] > 150, f"Rotated polygon corner was not colored green: {poly_corner}"
+
+
+def test_annotate_obb_angle_label():
+    pil = pytest.importorskip("PIL.Image")
+    img = pil.new("RGB", (200, 100), (0, 0, 0))
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    snap = Snapshot(jpeg=buf.getvalue(), width=200, height=100, device_ts_ms=1, host_rx_ms=1)
+    det = Detection(
+        "can",
+        0.85,
+        (0.2, 0.2, 0.6, 0.6),
+        angle_deg=-45.2,
+        obb_corners_norm=[(0.2, 0.4), (0.4, 0.2), (0.6, 0.4), (0.4, 0.6)],
+    )
+    out = annotate(snap, [det])
+    res = pil.open(io.BytesIO(out.jpeg)).convert("RGB")
+    assert out.width == 200 and out.height == 100
+
+    # Near-90 deg angle wrapping check: 89.9 wraps to -90deg display
+    det_edge = Detection(
+        "can",
+        0.85,
+        (0.2, 0.2, 0.6, 0.6),
+        angle_deg=89.9,
+        obb_corners_norm=[(0.2, 0.4), (0.4, 0.2), (0.6, 0.4), (0.4, 0.6)],
+    )
+    out_edge = annotate(snap, [det_edge])
+    assert out_edge.width == 200 and out_edge.height == 100
+    disp_deg = (round(det_edge.angle_deg) + 90) % 180 - 90
+    assert disp_deg == -90
+
+
+def test_obb_and_rbox_format_parsing():
+    import math
+
+    # Case A: format="obb" with rbox [cx, cy, w, h, angle]
+    # w=0.4, h=0.2, angle=0.0 rad -> w >= h, long side angle is 0.0 deg
+    raw_obb = {
+        "detections": [
+            {
+                "format": "obb",
+                "rbox": [0.5, 0.5, 0.4, 0.2, 0.0],
+                "score": 0.88,
+                "label": "block",
+            }
+        ]
+    }
+    (d1,) = parse_detections(raw_obb)
+    assert d1.box_norm == pytest.approx((0.3, 0.4, 0.7, 0.6))
+    assert d1.center_norm == pytest.approx((0.5, 0.5))
+    assert d1.angle_deg == pytest.approx(0.0)
+    assert len(d1.obb_corners_norm) == 4
+    assert d1.obb_corners_norm[0] == pytest.approx((0.3, 0.4))
+    assert d1.obb_corners_norm[1] == pytest.approx((0.7, 0.4))
+    assert d1.obb_corners_norm[2] == pytest.approx((0.7, 0.6))
+    assert d1.obb_corners_norm[3] == pytest.approx((0.3, 0.6))
+
+    # Case B: format="rbox" with w < h (vertical box) -> long side angle is rotated by 90 deg
+    # w=0.2, h=0.4, angle=0.0 rad -> long side is vertical (angle_deg=-90.0)
+    raw_rbox = {
+        "detections": [
+            {
+                "format": "rbox",
+                "cx": 0.5,
+                "cy": 0.5,
+                "w": 0.2,
+                "h": 0.4,
+                "angle": 0.0,
+                "score": 0.85,
+            }
+        ]
+    }
+    (d2,) = parse_detections(raw_rbox)
+    assert d2.angle_deg == pytest.approx(-90.0)
+    assert d2.box_norm == pytest.approx((0.4, 0.3, 0.6, 0.7))
+
+    # Case C: format="obb" rotated by 45 degrees (pi/4)
+    # Square 0.2x0.2 rotated 45 deg -> half width = 0.1 * sqrt(2) = 0.14142
+    angle = math.pi / 4
+    raw_rot = {
+        "detections": [
+            {
+                "format": "obb",
+                "cx": 0.5,
+                "cy": 0.5,
+                "w": 0.2,
+                "h": 0.2,
+                "angle": angle,
+                "score": 0.9,
+            }
+        ]
+    }
+    (d3,) = parse_detections(raw_rot)
+    assert d3.angle_deg == pytest.approx(45.0)
+    hw = 0.1 * math.sqrt(2)
+    assert d3.box_norm == pytest.approx((0.5 - hw, 0.5 - hw, 0.5 + hw, 0.5 + hw))
+
+
+def test_numeric_hardening_and_angle_wrapping():
+    from rebot.detection import _opt_angle_deg
+
+    # angle_deg wrapping into [-90.0, 90.0)
+    assert _opt_angle_deg(0.0) == pytest.approx(0.0)
+    assert _opt_angle_deg(-0.0) == 0.0
+    assert _opt_angle_deg(45.0) == pytest.approx(45.0)
+    assert _opt_angle_deg(-45.0) == pytest.approx(-45.0)
+    assert _opt_angle_deg(-90.0) == pytest.approx(-90.0)
+    assert _opt_angle_deg(90.0) == pytest.approx(-90.0)
+    assert _opt_angle_deg(180.0) == pytest.approx(0.0)
+    assert _opt_angle_deg(270.0) == pytest.approx(-90.0)
+    assert _opt_angle_deg(-180.0) == pytest.approx(0.0)
+    assert _opt_angle_deg(-270.0) == pytest.approx(-90.0)
+
+    # 89.999999999 does not produce 90.0
+    w = _opt_angle_deg(89.999999999)
+    assert w < 90.0 and w != 90.0
+
+    # Non-bool / NaN / Inf / Overflow rejection
+    assert _opt_angle_deg(True) is None
+    assert _opt_angle_deg(False) is None
+    assert _opt_angle_deg(float("nan")) is None
+    assert _opt_angle_deg("nan") is None
+    assert _opt_angle_deg(float("inf")) is None
+    assert _opt_angle_deg(float("-inf")) is None
+    assert _opt_angle_deg("1e400") is None
+
+    # Payload with invalid values
+    raw_invalid = {
+        "detections": [
+            {
+                "format": "xywh_center",
+                "cx": 0.5,
+                "cy": 0.5,
+                "w": 0.2,
+                "h": 0.2,
+                "score": 0.8,
+                "angle_deg": True,  # reject bool
+                "angle_conf": 1.5,  # clamp to 1.0
+                "grasp_width_px": -10.0,  # reject negative
+                "mask_focus": "yes",  # reject non-bool
+                "obb_corners": [
+                    [True, 0.5],
+                    [0.6, 0.4],
+                    [0.6, 0.6],
+                    [0.4, 0.6],
+                ],  # reject bool in corner
+            }
+        ]
+    }
+    (d_inv,) = parse_detections(raw_invalid)
+    assert d_inv.angle_deg is None
+    assert d_inv.angle_conf == pytest.approx(1.0)
+    assert d_inv.grasp_width_px is None
+    assert d_inv.mask_focus is None
+    assert d_inv.obb_corners_norm is None

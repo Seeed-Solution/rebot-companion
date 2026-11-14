@@ -236,7 +236,7 @@ ssh <user>@192.168.42.1 'cd ~/arm && python3 main.py'
 | `gripper_open()`, `gripper_close()`, `gripper_move(fraction)` | gripper; `gripper_close().holding` reports a held object |
 | `gripper_zero_check(store_offset=False, threshold_rad=0.10)` | mechanical zero check; result has `stop_rad`, `offset_rad`, `pass_` (`.passed`) |
 | `gripper_calibration()`, `set_gripper_calibration(points, offset_rad=None)` | read calibration (GET); write opening table and/or offset (WS) |
-| `detect(label=None, pipelines=("yolo",), min_score=0.3)` | one detector run through armd; list of detections |
+| `detect(label=None, pipelines=("yolo",), min_score=0.3)` | one detector run through armd; list of detections (includes OBB fields `angle_deg`, `angle_conf`, `grasp_width_px`, `obb_corners_norm`, `mask_focus` when available) |
 | `grasp(detection)` or `grasp("cup", box=(x0, y0, x1, y1))` | armd's grasp action; `.holding` in the result |
 | `grasp_dry_run(detection)` | check reachability of a detection without moving or lease |
 | `grasp_any(label=None, min_score=0.3, max_candidates=5)` | detect, dry-run in order, grasp first reachable target |
@@ -473,7 +473,7 @@ Tools:
 | `get_state` | — | safety state, fault, torque, lease, joints (positions / commanded / velocities / torques / temperatures), `tcp` (host FK: `xyz_m`, `rpy_deg`, `quat` [w,x,y,z]), gripper, latest `action`, `epoch_id`. No lease needed |
 | `snapshot` | `max_width` (800, 64..1920), `quality` (80, 10..95) | JPEG image + JSON `{width, height, device_ts_ms, age_ms}` |
 | `snapshot_annotated` | `min_score` (0.3), `max_width`, `quality` | JPEG with the latest detector boxes + JSON `{detections, det_frame_id, det_age_vs_frame_ms, note?}` |
-| `detect` | `wait_ms` (2500, 0..5000), `min_score` (0.3), `pipelines` (`yolo` / `aruco` / `both`, default both) | `{frame_id, ts_ms, pipelines, count, detections[{label, score, box_norm, center_norm, track_id}]}`; uses `POST /api/v1/detection/trigger` with `{"pipelines": [...]}` when the detector reports `per_request_pipelines` (rebot-vision >= 1.3, perception API 2); older detectors run their current mode and `pipelines` in the result is null; on 404: enable inference → `latest` → disable (only if it enabled inference) |
+| `detect` | `wait_ms` (2500, 0..5000), `min_score` (0.3), `pipelines` (`yolo` / `aruco` / `both`, default both) | `{frame_id, ts_ms, pipelines, count, detections[{label, score, box_norm, center_norm, track_id, angle_deg?, angle_conf?, grasp_width_px?, obb_corners_norm?, mask_focus?}]}`; uses `POST /api/v1/detection/trigger` with `{"pipelines": [...]}` when the detector reports `per_request_pipelines` (rebot-vision >= 1.3, perception API 2); older detectors run their current mode and `pipelines` in the result is null; on 404: enable inference → `latest` → disable (only if it enabled inference) |
 | `move_to` | `x, y, z` (m), `roll_deg/pitch_deg/yaw_deg` or `quat`, `speed_mps` (≤ 0.15, default 0.05), `timeout_s` (≤ 60) | `{action_id, state, settled, tcp_after, duration_s}`; straight line of `end_link`; orientation omitted = keep |
 | `move_relative` | `frame` (`base`/`tool`/`camera`), `dx/dy/dz` (each ≤ 0.30 m), `dyaw_deg/dpitch_deg/droll_deg` (each ≤ 90), `level`, `speed_mps` | same as `move_to` |
 | `gripper` | `command` (`open`/`close`/`move`), `fraction` (0 closed .. 1 open), `grasp` | `{holding, gap_rad, torque_nm, fraction, state}` |
