@@ -1342,6 +1342,12 @@ class ArmSession:
         (:meth:`move_to` is the joint-space jog.)
         ``auto_yaw``: when True on 5-DOF arms (orient_dof=2), armd solves yaw from position.
         """
+        if auto_yaw is not None and not isinstance(auto_yaw, bool):
+            raise ValueError(f"auto_yaw must be bool or None, got {type(auto_yaw).__name__}: {auto_yaw!r}")
+        if auto_yaw is True and getattr(self, "_schema", None) is not None:
+            caps = getattr(self._schema, "capabilities", None) or {}
+            if caps.get("auto_yaw") is not True:
+                raise UnsupportedError("armd does not advertise auto_yaw capability", code="UNSUPPORTED")
         if rpy is not None and quat is not None:
             raise ValueError("give rpy or quat, not both")
         body: dict = {"position": _vec(position, 3, "position")}

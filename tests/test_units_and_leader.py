@@ -1999,6 +1999,8 @@ def test_leader_bridge_quintic_ramp_step_limit_extended(monkeypatch):
         mock_session._frames += 1
 
     monkeypatch.setattr(time, "sleep", fake_sleep)
+    initial_pos = list(armed_obs.positions)
+    mock_session.servo.side_effect = lambda cmd: setattr(armed_obs, "positions", list(cmd))
 
     schema = ObservationSchema.from_dict({
         "dof": 6,
@@ -2015,7 +2017,7 @@ def test_leader_bridge_quintic_ramp_step_limit_extended(monkeypatch):
     bridge.align_and_ramp()
     assert bridge.frames_sent >= 18
     calls = [c.args[0] for c in mock_session.servo.call_args_list]
-    prev = armed_obs.positions
+    prev = initial_pos
     for frame in calls:
         step_deltas = [abs(f - p) for f, p in zip(frame, prev)]
         assert max(step_deltas) <= 0.35 + 1e-4
@@ -2814,13 +2816,22 @@ def test_leader_teleop_steady_state_lead_clamping_and_empty_commanded(caplog):
 
     caplog.clear()
     with caplog.at_level(logging.WARNING):
+        cur_t = 1000.0
+        period = 1.0 / 50.0
+
+        def fake_monotonic():
+            return cur_t
+
         # Run 5 steps then stop
         def fake_sleep(dur):
+            nonlocal cur_t
+            cur_t += period
             if len(sent_frames) >= 5:
                 bridge.stop()
 
-        with patch("time.sleep", side_effect=fake_sleep):
-            bridge.run()
+        with patch("time.monotonic", side_effect=fake_monotonic):
+            with patch("time.sleep", side_effect=fake_sleep):
+                bridge.run()
 
     assert len(sent_frames) >= 5
     # For every frame, arm joints 0..4 stay clamped within obs ± 0.15 rad
@@ -2905,9 +2916,9 @@ def test_leader_teleop_moving_leader_ramp_slew_limit():
     # Leader jumps rapidly during ramp
     leader_pos = [0.0] * 6
     def read_sync(sids):
-        # Leader steps outward rapidly: 0.1 rad per step
+        # Leader steps outward during ramp
         for i in range(5):
-            leader_pos[i] = min(leader_pos[i] + 0.1, 1.5)
+            leader_pos[i] = min(leader_pos[i] + 0.02, 0.15)
         # convert to ticks: 2048 + pos * 4096 / (2*pi)
         return {sid: int(2048 + leader_pos[i] * 4096 / (2 * math.pi)) for i, sid in enumerate(sids)}
 
@@ -2937,11 +2948,27 @@ def test_leader_teleop_moving_leader_ramp_slew_limit():
     })
 
     sent_frames = []
-    mock_session.servo.side_effect = lambda cmd: sent_frames.append(list(cmd))
+
+    def on_servo(cmd):
+        sent_frames.append(list(cmd))
+        mock_obs.positions = list(cmd)
+
+    mock_session.servo.side_effect = on_servo
 
     bridge = LeaderTeleopBridge(bus, mock_session, schema, fps=50, ramp_seconds=0.2)
-    with patch("time.sleep", return_value=None):
-        bridge.align_and_ramp()
+    cur_time = 1000.0
+    period = 1.0 / 50.0
+
+    def mock_monotonic():
+        return cur_time
+
+    def mock_sleep(secs):
+        nonlocal cur_time
+        cur_time += (secs if secs is not None and secs > 0 else period)
+
+    with patch("time.monotonic", side_effect=mock_monotonic):
+        with patch("time.sleep", side_effect=mock_sleep):
+            bridge.align_and_ramp()
 
     assert len(sent_frames) > 0
     # Every step delta must be bounded by v_cap * 3.0 * period + eps
@@ -3194,7 +3221,7 @@ def test_lerobot_homing_offset_preserves_center_over_feetech_zero_step():
 
 
 def test_leader_teleop_run_rapid_swing_frame_step_clamp():
-    """Rapid swing (+0.30 -> -0.30 rad) with static obs.commanded_positions does not jump > 0.30 rad between consecutive frames."""
+    """Rapid swing (+0.30 -> -0.30 rad) with static obs.positions does not jump > v_run * dt between consecutive frames."""
     from unittest.mock import patch
 
     bus = MagicMock()
@@ -3243,15 +3270,26 @@ def test_leader_teleop_run_rapid_swing_frame_step_clamp():
 
     mock_session.servo.side_effect = on_servo
 
+    cur_time = 1000.0
+    period = 1.0 / 50.0
+    def mock_monotonic():
+        return cur_time
+
+    def mock_sleep(secs):
+        nonlocal cur_time
+        cur_time += (secs if secs is not None and secs > 0 else period)
+
     bridge = LeaderTeleopBridge(bus, mock_session, schema, fps=50)
     with patch.object(bridge, "align_and_ramp"):
-        with patch("time.sleep", return_value=None):
-            bridge.run()
+        with patch("time.monotonic", side_effect=mock_monotonic):
+            with patch("time.sleep", side_effect=mock_sleep):
+                bridge.run()
 
     assert len(sent_frames) >= 2
     delta_j0 = abs(sent_frames[1][0] - sent_frames[0][0])
-    assert delta_j0 <= 0.300001, f"Frame jumped {delta_j0} rad (> 0.30 rad)"
-    assert sent_frames[0][0] == pytest.approx(0.30, abs=1e-3)
+    expected_step = 0.8 * 2.0 * period  # 0.032 rad
+    assert delta_j0 <= expected_step + 1e-5, f"Frame jumped {delta_j0} rad (> {expected_step} rad)"
+    assert sent_frames[0][0] == pytest.approx(expected_step, abs=1e-3)
     assert sent_frames[1][0] == pytest.approx(0.00, abs=1e-3)
 
 
@@ -3533,3 +3571,397 @@ def test_leader_teleop_gripper_glitch_step_clamp():
     # max_gripper_step = max(0.30, 0.25 * 1.5) = 0.375 rad.
     # Frame 0 gripper must be clamped to 0.375 rad, NOT 1.5 rad.
     assert sent_frames[0][5] == pytest.approx(0.375, abs=1e-3)
+
+
+def test_leader_teleop_run_100hz_step_scaling():
+    """At 100 Hz (dt=0.01s), rapid swing frame step is scaled by dt (max_step = 0.8 * 2.0 * 0.01 = 0.016 rad)."""
+    from unittest.mock import patch
+
+    bus = MagicMock()
+    targets = [
+        [0.30, 0.0, 0.0, 0.0, 0.0, 0.0],
+        [-0.30, 0.0, 0.0, 0.0, 0.0, 0.0],
+    ]
+    step = 0
+
+    def read_sync(sids):
+        nonlocal step
+        target = targets[min(step, len(targets) - 1)]
+        return {sid: int(2048 + target[i] * 4096 / (2 * math.pi)) for i, sid in enumerate(sids)}
+
+    bus.read_positions_sync.side_effect = read_sync
+
+    mock_session = MagicMock()
+    mock_session.client.get_safety_describe.return_value = {"device": {"follower": "mock"}}
+    mock_obs = MagicMock()
+    mock_obs.positions = [0.0] * 6
+    mock_obs.commanded_positions = [0.0] * 6
+    mock_obs.safety_state = "Armed"
+    mock_obs.is_stopped = False
+    mock_obs.is_torqued = True
+    mock_obs.is_operational = True
+    mock_obs.collision = None
+    mock_session.wait_for_observation.return_value = mock_obs
+    mock_session.latest_observation.return_value = mock_obs
+
+    schema = ObservationSchema.from_dict({
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "limits": [
+            {"name": f"j{i}", "min_position": -3.14, "max_position": 3.14, "max_velocity": 2.0, "max_acceleration": 5.0}
+            for i in range(6)
+        ],
+    })
+
+    sent_frames = []
+
+    def on_servo(cmd):
+        nonlocal step
+        sent_frames.append(list(cmd))
+        step += 1
+        if len(sent_frames) >= 2:
+            bridge.stop()
+
+    mock_session.servo.side_effect = on_servo
+
+    cur_time = 1000.0
+    period = 1.0 / 100.0
+
+    def mock_monotonic():
+        return cur_time
+
+    def mock_sleep(secs):
+        nonlocal cur_time
+        cur_time += (secs if secs is not None and secs > 0 else period)
+
+    bridge = LeaderTeleopBridge(bus, mock_session, schema, fps=100)
+    with patch.object(bridge, "align_and_ramp"):
+        with patch("time.monotonic", side_effect=mock_monotonic):
+            with patch("time.sleep", side_effect=mock_sleep):
+                bridge.run()
+
+    assert len(sent_frames) >= 2
+    delta_j0 = abs(sent_frames[1][0] - sent_frames[0][0])
+    expected_step = 0.8 * 2.0 * period  # 0.016 rad
+    assert delta_j0 <= expected_step + 1e-5, f"Frame jumped {delta_j0} rad (> {expected_step} rad)"
+    assert sent_frames[0][0] == pytest.approx(expected_step, abs=1e-3)
+    assert sent_frames[1][0] == pytest.approx(0.00, abs=1e-3)
+
+
+def test_leader_teleop_run_low_max_velocity_step_clamp():
+    """Follower schema with low max_velocity=0.05 rad/s restricts run() step to <= 0.8 * 0.05 * dt."""
+    from unittest.mock import patch
+
+    bus = MagicMock()
+    targets = [
+        [0.30, 0.0, 0.0, 0.0, 0.0, 0.0],
+        [-0.30, 0.0, 0.0, 0.0, 0.0, 0.0],
+    ]
+    step = 0
+
+    def read_sync(sids):
+        nonlocal step
+        target = targets[min(step, len(targets) - 1)]
+        return {sid: int(2048 + target[i] * 4096 / (2 * math.pi)) for i, sid in enumerate(sids)}
+
+    bus.read_positions_sync.side_effect = read_sync
+
+    mock_session = MagicMock()
+    mock_session.client.get_safety_describe.return_value = {"device": {"follower": "mock"}}
+    mock_obs = MagicMock()
+    mock_obs.positions = [0.0] * 6
+    mock_obs.commanded_positions = [0.0] * 6
+    mock_obs.safety_state = "Armed"
+    mock_obs.is_stopped = False
+    mock_obs.is_torqued = True
+    mock_obs.is_operational = True
+    mock_obs.collision = None
+    mock_session.wait_for_observation.return_value = mock_obs
+    mock_session.latest_observation.return_value = mock_obs
+
+    schema = ObservationSchema.from_dict({
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "limits": [
+            {"name": f"j{i}", "min_position": -3.14, "max_position": 3.14, "max_velocity": 0.05, "max_acceleration": 5.0}
+            for i in range(6)
+        ],
+    })
+
+    sent_frames = []
+
+    def on_servo(cmd):
+        nonlocal step
+        sent_frames.append(list(cmd))
+        step += 1
+        if len(sent_frames) >= 2:
+            bridge.stop()
+
+    mock_session.servo.side_effect = on_servo
+
+    cur_time = 1000.0
+    period = 1.0 / 50.0
+
+    def mock_monotonic():
+        return cur_time
+
+    def mock_sleep(secs):
+        nonlocal cur_time
+        cur_time += (secs if secs is not None and secs > 0 else period)
+
+    bridge = LeaderTeleopBridge(bus, mock_session, schema, fps=50)
+    with patch.object(bridge, "align_and_ramp"):
+        with patch("time.monotonic", side_effect=mock_monotonic):
+            with patch("time.sleep", side_effect=mock_sleep):
+                bridge.run()
+
+    assert len(sent_frames) >= 2
+    delta_j0 = abs(sent_frames[1][0] - sent_frames[0][0])
+    expected_step = 0.8 * 0.05 * period  # 0.0008 rad
+    assert delta_j0 <= expected_step + 1e-5, f"Frame jumped {delta_j0} rad (> {expected_step} rad)"
+    assert sent_frames[0][0] == pytest.approx(expected_step, abs=1e-4)
+
+
+def test_leader_teleop_run_measured_obs_positions_lead_clamping():
+    """In run(), ref uses measured obs.positions so arm_lead bounds lookahead relative to follower position."""
+    from unittest.mock import patch
+
+    bus = MagicMock()
+    # Leader wants large move to 0.60 rad
+    bus.read_positions_sync.return_value = {sid: int(2048 + 0.60 * 4096 / (2 * math.pi)) for sid in range(1, 7)}
+
+    mock_session = MagicMock()
+    mock_session.client.get_safety_describe.return_value = {"device": {"follower": "mock"}}
+    mock_obs = MagicMock()
+    # Measured position is 0.0, but commanded is 0.20
+    mock_obs.positions = [0.0] * 6
+    mock_obs.commanded_positions = [0.20] * 6
+    mock_obs.safety_state = "Armed"
+    mock_obs.is_stopped = False
+    mock_obs.is_torqued = True
+    mock_obs.is_operational = True
+    mock_obs.collision = None
+    mock_session.wait_for_observation.return_value = mock_obs
+    mock_session.latest_observation.return_value = mock_obs
+
+    schema = ObservationSchema.from_dict({
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "limits": [
+            {"name": f"j{i}", "min_position": -3.14, "max_position": 3.14, "max_velocity": 25.0, "max_acceleration": 50.0}
+            for i in range(6)
+        ],
+    })
+
+    sent_frames = []
+
+    def on_servo(cmd):
+        sent_frames.append(list(cmd))
+        bridge.stop()
+
+    mock_session.servo.side_effect = on_servo
+
+    bridge = LeaderTeleopBridge(bus, mock_session, schema, fps=50)
+    bridge.arm_lead = 0.35
+    bridge._last_servo_cmd = [0.20] * 6
+    with patch.object(bridge, "align_and_ramp"):
+        with patch("time.sleep", return_value=None):
+            bridge.run()
+
+    assert len(sent_frames) == 1
+    # Clamped to ref[0] + arm_lead = 0.0 + 0.35 = 0.35 rad (NOT commanded 0.20 + 0.35 = 0.55 rad)
+    assert sent_frames[0][0] == pytest.approx(0.35, abs=1e-3)
+
+
+def test_leader_teleop_settle_non_convergence_raises_leader_error():
+    """align_and_ramp() raises LeaderError when settle phase fails to converge within timeout."""
+    from unittest.mock import patch
+
+    bus = MagicMock()
+    # Leader is stuck at 0.5 rad (gap = 0.5 rad > 0.08 rad)
+    bus.read_positions_sync.return_value = {sid: int(2048 + 0.5 * 4096 / (2 * math.pi)) for sid in range(1, 7)}
+
+    mock_session = MagicMock()
+    mock_session.client.get_safety_describe.return_value = {"device": {"follower": "mock"}}
+    mock_obs = MagicMock()
+    mock_obs.positions = [0.0] * 6
+    mock_obs.commanded_positions = [0.0] * 6
+    mock_obs.safety_state = "Armed"
+    mock_obs.is_stopped = False
+    mock_obs.is_torqued = True
+    mock_obs.is_operational = True
+    mock_obs.collision = None
+    mock_session.wait_for_observation.return_value = mock_obs
+    mock_session.latest_observation.return_value = mock_obs
+
+    schema = ObservationSchema.from_dict({
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "limits": [
+            {"name": f"j{i}", "min_position": -3.14, "max_position": 3.14, "max_velocity": 2.0, "max_acceleration": 5.0}
+            for i in range(6)
+        ],
+    })
+
+    bridge = LeaderTeleopBridge(bus, mock_session, schema, fps=50, ramp_seconds=0.2, allow_large_gap=True)
+    with patch("time.sleep", return_value=None):
+        with pytest.raises(LeaderError, match="settle phase failed to converge within timeout"):
+            bridge.align_and_ramp()
+
+
+def test_load_lerobot_norm_bounds_homing_offset_no_double_subtract(tmp_path: Path):
+    """When calibration JSON specifies homing_offset, ticks are post-homing Present_Position; do not add homing_offset_steps again."""
+    calib_json = tmp_path / "calib_homing.json"
+    calib_data = {
+        "shoulder_pan": {"range_min": 1024, "range_max": 3072, "homing_offset": 200, "zero_step": 2048},
+        "shoulder_lift": {"range_min": 1024, "range_max": 3072, "homing_offset": 200, "zero_step": 2048},
+        "elbow_flex": {"range_min": 1024, "range_max": 3072, "homing_offset": 200, "zero_step": 2048},
+        "wrist_flex": {"range_min": 1024, "range_max": 3072, "homing_offset": 200, "zero_step": 2048},
+        "wrist_roll": {"range_min": 1024, "range_max": 3072, "homing_offset": 200, "zero_step": 2048},
+        "gripper": {"range_min": 1500, "range_max": 2500, "homing_offset": 200, "zero_step": 2048},
+    }
+    calib_json.write_text(json.dumps(calib_data), encoding="utf-8")
+
+    schema_feetech = ObservationSchema.from_dict({
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "limits": [{"name": f"j{i}", "min_position": -3.0, "max_position": 3.0, "max_velocity": 1.0, "max_acceleration": 1.0} for i in range(6)],
+        "feetech_joints": [
+            {"zero_step": 2048, "homing_applied_in_hw": False, "homing_offset_steps": 200, "drive_mode_invert": False}
+            for _ in range(6)
+        ],
+    })
+
+    limits, closed_rad, open_rad = units.load_lerobot_norm_bounds(calib_json, schema=schema_feetech)
+    # effective_zero must be 2048 (not 2048 + 200 = 2248)
+    expected_neg = (1024 - 2048) * (2 * math.pi / 4096)
+    expected_pos = (3072 - 2048) * (2 * math.pi / 4096)
+    assert math.isclose(limits[0][0], expected_neg, rel_tol=1e-5)
+    assert math.isclose(limits[0][1], expected_pos, rel_tol=1e-5)
+
+
+def test_resolve_schema_gripper_bounds_validation():
+    """Test gripper bounds validation: equal endpoints, non-finite values, and zero-span limits."""
+    # 1. Equal explicit endpoints in dict raise ValueError
+    with pytest.raises(ValueError, match="cannot be equal"):
+        units.resolve_schema_gripper_bounds({"closed_rad": 0.0, "open_rad": 0.0}, None, 5)
+
+    with pytest.raises(ValueError, match="cannot be equal"):
+        units.resolve_schema_gripper_bounds({"closed_rad": "1.5", "open_rad": "1.5"}, None, 5)
+
+    # 2. Non-numeric or non-finite values in gripper_policy raise ValueError
+    with pytest.raises(ValueError, match="must be finite"):
+        units.resolve_schema_gripper_bounds({"closed_rad": float("nan"), "open_rad": 1.0}, None, 5)
+
+    with pytest.raises(ValueError, match="must be numeric"):
+        units.resolve_schema_gripper_bounds({"closed_rad": "invalid", "open_rad": 1.0}, None, 5)
+
+    # 3. closed_rad=1.5 without limits on gripper_joint=5 does NOT inject -5.7
+    c, o = units._resolve_gripper_bounds(None, 5, 1.5, None)
+    assert c == 1.5
+    assert o == 0.0
+    assert o != -5.7
+
+    # 4. Zero-span limits raise ValueError
+    with pytest.raises(ValueError, match="zero span"):
+        units._resolve_gripper_bounds([{"min_position": 1.0, "max_position": 1.0}] * 6, 5, None, None)
+
+
+def test_units_from_armd_to_armd_reject_non_finite():
+    """from_armd and to_armd reject NaN and inf in all modes."""
+    for mode in ("rad", "so101_norm", "deg"):
+        for bad_val in (float("nan"), float("inf"), float("-inf")):
+            with pytest.raises(ValueError, match="must be finite"):
+                units.from_armd([bad_val, 0.0, 0.0, 0.0, 0.0, 0.0], mode)
+
+            with pytest.raises(ValueError, match="must be finite"):
+                units.to_armd([bad_val, 0.0, 0.0, 0.0, 0.0, 0.0], mode)
+
+
+def test_auto_yaw_validation_and_capability_check():
+    """auto_yaw rejects non-bools in Arm.move_to and ArmSession.move_pose, and verifies capability check."""
+    from rebot.arm import Arm
+    from rebot.client import ArmSession, UnsupportedError
+
+    # 1. Arm.move_to validation
+    mock_session = MagicMock()
+    mock_arm = Arm.__new__(Arm)
+    mock_arm.session = mock_session
+    mock_arm.schema = ObservationSchema.from_dict({"dof": 6, "arm_dof": 5, "gripper_joint": 5, "capabilities": {"auto_yaw": True}})
+
+    with pytest.raises(ValueError, match="auto_yaw must be bool or None, got str: 'false'"):
+        mock_arm.move_to([0.2, 0.0, 0.1], auto_yaw="false")
+
+    with pytest.raises(ValueError, match="auto_yaw must be bool or None, got int: 1"):
+        mock_arm.move_to([0.2, 0.0, 0.1], auto_yaw=1)
+
+    # 2. ArmSession.move_pose validation
+    session = ArmSession.__new__(ArmSession)
+    session._schema = None
+
+    with pytest.raises(ValueError, match="auto_yaw must be bool or None, got str: 'false'"):
+        session.move_pose([0.2, 0.0, 0.1], auto_yaw="false")
+
+    with pytest.raises(ValueError, match="auto_yaw must be bool or None, got int: 1"):
+        session.move_pose([0.2, 0.0, 0.1], auto_yaw=1)
+
+    # 3. ArmSession.move_pose unsupported capability check
+    session._schema = ObservationSchema.from_dict({
+        "dof": 6, "arm_dof": 5, "gripper_joint": 5, "capabilities": {"auto_yaw": False}
+    })
+    with pytest.raises(UnsupportedError, match="armd does not advertise auto_yaw capability"):
+        session.move_pose([0.2, 0.0, 0.1], auto_yaw=True)
+
+
+def test_lerobot_recorder_toolless_7dof_and_custom_joint_names(tmp_path: Path):
+    """Toolless 7-DOF schema is accepted in so101_norm and custom joint_names are preserved."""
+    schema_7dof = ObservationSchema.from_dict({
+        "dof": 7,
+        "arm_dof": 7,
+        "gripper_joint": None,
+        "limits": [
+            {"name": f"j{i}", "min_position": -3.14, "max_position": 3.14, "max_velocity": 2.0, "max_acceleration": 5.0}
+            for i in range(7)
+        ],
+    })
+    rec = LeRobotRecorder(tmp_path / "rec7", "test/repo", unit_mode="so101_norm", fps=10, armd_host=None, camera_url=None)
+    rec.schema = schema_7dof
+    rec.arm_dof = 7
+    rec.gripper_joint = None
+    rec.limits = schema_7dof.limits
+    rec._schema_fetched = True
+
+    rec.start_episode(task="test7")
+    rec.add_frame([0.0] * 7, [0.0] * 7)
+    assert len(rec._ep.state) == 1
+
+    # Custom joint_names preserved even when schema has joint_names
+    custom_names = [f"arm_joint_{i}" for i in range(7)]
+    rec_custom = LeRobotRecorder(
+        tmp_path / "rec_custom",
+        "test/repo",
+        unit_mode="rad",
+        fps=10,
+        joint_names=custom_names,
+        armd_host=None,
+        camera_url=None,
+    )
+    schema_with_names = ObservationSchema.from_dict({
+        "dof": 7,
+        "arm_dof": 7,
+        "gripper_joint": None,
+        "joint_names": [f"default_j_{i}" for i in range(7)],
+        "limits": [
+            {"name": f"j{i}", "min_position": -3.14, "max_position": 3.14, "max_velocity": 2.0, "max_acceleration": 5.0}
+            for i in range(7)
+        ],
+    })
+    rec_custom.schema = schema_with_names
+    rec_custom._dof = 7
+    feats = rec_custom._features()
+    assert feats["observation.state"]["names"] == custom_names

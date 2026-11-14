@@ -372,6 +372,8 @@ class Arm:
         ``speed``: m/s (armd default 0.05).
         ``auto_yaw``: when True on 5-DOF arms (orient_dof=2), armd solves yaw from position.
         """
+        if auto_yaw is not None and not isinstance(auto_yaw, bool):
+            raise ValueError(f"auto_yaw must be bool or None, got {type(auto_yaw).__name__}: {auto_yaw!r}")
         caps = getattr(getattr(self, "schema", None), "capabilities", None) or {}
         has_auto_yaw_cap = caps.get("auto_yaw") is True
         if auto_yaw is True:

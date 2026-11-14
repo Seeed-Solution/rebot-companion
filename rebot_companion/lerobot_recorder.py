@@ -533,6 +533,7 @@ class LeRobotRecorder:
         self.video = video or VideoSettings()
         self.robot_type = robot_type
         self.joint_names = list(joint_names)
+        self._custom_joint_names = list(joint_names) != list(JOINT_NAMES)
         self.connect_timeout = connect_timeout
         if unit_mode == "auto" or unit_mode not in ("rad", "so101_norm", "deg"):
             raise ValueError(f"unit_mode must be one of ('rad', 'so101_norm', 'deg'), got {unit_mode!r}")
@@ -598,17 +599,17 @@ class LeRobotRecorder:
                         f"ambiguous 6-DOF schema missing arm_dof and gripper_joint for unit_mode {self.unit_mode!r}"
                     )
                 if self.unit_mode == "so101_norm" and schema.gripper_joint is None:
-                    if schema.arm_dof != 6:
+                    if not (schema.arm_dof in (6, 7) and schema.arm_dof == schema.dof):
                         raise RecorderError(
                             f"armd schema gripper_joint required for unit_mode {self.unit_mode!r} "
-                            f"(arm_dof={schema.arm_dof} != 6)"
+                            f"(arm_dof={schema.arm_dof}, dof={schema.dof})"
                         )
             self.schema = schema
             self.profile_id = schema.profile_id
             self.arm_dof = schema.arm_dof
             self.gripper_joint = schema.gripper_joint
             self.limits = schema.limits
-            if schema.joint_names and (self.joint_names == JOINT_NAMES or not self.joint_names):
+            if schema.joint_names and not self._custom_joint_names:
                 self.joint_names = list(schema.joint_names)
             if self.gripper_joint is not None:
                 self.closed_rad, self.open_rad = units.resolve_schema_gripper_bounds(
@@ -736,7 +737,7 @@ class LeRobotRecorder:
                     f"got limits={self.limits}"
                 )
             if self.unit_mode == "so101_norm" and self.gripper_joint is None:
-                if not (self.schema is not None and self.arm_dof == 6):
+                if not (self.schema is not None and self.arm_dof in (6, 7) and self.arm_dof == self._dof):
                     raise RuntimeError(
                         f"unit_mode {self.unit_mode!r} requires gripper_joint to be set"
                     )
@@ -978,7 +979,9 @@ class LeRobotRecorder:
 
     def _features(self) -> dict[str, dict]:
         dof = getattr(self, "_dof", len(self.joint_names))
-        if self.schema is not None and self.schema.joint_names and len(self.schema.joint_names) == dof:
+        if self._custom_joint_names and len(self.joint_names) == dof:
+            names = list(self.joint_names)
+        elif self.schema is not None and self.schema.joint_names and len(self.schema.joint_names) == dof:
             names = list(self.schema.joint_names)
         elif len(self.joint_names) == dof:
             names = list(self.joint_names)

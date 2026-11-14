@@ -995,6 +995,31 @@ class LeaderTeleopBridge:
             )
         return overall_gap
 
+    def _arm_velocity_caps(self) -> list[float]:
+        caps: list[float] = []
+        limits = getattr(self.schema, "limits", None) or []
+        for i, lim in enumerate(limits[:5]):
+            val = getattr(lim, "max_velocity", None)
+            if val is None and isinstance(lim, dict):
+                val = lim.get("max_velocity")
+            if val is not None:
+                try:
+                    v = float(val)
+                except (ValueError, TypeError):
+                    raise LeaderTeleopError(
+                        f"follower joint {i + 1} ({getattr(lim, 'name', f'j{i+1}')}) has non-numeric max_velocity: {val}"
+                    )
+                if not math.isfinite(v) or v <= 0:
+                    raise LeaderTeleopError(
+                        f"follower joint {i + 1} ({getattr(lim, 'name', f'j{i+1}')}) has non-finite or non-positive max_velocity: {val}"
+                    )
+                caps.append(v)
+            else:
+                caps.append(0.6)
+        while len(caps) < 5:
+            caps.append(0.6)
+        return caps
+
     def align_and_ramp(self) -> None:
         """Verify alignment against the follower arm and perform a smooth quintic ramp-in."""
         if self._stop:
@@ -1021,42 +1046,8 @@ class LeaderTeleopBridge:
         leader_target = self.read_leader_target()
         gap = self._check_alignment_gap(leader_target, follower_start, stage="initial")
 
-        v_maxes = []
-        for i, lim in enumerate(self.schema.limits[:5]):
-            val = getattr(lim, "max_velocity", None)
-            if val is None and isinstance(lim, dict):
-                val = lim.get("max_velocity")
-            if val is not None:
-                try:
-                    v = float(val)
-                except (ValueError, TypeError):
-                    raise LeaderTeleopError(
-                        f"follower joint {i + 1} ({getattr(lim, 'name', f'j{i+1}')}) has non-numeric max_velocity: {val}"
-                    )
-                if not math.isfinite(v) or v <= 0:
-                    raise LeaderTeleopError(
-                        f"follower joint {i + 1} ({getattr(lim, 'name', f'j{i+1}')}) has non-finite or non-positive max_velocity: {val}"
-                    )
-                v_maxes.append(v)
-        if hasattr(self, "follower_limits") and self.follower_limits:
-            for i, flim in enumerate(self.follower_limits[:5]):
-                val = getattr(flim, "max_velocity", None)
-                if val is None and isinstance(flim, dict):
-                    val = flim.get("max_velocity")
-                if val is not None:
-                    try:
-                        v = float(val)
-                    except (ValueError, TypeError):
-                        raise LeaderTeleopError(
-                            f"follower limit {i + 1} has non-numeric max_velocity: {val}"
-                        )
-                    if not math.isfinite(v) or v <= 0:
-                        raise LeaderTeleopError(
-                            f"follower limit {i + 1} has non-finite or non-positive max_velocity: {val}"
-                        )
-                    if v not in v_maxes:
-                        v_maxes.append(v)
-        min_v_max = min(v_maxes) if v_maxes else 0.6
+        v_caps = self._arm_velocity_caps()
+        min_v_max = min(v_caps) if v_caps else 0.6
         max_ramp_vel = min(0.6, 0.8 * min_v_max)
 
         base_steps = max(1, int(round(self.ramp_seconds * self.fps)))
@@ -1232,10 +1223,9 @@ class LeaderTeleopBridge:
                         time.sleep(due - now)
                     elif now > due:
                         t_settle_start += now - due
-                if arm_gap > 0.08:
-                    log.warning(
-                        "Settle phase finished with arm_gap=%.3f rad remaining (> 0.08 rad)",
-                        arm_gap,
+                if not self._stop and arm_gap > 0.08:
+                    raise LeaderError(
+                        f"settle phase failed to converge within timeout: arm_gap={arm_gap:.3f} rad > 0.08 rad"
                     )
 
     def run(self) -> None:
@@ -1251,7 +1241,9 @@ class LeaderTeleopBridge:
 
         period = 1.0 / self.fps
         t0 = time.monotonic()
+        prev_t = t0 - period
         k = 0
+        v_caps = self._arm_velocity_caps()
         while not self._stop:
             due = t0 + k * period
             now = time.monotonic()
@@ -1264,30 +1256,38 @@ class LeaderTeleopBridge:
             if self._stop:
                 break
 
+            now = time.monotonic()
+            dt = min(max(now - prev_t, 1e-3), 3.0 * period)
+            prev_t = now
+
             try:
                 obs = self.session.latest_observation()
                 self._check_follower_healthy(obs, require_torqued=True)
-                ref = (
-                    obs.commanded_positions
-                    if getattr(obs, "commanded_positions", None)
-                    else obs.positions
-                )
+                positions = getattr(obs, "positions", None)
+                if positions:
+                    ref = list(positions)
+                elif getattr(obs, "commanded_positions", None):
+                    ref = list(obs.commanded_positions)
+                else:
+                    ref = []
                 target = self.read_leader_target()
                 if self._stop:
                     break
                 clamped_target = list(target)
                 prev = self._last_servo_cmd or list(ref)
-                max_frame_step = 0.30
                 saturated = False
                 for j in range(min(len(clamped_target), len(ref))):
                     if j != self.gripper_joint and j < 5:
                         orig_val = clamped_target[j]
                         j_min, j_max = self.limits[j] if j < len(self.limits) else (None, None)
+                        v_cap_j = v_caps[j] if j < len(v_caps) else 0.6
+                        v_run_j = 0.8 * v_cap_j
+                        max_frame_step_j = min(0.30, v_run_j * dt)
                         clamped_val = _clamp_lead_and_step(
                             orig_val,
                             prev[j],
                             ref[j],
-                            max_frame_step,
+                            max_frame_step_j,
                             self.arm_lead,
                             j_min=j_min,
                             j_max=j_max,
