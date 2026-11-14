@@ -587,9 +587,15 @@ class LeRobotRecorder:
             if schema.joint_names and (self.joint_names == JOINT_NAMES or not self.joint_names):
                 self.joint_names = list(schema.joint_names)
             policy = schema.gripper_policy or {}
-            if "closed_rad" in policy and "open_rad" in policy:
+            if "closed_rad" in policy:
                 self.closed_rad = float(policy["closed_rad"])
+            if "open_rad" in policy:
                 self.open_rad = float(policy["open_rad"])
+            if self.gripper_joint == 6:
+                if self.closed_rad is None:
+                    self.closed_rad = 0.0
+                if self.open_rad is None:
+                    self.open_rad = -5.7
         except Exception as exc:
             log.info("schema fetch skipped or unavailable: %s", exc)
         try:

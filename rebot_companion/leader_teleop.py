@@ -144,33 +144,47 @@ class PosixSerialTransport(LeaderTransport):
                 termios.tcsetattr(self.fd, termios.TCSANOW, mode)
             else:
                 termios.tcsetattr(self.fd, termios.TCSANOW, mode)
-                self._set_custom_baud_linux(baud)
+                self._set_custom_baud(baud)
         except Exception:
             os.close(self.fd)
             raise
 
-    def _set_custom_baud_linux(self, baud: int) -> None:
+    def _set_custom_baud(self, baud: int) -> None:
         import fcntl
         import struct
         import sys
 
-        if sys.platform != "linux":
-            return
-        TCGETS2 = 0x802C542A
-        TCSETS2 = 0x402C542B
-        BOTHER = 0x1000
-        buf = bytearray(44)
-        try:
-            fcntl.ioctl(self.fd, TCGETS2, buf)
-            c_cflag = struct.unpack_from("I", buf, 8)[0]
-            c_cflag &= ~0o010017
-            c_cflag |= BOTHER
-            struct.pack_into("I", buf, 8, c_cflag)
-            struct.pack_into("I", buf, 36, baud)
-            struct.pack_into("I", buf, 40, baud)
-            fcntl.ioctl(self.fd, TCSETS2, buf)
-        except Exception as exc:
-            log.warning("failed to set custom baud %d via termios2 (%s)", baud, exc)
+        if sys.platform == "linux":
+            TCGETS2 = 0x802C542A
+            TCSETS2 = 0x402C542B
+            BOTHER = 0x1000
+            buf = bytearray(44)
+            try:
+                fcntl.ioctl(self.fd, TCGETS2, buf)
+                c_cflag = struct.unpack_from("I", buf, 8)[0]
+                c_cflag &= ~0o010017
+                c_cflag |= BOTHER
+                struct.pack_into("I", buf, 8, c_cflag)
+                struct.pack_into("I", buf, 36, baud)
+                struct.pack_into("I", buf, 40, baud)
+                fcntl.ioctl(self.fd, TCSETS2, buf)
+            except Exception as exc:
+                raise LeaderError(
+                    f"failed to set custom baud {baud} on Linux for {self.port}: {exc}; install pyserial"
+                ) from exc
+        elif sys.platform == "darwin":
+            IOSSIOSPEED = 0x80085402
+            buf = struct.pack("L", baud)
+            try:
+                fcntl.ioctl(self.fd, IOSSIOSPEED, buf)
+            except Exception as exc:
+                raise LeaderError(
+                    f"failed to set custom baud {baud} on macOS for {self.port}: {exc}; install pyserial"
+                ) from exc
+        else:
+            raise LeaderError(
+                f"custom baud {baud} is unsupported on {sys.platform} without pyserial; install pyserial"
+            )
 
     def write(self, data: bytes) -> None:
         os.write(self.fd, data)
@@ -498,9 +512,15 @@ class LeaderTeleopBridge:
         if obs.collision and obs.collision.get("active"):
             raise LeaderError("follower collision hold active; wait until it resumes")
 
-        follower_start = list(obs.positions[:6])
+        if self.schema.dof != 6 or self.schema.arm_dof != 5 or len(obs.positions) != 6:
+            raise LeaderError(
+                f"expected 6 DOF for SO-ARM101 (schema.dof={self.schema.dof}, "
+                f"schema.arm_dof={self.schema.arm_dof}, follower_positions={len(obs.positions)})"
+            )
+
+        follower_start = list(obs.positions)
         leader_target = self.read_leader_target()
-        if len(leader_target) != 6 or len(follower_start) != 6:
+        if len(leader_target) != 6:
             raise LeaderError(
                 f"expected 6 DOF for SO-ARM101 (got follower={len(follower_start)}, leader={len(leader_target)})"
             )
@@ -527,7 +547,9 @@ class LeaderTeleopBridge:
                         f"follower is in {obs.safety_state} ({obs.fault_code or obs.fault_reason}); "
                         "check it and clear the fault in the cockpit"
                     )
-            follower_start = list(obs.positions[:6])
+            if len(obs.positions) != 6:
+                raise LeaderError(f"expected 6 follower positions after enabling torque, got {len(obs.positions)}")
+            follower_start = list(obs.positions)
 
         if self.ramp_seconds <= 0.0:
             return
@@ -648,6 +670,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         schema = client.get_schema()
     except Exception as exc:
         print(f"rebot-teleop-leader: failed to fetch armd schema: {exc}", file=sys.stderr)
+        transport.close()
+        return 1
+
+    if schema.dof != 6 or schema.arm_dof != 5:
+        print(
+            f"rebot-teleop-leader: unsupported arm schema (dof={schema.dof}, arm_dof={schema.arm_dof}); "
+            "expected 6 DOF (5 arm + 1 gripper) for SO-ARM101",
+            file=sys.stderr,
+        )
         transport.close()
         return 1
 

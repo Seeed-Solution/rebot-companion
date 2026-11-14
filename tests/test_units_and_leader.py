@@ -22,6 +22,7 @@ from rebot_companion.leader_teleop import (
     LeaderError,
     LeaderTeleopBridge,
     LeaderTransport,
+    PosixSerialTransport,
     compute_checksum,
     decode_packet,
     encode_packet,
@@ -103,6 +104,38 @@ def test_units_b601_dm_inverted_gripper_roundtrip():
     )
     for orig, rec in zip(rad_vals, rec_vals):
         assert abs(orig - rec) < 1e-4
+
+
+def test_units_b601_inverted_gripper_fallback_from_limits():
+    # Inverted B601 limits [-5.7, 0.0] with closed_rad=None, open_rad=None
+    limits = [JointLimit(f"j{i}", -3.14, 3.14, 2.0, 5.0) for i in range(6)]
+    limits.append(JointLimit("gripper", -5.7, 0.0, 2.0, 5.0))
+    gripper_j = 6
+
+    # When closed_rad=None and open_rad=None, should resolve closed=0.0 and open=-5.7
+    rad_closed = [0.1, -0.2, 0.3, -0.4, 0.5, -0.6, 0.0]
+    norm_closed = units.from_armd(
+        rad_closed, "so101_norm", limits=limits, gripper_joint=gripper_j, closed_rad=None, open_rad=None
+    )
+    assert abs(norm_closed[6] - 0.0) < 1e-4
+
+    rad_open = [0.1, -0.2, 0.3, -0.4, 0.5, -0.6, -5.7]
+    norm_open = units.from_armd(
+        rad_open, "so101_norm", limits=limits, gripper_joint=gripper_j, closed_rad=None, open_rad=None
+    )
+    assert abs(norm_open[6] - 100.0) < 1e-4
+
+    rec_open = units.to_armd(
+        norm_open, "so101_norm", limits=limits, gripper_joint=gripper_j, closed_rad=None, open_rad=None
+    )
+    for orig, rec in zip(rad_open, rec_open):
+        assert abs(orig - rec) < 1e-4
+
+    # Also test when limits is None, gripper_joint=6 fallback
+    norm_open_no_limits = units.from_armd(
+        rad_open, "so101_norm", limits=None, gripper_joint=gripper_j, closed_rad=None, open_rad=None
+    )
+    assert abs(norm_open_no_limits[6] - 100.0) < 1e-4
 
 
 def test_units_deg_roundtrip():
@@ -513,6 +546,126 @@ def test_leader_bridge_arms_idle_follower_before_ramp():
     assert mock_session.servo.call_count == 2
 
 
+def test_posix_serial_custom_baud_darwin(monkeypatch):
+    import struct
+    import termios
+    import tty
+
+    mock_fd = 42
+    monkeypatch.setattr("os.open", lambda *a, **k: mock_fd)
+    monkeypatch.setattr("os.close", lambda fd: None)
+    monkeypatch.setattr("termios.tcgetattr", lambda fd: [0, 0, 0, 0, 0, 0, [0] * 32])
+    monkeypatch.setattr("termios.tcsetattr", lambda fd, when, mode: None)
+    monkeypatch.delattr("termios.B1000000", raising=False)
+    monkeypatch.setattr("sys.platform", "darwin")
+
+    ioctl_calls = []
+
+    def fake_ioctl(fd, request, arg):
+        ioctl_calls.append((fd, request, bytes(arg) if isinstance(arg, (bytes, bytearray)) else arg))
+        return 0
+
+    monkeypatch.setattr("fcntl.ioctl", fake_ioctl)
+
+    # 1000000 baud is not a standard B1000000 in termios
+    transport = PosixSerialTransport("/dev/fake_port", baud=1000000)
+    assert transport.fd == mock_fd
+
+    # Verify IOSSIOSPEED (0x80085402) called with packed 8-byte baud
+    expected_buf = struct.pack("L", 1000000)
+    assert len(ioctl_calls) == 1
+    assert ioctl_calls[0][0] == mock_fd
+    assert ioctl_calls[0][1] == 0x80085402
+    assert ioctl_calls[0][2] == expected_buf
+
+    # Test error handling on darwin ioctl failure
+    def failing_ioctl(fd, request, arg):
+        raise OSError("ioctl failure")
+
+    monkeypatch.setattr("fcntl.ioctl", failing_ioctl)
+    with pytest.raises(LeaderError, match=r"failed to set custom baud 1000000 on macOS for /dev/fake_port"):
+        PosixSerialTransport("/dev/fake_port", baud=1000000)
+
+    # Test unsupported platform
+    monkeypatch.setattr("sys.platform", "win32")
+    with pytest.raises(LeaderError, match=r"custom baud 1000000 is unsupported on win32 without pyserial"):
+        PosixSerialTransport("/dev/fake_port", baud=1000000)
+
+    # Test linux failure raising LeaderError
+    monkeypatch.setattr("sys.platform", "linux")
+    monkeypatch.setattr("fcntl.ioctl", failing_ioctl)
+    with pytest.raises(LeaderError, match=r"failed to set custom baud 1000000 on Linux for /dev/fake_port"):
+        PosixSerialTransport("/dev/fake_port", baud=1000000)
+
+
+def test_leader_bridge_rejects_7dof_before_torque_or_servo():
+    bus = MagicMock()
+    mock_session = MagicMock()
+    mock_obs = MagicMock()
+    mock_obs.is_stopped = False
+    mock_obs.collision = None
+    mock_obs.positions = [0.0] * 7  # 7-DOF positions
+    mock_obs.is_torqued = False
+    mock_obs.is_operational = False
+    mock_session.wait_for_observation.return_value = mock_obs
+
+    schema = ObservationSchema.from_dict({
+        "dof": 7,
+        "arm_dof": 6,
+        "gripper_joint": 6,
+        "limits": [
+            {"name": f"j{i}", "min_position": -3.14, "max_position": 3.14, "max_velocity": 2.0, "max_acceleration": 5.0}
+            for i in range(7)
+        ],
+    })
+
+    bridge = LeaderTeleopBridge(bus, mock_session, schema)
+
+    with pytest.raises(LeaderError, match="expected 6 DOF for SO-ARM101"):
+        bridge.align_and_ramp()
+
+    # Crucial safety check: torque and servo MUST NOT have been called
+    mock_session.torque.assert_not_called()
+    mock_session.servo.assert_not_called()
+    bus.read_positions_sync.assert_not_called()
+
+
+def test_leader_teleop_main_rejects_7dof_before_session(monkeypatch, capsys):
+    from rebot_companion import leader_teleop
+
+    mock_transport = MagicMock()
+    monkeypatch.setattr(leader_teleop, "open_serial_transport", lambda *a, **k: mock_transport)
+
+    mock_schema = ObservationSchema.from_dict({
+        "dof": 7,
+        "arm_dof": 6,
+        "gripper_joint": 6,
+        "limits": [
+            {"name": f"j{i}", "min_position": -3.14, "max_position": 3.14, "max_velocity": 2.0, "max_acceleration": 5.0}
+            for i in range(7)
+        ],
+    })
+    mock_client = MagicMock()
+    mock_client.get_schema.return_value = mock_schema
+    monkeypatch.setattr(leader_teleop, "ArmdClient", lambda *a, **k: mock_client)
+
+    session_created = False
+
+    def fake_arm_session(*a, **k):
+        nonlocal session_created
+        session_created = True
+        return MagicMock()
+
+    monkeypatch.setattr(leader_teleop, "ArmSession", fake_arm_session)
+
+    rc = leader_teleop.main(["--leader-port", "/dev/null", "--arm-host", "127.0.0.1"])
+    assert rc == 1
+    assert not session_created
+    mock_transport.close.assert_called_once()
+    err = capsys.readouterr().err
+    assert "unsupported arm schema (dof=7, arm_dof=6)" in err
+
+
 def test_recorder_fetch_schema_normalizes_plain_host(tmp_path, monkeypatch):
     from rebot._http import host_url
 
@@ -555,6 +708,64 @@ def test_recorder_fetch_schema_normalizes_plain_host(tmp_path, monkeypatch):
         method == "GET" and url == "http://192.168.16.1:8765/api/v1/gripper/calibration"
         for method, url in recorded_requests
     )
+
+
+def test_lerobot_recorder_fetch_schema_7dof_fallback(monkeypatch, tmp_path):
+    mock_schema = ObservationSchema.from_dict({
+        "dof": 7,
+        "arm_dof": 6,
+        "gripper_joint": 6,
+        "joint_names": [f"j{i}" for i in range(7)],
+        "gripper_policy": None,
+        "limits": [
+            {"name": f"j{i}", "min_position": -3.14, "max_position": 3.14, "max_velocity": 2.0, "max_acceleration": 5.0}
+            for i in range(7)
+        ],
+    })
+
+    class FakeArmdClient:
+        def __init__(self, host_url):
+            pass
+
+        def get_schema(self):
+            return mock_schema
+
+    monkeypatch.setattr("rebot.client.ArmdClient", FakeArmdClient)
+    monkeypatch.setattr("rebot._http.request", lambda *a, **k: MagicMock(ok=False))
+
+    rec = LeRobotRecorder(tmp_path / "rec", "test/repo", armd_host="192.168.16.1", fps=10)
+    rec._fetch_schema()
+    assert rec.closed_rad == 0.0
+    assert rec.open_rad == -5.7
+
+    # Also test partial gripper_policy with closed_rad only
+    mock_schema_partial = ObservationSchema.from_dict({
+        "dof": 7,
+        "arm_dof": 6,
+        "gripper_joint": 6,
+        "gripper_policy": {"closed_rad": 0.12},
+        "limits": [
+            {"name": f"j{i}", "min_position": -3.14, "max_position": 3.14, "max_velocity": 2.0, "max_acceleration": 5.0}
+            for i in range(7)
+        ],
+    })
+    rec2 = LeRobotRecorder(tmp_path / "rec2", "test/repo2", armd_host="192.168.16.1", fps=10)
+    rec2._fetch_schema = lambda: None
+    rec2.schema = mock_schema_partial
+    rec2.arm_dof = 6
+    rec2.gripper_joint = 6
+    policy = mock_schema_partial.gripper_policy or {}
+    if "closed_rad" in policy:
+        rec2.closed_rad = float(policy["closed_rad"])
+    if "open_rad" in policy:
+        rec2.open_rad = float(policy["open_rad"])
+    if rec2.gripper_joint == 6:
+        if rec2.closed_rad is None:
+            rec2.closed_rad = 0.0
+        if rec2.open_rad is None:
+            rec2.open_rad = -5.7
+    assert rec2.closed_rad == 0.12
+    assert rec2.open_rad == -5.7
 
 
 def test_pretrained_info_resolves_so101_norm_for_lerobot_policy(tmp_path):

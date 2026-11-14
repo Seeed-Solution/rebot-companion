@@ -45,11 +45,16 @@ def _resolve_gripper_bounds(
     c = 0.0 if closed_rad is None else float(closed_rad)
     if open_rad is not None:
         return c, float(open_rad)
+    fallback = -5.7 if gripper_joint == 6 else 1.5
     if limits is not None and gripper_joint is not None and 0 <= gripper_joint < len(limits):
         lo, hi = _extract_limit(limits[gripper_joint])
-        o = hi if hi != lo else 1.5
+        o = hi if abs(hi - c) >= abs(lo - c) else lo
+        if o == c:
+            o = fallback
     else:
-        o = 1.5
+        o = fallback
+    if o == c:
+        o = 1.5 if c == -5.7 else -5.7
     return c, o
 
 
