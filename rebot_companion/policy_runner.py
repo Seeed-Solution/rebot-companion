@@ -951,6 +951,11 @@ class PolicyRunner:
                     f"--lerobot-calib requires a 6-DOF arm with gripper_joint=5 (got dof={self.dof}, "
                     f"gripper_joint={self.gripper_joint}, arm_dof={getattr(self.schema, 'arm_dof', None)})"
                 )
+            if self.schema is None or getattr(self.schema, "feetech_joints", None) is None:
+                log.warning(
+                    "PolicyRunner: --lerobot-calib used but follower feetech_joints schema is missing; "
+                    "assuming default direction and center ticks"
+                )
             l_limits, l_closed, l_open = units.load_lerobot_norm_bounds(self.lerobot_calib, schema=self.schema)
             self._lerobot_limits = l_limits
             self._lerobot_closed_rad = l_closed
@@ -1013,23 +1018,27 @@ class PolicyRunner:
             )
 
         if (
-            (self.action_units == "so101_norm" or self.state_units == "so101_norm")
+            any(m in ("so101_norm", "deg") for m in (self.action_units, self.state_units))
             and self.lerobot_calib is None
         ):
             norm_b = policy_info.get("normalization_bounds") if isinstance(policy_info, dict) else None
-            if isinstance(norm_b, dict) and "limits" in norm_b:
-                rec_lims = norm_b["limits"]
-                if not isinstance(rec_lims, (list, tuple)) or len(rec_lims) != self.dof:
-                    raise RunnerError(
-                        f"normalization_bounds limits length ({len(rec_lims) if isinstance(rec_lims, (list, tuple)) else 'invalid'}) "
-                        f"does not match arm DOF ({self.dof})"
-                    )
-                self._recorded_limits = [(float(lim[0]), float(lim[1])) for lim in rec_lims]
+            if isinstance(norm_b, dict) and ("limits" in norm_b or "closed_rad" in norm_b or "open_rad" in norm_b):
+                rec_lims = norm_b.get("limits")
+                if rec_lims is not None:
+                    if not isinstance(rec_lims, (list, tuple)) or len(rec_lims) != self.dof:
+                        raise RunnerError(
+                            f"normalization_bounds limits length ({len(rec_lims) if isinstance(rec_lims, (list, tuple)) else 'invalid'}) "
+                            f"does not match arm DOF ({self.dof})"
+                        )
+                    self._recorded_limits = [(float(lim[0]), float(lim[1])) for lim in rec_lims]
                 if norm_b.get("closed_rad") is not None:
                     self._recorded_closed_rad = float(norm_b["closed_rad"])
                 if norm_b.get("open_rad") is not None:
                     self._recorded_open_rad = float(norm_b["open_rad"])
-            elif not (isinstance(policy_info, dict) and policy_info.get("rebot_unit_mode")):
+            elif (
+                (self.action_units == "so101_norm" or self.state_units == "so101_norm")
+                and not (isinstance(policy_info, dict) and policy_info.get("rebot_unit_mode"))
+            ):
                 log.warning(
                     "so101_norm is active without --lerobot-calib and without 'rebot_unit_mode' in metadata; "
                     "normalizing using armd schema joint limits (rebot-record convention). "

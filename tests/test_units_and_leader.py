@@ -1039,9 +1039,12 @@ def test_leader_calibration_validation_and_parsing():
     with pytest.raises(LeaderError, match="'sign' must be 1 or -1"):
         LeaderCalibration.load({"joints": [{"center": 2048, "sign": 0}] + [{"center": 2048}] * 4})
 
-    # homing_offset without center tick must be rejected
-    with pytest.raises(LeaderError, match="raw EEPROM 'homing_offset' without 'center'"):
-        LeaderCalibration.load({"joints": [{"homing_offset": 500}] + [{"center": 2048}] * 4})
+    # invalid non-numeric homing_offset must be rejected
+    with pytest.raises(LeaderError, match="invalid 'homing_offset'"):
+        LeaderCalibration.load({"joints": [{"homing_offset": "bad"}] + [{"center": 2048}] * 4})
+    # valid homing_offset without center defaults center to 2048
+    calib_ho = LeaderCalibration.load({"joints": [{"homing_offset": 500}] + [{"center": 2048}] * 4})
+    assert calib_ho.joints[0].center == 2048
 
     # joints list length != 5 must be rejected
     with pytest.raises(LeaderError, match="'joints' list must contain exactly 5"):
@@ -2222,9 +2225,9 @@ def test_leader_teleop_calibration_validation_and_aliases(tmp_path: Path):
     assert calib.joints[2].sign == -1  # drive_mode 1 -> sign -1
     assert calib.joints[4].sign == 1
 
-    # 3. homing_offset without center raises LeaderError
-    with pytest.raises(LeaderError, match="raw EEPROM 'homing_offset' without 'center'"):
-        LeaderCalibration.load({"shoulder_pan": {"homing_offset": 50}})
+    # 3. homing_offset without center defaults center to 2048
+    calib_ho = LeaderCalibration.load({"shoulder_pan": {"homing_offset": 50}})
+    assert calib_ho.joints[0].center == 2048
 
 
 def test_leader_teleop_gripper_gap_exclusion_and_ramp_extension():
@@ -2548,9 +2551,9 @@ def test_leader_teleop_calibration_hardening(tmp_path: Path):
     with pytest.raises(LeaderError, match="gripper closed_tick .* must be in 0..4095 and closed_tick != open_tick"):
         LeaderCalibration.load({"joint_1": {"center": 2048}, "gripper": {"closed_tick": 2048, "open_tick": 2048}})
 
-    # 3. homing_offset without center has improved error message
-    with pytest.raises(LeaderError, match="specify 'center' \\(typically 2048 when homing_offset is written in servo EEPROM\\)"):
-        LeaderCalibration.load({"joint_1": {"homing_offset": 50}})
+    # 3. invalid non-numeric homing_offset without center raises LeaderError
+    with pytest.raises(LeaderError, match="invalid 'homing_offset'"):
+        LeaderCalibration.load({"joint_1": {"homing_offset": "bad_tick"}})
 
     # 4. fps bounds in LeaderTeleopBridge: SERVO_MIN_RATE_HZ <= fps <= 100
     bus = MagicMock()
@@ -2737,5 +2740,384 @@ def test_normalized_recording_replay_regression_with_changed_arm_limits(tmp_path
     bad_runner = PolicyRunner(mock_client, bad_policy, camera=None, action_units="so101_norm", state_units="so101_norm", fps=10)
     with pytest.raises(RunnerError, match="normalization_bounds limits length .* does not match arm DOF"):
         bad_runner._read_arm()
+
+
+def test_leader_teleop_steady_state_lead_clamping_and_empty_commanded(caplog):
+    """When leader moves fast, every servo frame is clamped to ref ± arm_lead (< 0.30) and empty commanded_positions is handled."""
+    from unittest.mock import patch
+    import logging
+
+    bus = MagicMock()
+    # Leader is far at 1.5 rad on all joints
+    bus.read_positions_sync.return_value = {1: 3025, 2: 3025, 3: 3025, 4: 3025, 5: 3025, 6: 2048}
+    mock_session = MagicMock()
+    mock_obs = MagicMock()
+    mock_obs.positions = [0.0] * 6
+    # commanded_positions is empty list [] (falsy!)
+    mock_obs.commanded_positions = []
+    mock_obs.safety_state = "Armed"
+    mock_obs.is_stopped = False
+    mock_obs.is_torqued = True
+    mock_obs.is_operational = True
+    mock_obs.collision = None
+    mock_session.latest_observation.return_value = mock_obs
+
+    schema = ObservationSchema.from_dict({
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "servo_max_lead_rad": 0.15,
+        "limits": [
+            {"name": f"j{i}", "min_position": -3.14, "max_position": 3.14, "max_velocity": 2.0, "max_acceleration": 5.0}
+            for i in range(6)
+        ],
+    })
+
+    sent_frames = []
+    def mock_servo(target):
+        sent_frames.append(list(target))
+        # advance positions slightly
+        mock_obs.positions = [min(p + 0.05, 1.5) for p in mock_obs.positions]
+
+    mock_session.servo.side_effect = mock_servo
+
+    bridge = LeaderTeleopBridge(bus, mock_session, schema, fps=50)
+    assert bridge.arm_lead == 0.15
+
+    # Bypass align_and_ramp to test steady-state run() loop directly
+    bridge.align_and_ramp = MagicMock()
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        # Run 5 steps then stop
+        def fake_sleep(dur):
+            if len(sent_frames) >= 5:
+                bridge.stop()
+
+        with patch("time.sleep", side_effect=fake_sleep):
+            bridge.run()
+
+    assert len(sent_frames) >= 5
+    # For every frame, arm joints 0..4 stay clamped within obs ± 0.15 rad
+    for f in sent_frames:
+        for j in range(5):
+            assert f[j] <= 0.15 + 0.05 * len(sent_frames) + 1e-4
+            # Every frame was clamped well below leader's 1.5 rad target
+            assert f[j] < 0.50
+    # Clamping saturation warning logged
+    assert any("lead clamping active" in record.message for record in caplog.records)
+
+
+def test_leader_teleop_direction_derivation_conflict_and_hardware_defaulted():
+    """Test direction derivation from feetech_joints, conflict rejection, and hardware defaulted check."""
+    bus = MagicMock()
+    schema_base = {
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "limits": [
+            {"name": f"j{i}", "min_position": -3.14, "max_position": 3.14, "max_velocity": 2.0, "max_acceleration": 5.0}
+            for i in range(6)
+        ],
+    }
+
+    # 1. Real hardware rejecting defaulted calib
+    mock_session_hw = MagicMock()
+    mock_client = MagicMock()
+    mock_client.get_safety_describe.return_value = {"device": {"follower": "so-arm101"}}
+    mock_session_hw.client = mock_client
+    sch_hw = ObservationSchema.from_dict(schema_base)
+    calib_defaulted = LeaderCalibration(has_defaulted_joints=True)
+
+    with pytest.raises(LeaderError, match="cannot use defaulted/uncalibrated joint settings on non-mock/sim follower 'so-arm101'"):
+        LeaderTeleopBridge(bus, mock_session_hw, sch_hw, calib=calib_defaulted)
+
+    # 2. feetech_joints drive_mode_invert auto-derivation on unexplicit sign and center from zero_step when not explicit
+    calib_unexplicit = LeaderCalibration.load({
+        "joint_1": {},  # neither sign nor center explicitly given
+        "joint_2": {"center": 2048},
+        "joint_3": {"center": 2048},
+        "joint_4": {"center": 2048},
+        "joint_5": {"center": 2048},
+    })
+    sch_dict = dict(schema_base)
+    sch_dict["feetech_joints"] = [
+        {"drive_mode_invert": True, "zero_step": 1850},
+        {"drive_mode_invert": False, "zero_step": 2048},
+        {"drive_mode_invert": False, "zero_step": 2048},
+        {"drive_mode_invert": False, "zero_step": 2048},
+        {"drive_mode_invert": False, "zero_step": 2048},
+    ]
+    sch_inv = ObservationSchema.from_dict(sch_dict)
+    mock_session_mock = MagicMock()
+    mock_session_mock.client.get_safety_describe.return_value = {"device": {"follower": "mock"}}
+
+    bridge = LeaderTeleopBridge(bus, mock_session_mock, sch_inv, calib=calib_unexplicit)
+    # Bridge auto-derived sign=-1 and center=1850 for joint 1
+    assert bridge.calib.joints[0].sign == -1
+    assert bridge.calib.joints[0].center == 1850
+    # Original caller calib must remain unmutated!
+    assert calib_unexplicit.joints[0].sign == 1
+    assert calib_unexplicit.joints[0].center == 2048
+
+    # 3. Explicit sign conflict rejection
+    calib_explicit = LeaderCalibration.load({
+        "joint_1": {"center": 2048, "sign": 1},  # explicit sign=1
+        "joint_2": {"center": 2048},
+        "joint_3": {"center": 2048},
+        "joint_4": {"center": 2048},
+        "joint_5": {"center": 2048},
+    })
+    with pytest.raises(LeaderError, match=r"joint_1 direction mismatch: leader calibration specifies explicit sign=1"):
+        LeaderTeleopBridge(bus, mock_session_mock, sch_inv, calib=calib_explicit)
+
+
+def test_leader_teleop_moving_leader_ramp_slew_limit():
+    """Moving leader during quintic ramp remains velocity-bounded per step."""
+    from unittest.mock import patch
+
+    bus = MagicMock()
+    # Leader jumps rapidly during ramp
+    leader_pos = [0.0] * 6
+    def read_sync(sids):
+        # Leader steps outward rapidly: 0.1 rad per step
+        for i in range(5):
+            leader_pos[i] = min(leader_pos[i] + 0.1, 1.5)
+        # convert to ticks: 2048 + pos * 4096 / (2*pi)
+        return {sid: int(2048 + leader_pos[i] * 4096 / (2 * math.pi)) for i, sid in enumerate(sids)}
+
+    bus.read_positions_sync.side_effect = read_sync
+
+    mock_session = MagicMock()
+    mock_obs = MagicMock()
+    mock_obs.positions = [0.0] * 6
+    mock_obs.commanded_positions = [0.0] * 6
+    mock_obs.safety_state = "Armed"
+    mock_obs.is_stopped = False
+    mock_obs.is_torqued = True
+    mock_obs.is_operational = True
+    mock_obs.collision = None
+    mock_session.wait_for_observation.return_value = mock_obs
+    mock_session.latest_observation.return_value = mock_obs
+
+    schema = ObservationSchema.from_dict({
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "limits": [
+            {"name": f"j{i}", "min_position": -3.14, "max_position": 3.14, "max_velocity": 0.5, "max_acceleration": 5.0}
+            for i in range(6)
+        ],
+    })
+
+    sent_frames = []
+    mock_session.servo.side_effect = lambda cmd: sent_frames.append(list(cmd))
+
+    bridge = LeaderTeleopBridge(bus, mock_session, schema, fps=50, ramp_seconds=0.2)
+    with patch("time.sleep", return_value=None):
+        bridge.align_and_ramp()
+
+    assert len(sent_frames) > 0
+    # Every step delta must be bounded by v_cap * 3.0 * period + eps
+    dt_max = 3.0 / 50.0
+    for i in range(1, len(sent_frames)):
+        for j in range(5):
+            delta = abs(sent_frames[i][j] - sent_frames[i - 1][j])
+            assert delta <= 0.6 * dt_max + 1e-3, f"Step {i} joint {j} jumped {delta:.4f}"
+
+
+def test_leader_teleop_settle_phase_stop_before_servo():
+    """Calling bridge.stop() inside settle-phase read_positions_sync issues zero subsequent servo frames."""
+    from unittest.mock import patch
+
+    bus = MagicMock()
+    mock_session = MagicMock()
+    mock_obs = MagicMock()
+    mock_obs.positions = [0.0] * 6
+    mock_obs.commanded_positions = [0.0] * 6
+    mock_obs.safety_state = "Armed"
+    mock_obs.is_stopped = False
+    mock_obs.is_torqued = True
+    mock_obs.is_operational = True
+    mock_obs.collision = None
+    mock_session.wait_for_observation.return_value = mock_obs
+    mock_session.latest_observation.return_value = mock_obs
+
+    # Leader at 0.5 rad (arm_gap = 0.5 rad > 0.08 rad -> triggers settle phase)
+    bus.read_positions_sync.return_value = {sid: int(2048 + 0.5 * 4096 / (2 * math.pi)) for sid in range(1, 7)}
+
+    schema = ObservationSchema.from_dict({
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "limits": [
+            {"name": f"j{i}", "min_position": -3.14, "max_position": 3.14, "max_velocity": 2.0, "max_acceleration": 5.0}
+            for i in range(6)
+        ],
+    })
+
+    bridge = LeaderTeleopBridge(bus, mock_session, schema, fps=50, ramp_seconds=0.2)
+    servo_calls = []
+    mock_session.servo.side_effect = lambda cmd: servo_calls.append(list(cmd))
+
+    # Count ramp servo frames
+    with patch("time.sleep", return_value=None):
+        settle_ticks = {sid: int(2048 + 0.5 * 4096 / (2 * math.pi)) for sid in range(1, 7)}
+        ramp_frames = []
+
+        def read_and_track(sids):
+            # When settle phase reads leader position, stop the bridge
+            if len(ramp_frames) >= 10:  # ramp has completed 10 frames
+                bridge.stop()
+            return settle_ticks
+
+        bus.read_positions_sync.side_effect = read_and_track
+        mock_session.servo.side_effect = lambda cmd: ramp_frames.append(list(cmd))
+
+        bridge.align_and_ramp()
+
+    # The settle loop should have broken immediately after bridge.stop() before sending any settle servo frame
+    assert bridge._stop is True
+    # Exactly the 10 ramp frames were sent; zero settle frames were sent!
+    assert len(ramp_frames) == 10
+
+
+def test_sts3215_bit15_sign_magnitude_decode_and_range_validation():
+    """STS3215 Present_Position bit-15 sign-magnitude decode (0x8032 -> -50) and >4095 rejection."""
+    # 1. Packet decoding in FeetechSerialBus
+    transport = MockLeaderTransport()
+    bus = FeetechSerialBus(transport)
+    # Construct response for sid=1 with 0x8032 (bytes 0x32, 0x80):
+    # packet: 0xFF 0xFF 0x01 0x04 0x00 0x32 0x80 checksum
+    body = [1, 4, 0x00, 0x32, 0x80]
+    chk = compute_checksum(body)
+    transport.to_read = bytearray([0xFF, 0xFF] + body + [chk])
+    positions = bus.read_positions_sequential([1], max_retries=0)
+    assert positions[1] == -50
+
+    # Sync read packet decode
+    transport.to_read = bytearray([0xFF, 0xFF] + body + [chk])
+    sync_pos = bus.read_positions_sync([1])
+    assert sync_pos[1] == -50
+
+    # 2. ticks_to_rad with -50 ticks produces smooth negative radians
+    calib = LeaderCalibration()
+    rads = calib.ticks_to_rad({1: -50, 2: 2048, 3: 2048, 4: 2048, 5: 2048, 6: 2048})
+    expected_rad = 1 * (-50 - 2048) * (2.0 * math.pi / 4096.0)
+    assert rads[0] == pytest.approx(expected_rad)
+
+    # 3. Corrupted magnitude > 4095 raises LeaderError
+    with pytest.raises(LeaderError, match=r"joint 1 \(servo 1\) position tick out of range \[-4095, 4095\]: got 5000"):
+        calib.ticks_to_rad({1: 5000, 2: 2048, 3: 2048, 4: 2048, 5: 2048, 6: 2048})
+    with pytest.raises(LeaderError, match=r"joint 1 \(servo 1\) position tick out of range \[-4095, 4095\]: got -5000"):
+        calib.ticks_to_rad({1: -5000, 2: 2048, 3: 2048, 4: 2048, 5: 2048, 6: 2048})
+    with pytest.raises(LeaderError, match=r"gripper \(servo 6\) position tick out of range \[-4095, 4095\]: got 4500"):
+        calib.ticks_to_rad({1: 2048, 2: 2048, 3: 2048, 4: 2048, 5: 2048, 6: 4500})
+
+
+def test_real_lerobot_calib_without_center_and_missing_feetech_warning(tmp_path: Path, caplog):
+    """Real LeRobot calibration JSON with homing_offset without center loads center=2048 and logs info; missing feetech_joints warns."""
+    import logging
+
+    real_lerobot_data = {
+        "shoulder_pan": {"id": 1, "drive_mode": 0, "homing_offset": 55, "range_min": 1000, "range_max": 3000},
+        "shoulder_lift": {"id": 2, "drive_mode": 1, "homing_offset": -20, "range_min": 1100, "range_max": 2900},
+        "elbow_flex": {"id": 3, "drive_mode": 0, "homing_offset": 0, "range_min": 1200, "range_max": 2800},
+        "wrist_flex": {"id": 4, "drive_mode": 1, "homing_offset": 10, "range_min": 1300, "range_max": 2700},
+        "wrist_roll": {"id": 5, "drive_mode": 0, "homing_offset": 0, "range_min": 1400, "range_max": 2600},
+        "gripper": {"id": 6, "drive_mode": 0, "homing_offset": 0, "range_min": 1500, "range_max": 2500},
+    }
+    calib_file = tmp_path / "lerobot_calib.json"
+    calib_file.write_text(json.dumps(real_lerobot_data), encoding="utf-8")
+
+    # 1. LeaderCalibration.load loads without center, sets center=2048
+    calib = LeaderCalibration.load(calib_file)
+    assert len(calib.joints) == 5
+    for j in calib.joints:
+        assert j.center == 2048
+    assert calib.joints[0].sign == 1
+    assert calib.joints[1].sign == -1  # drive_mode=1 -> sign=-1
+
+    # 2. load_lerobot_norm_bounds with schema=None logs warning
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        lims, closed, op = units.load_lerobot_norm_bounds(calib_file, schema=None)
+    assert len(lims) == 6
+    assert closed is not None and op is not None
+    assert any("load_lerobot_norm_bounds called without follower feetech_joints schema" in r.message for r in caplog.records)
+
+
+def test_deg_mode_loads_normalization_bounds_with_changed_gripper_bounds(tmp_path: Path):
+    """When action_units or state_units is deg, persisted normalization_bounds are loaded, keeping live schema as safety limit."""
+    from unittest.mock import patch
+    from rebot_companion.policy_runner import PolicyRunner
+
+    meta_dir = tmp_path / "meta"
+    meta_dir.mkdir(parents=True, exist_ok=True)
+    info_data = {
+        "unit_mode": "deg",
+        "normalization_bounds": {
+            "limits": [[-3.14, 3.14]] * 6,
+            "closed_rad": 0.10,
+            "open_rad": 1.20,  # trained with open_rad = 1.20
+        },
+    }
+    (meta_dir / "info.json").write_text(json.dumps(info_data), encoding="utf-8")
+
+    # Live arm schema has different open_rad (e.g. 1.60)
+    mock_client = MagicMock()
+    mock_client.request.return_value.json.return_value = {
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "joint_names": [f"j{i}" for i in range(6)],
+        "gripper_policy": {"closed_rad": 0.0, "open_rad": 1.60},
+        "limits": [
+            {"name": f"j{i}", "min_position": -3.14, "max_position": 3.14, "max_velocity": 2.0, "max_acceleration": 5.0}
+            for i in range(6)
+        ],
+        "profile_id": "so-arm101",
+    }
+    mock_client.request.return_value.raise_for_status = lambda: None
+    mock_client.get_safety_describe.return_value = {"device": {"follower": "mock"}}
+
+    policy = MagicMock()
+    policy.info = info_data
+    policy.action_dim = 6
+    policy.inputs = ("observation.state",)
+    policy.image_key = None
+
+    runner = PolicyRunner(
+        mock_client,
+        policy,
+        camera=None,
+        action_units="deg",
+        state_units="deg",
+        fps=10,
+    )
+    runner._read_arm()
+
+    # Verify normalization_bounds were loaded for deg mode
+    assert runner._recorded_closed_rad == 0.10
+    assert runner._recorded_open_rad == 1.20
+    # Live schema open_rad is 1.60
+    assert runner.open_rad == 1.60
+
+    # Observation gripper normalization uses recorded open_rad (1.20)
+    # When physical gripper is at 1.20 rad (open_rad in recorded bounds), normalized openness in deg mode is 100.0%
+    obs = ArmStatus(
+        timestamp=1.0,
+        positions=[0.0, 0.0, 0.0, 0.0, 0.0, 1.20],
+        velocities=[0.0] * 6,
+        torques=[0.0] * 6,
+        temperatures=[25.0] * 6,
+        is_torqued=True,
+        safety_state="Armed",
+        epoch_id=1,
+    )
+    obs_dict = runner._observation(obs)
+    # gripper in deg mode maps [closed_rad, open_rad] -> [0, 100]
+    assert obs_dict["observation.state"][5] == pytest.approx(100.0, abs=1e-3)
+
 
 

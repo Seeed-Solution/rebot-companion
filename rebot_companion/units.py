@@ -18,10 +18,13 @@ Supported modes:
 from __future__ import annotations
 
 import json
+import logging
 import math
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
+
+log = logging.getLogger("rebot_companion.units")
 
 SUPPORTED_UNIT_MODES = ("rad", "so101_norm", "deg")
 
@@ -299,6 +302,12 @@ def load_lerobot_norm_bounds(
     )
     if feetech_joints is None and isinstance(schema, dict):
         feetech_joints = schema.get("feetech_joints")
+
+    if schema is None or feetech_joints is None:
+        log.warning(
+            "load_lerobot_norm_bounds called without follower feetech_joints schema; "
+            "assuming default sign=+1 and zero_step=2048 for joints lacking hardware calibration"
+        )
 
     limits: list[tuple[float, float]] = []
     for i, name in enumerate(joint_names):

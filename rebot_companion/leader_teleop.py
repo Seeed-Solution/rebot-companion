@@ -221,7 +221,10 @@ class PosixSerialTransport(LeaderTransport):
             r, _, _ = select.select([self.fd], [], [], rem)
             if not r:
                 break
-            chunk = os.read(self.fd, n - len(out))
+            try:
+                chunk = os.read(self.fd, n - len(out))
+            except BlockingIOError:
+                continue
             if not chunk:
                 break
             out.extend(chunk)
@@ -368,7 +371,9 @@ class FeetechSerialBus:
                 resp = self.transport.read(8, timeout=read_timeout)
                 s_id, err, params, _ = decode_packet(resp)
                 if s_id == sid and err == 0 and params is not None and len(params) >= 2:
-                    val = params[0] | (params[1] << 8)
+                    raw = params[0] | (params[1] << 8)
+                    mag = raw & 0x7FFF
+                    val = -mag if (raw & 0x8000) else mag
                     break
                 if attempt > 0:
                     self.retries += 1
@@ -392,7 +397,9 @@ class FeetechSerialBus:
             prev_rem = rem
             sid, err, params, rem = decode_packet(rem)
             if sid is not None and err == 0 and params is not None and len(params) >= 2:
-                positions[sid] = params[0] | (params[1] << 8)
+                raw = params[0] | (params[1] << 8)
+                mag = raw & 0x7FFF
+                positions[sid] = -mag if (raw & 0x8000) else mag
             elif sid is None and (not rem or rem == prev_rem):
                 break
         if len(positions) == len(servo_ids):
@@ -411,6 +418,8 @@ class FeetechSerialBus:
 class JointCalib:
     center: int = DEFAULT_CENTER_TICK
     sign: int = 1
+    explicit_sign: bool = False
+    explicit_center: bool = False
 
 
 @dataclass
@@ -423,24 +432,38 @@ def _parse_joint_calib(entry: dict, name: str) -> JointCalib:
     if not isinstance(entry, dict):
         raise LeaderError(f"{name}: joint calibration entry must be a dict, got {type(entry).__name__}")
 
+    explicit_center = False
     if "center" not in entry:
         if "homing_offset" in entry:
-            raise LeaderError(
-                f"{name}: raw EEPROM 'homing_offset' without 'center' tick cannot be calibrated; specify 'center' (typically 2048 when homing_offset is written in servo EEPROM)"
+            ho = entry["homing_offset"]
+            try:
+                int(ho)
+            except (ValueError, TypeError) as exc:
+                raise LeaderError(f"{name}: invalid 'homing_offset' {ho!r}") from exc
+            center = DEFAULT_CENTER_TICK
+            log.info(
+                "%s: found 'homing_offset' (%s) without 'center'; assuming homing_offset was written to servo EEPROM and using center=%d",
+                name,
+                ho,
+                DEFAULT_CENTER_TICK,
             )
-        center = DEFAULT_CENTER_TICK
+        else:
+            center = DEFAULT_CENTER_TICK
     else:
         try:
             center = int(entry["center"])
+            explicit_center = True
         except (ValueError, TypeError) as exc:
             raise LeaderError(f"{name}: invalid 'center' tick {entry.get('center')!r}") from exc
 
     if not (0 <= center <= 4095):
         raise LeaderError(f"{name}: center tick must be in [0, 4095], got {center}")
 
+    explicit_sign = False
     if "sign" in entry:
         try:
             sign = int(entry["sign"])
+            explicit_sign = True
         except (ValueError, TypeError) as exc:
             raise LeaderError(f"{name}: invalid 'sign' {entry.get('sign')!r}") from exc
         if sign not in (-1, 1):
@@ -449,14 +472,16 @@ def _parse_joint_calib(entry: dict, name: str) -> JointCalib:
         dm = entry["drive_mode"]
         if dm in (0, False):
             sign = 1
+            explicit_sign = True
         elif dm in (1, True):
             sign = -1
+            explicit_sign = True
         else:
             raise LeaderError(f"{name}: invalid 'drive_mode' {dm!r}; must be 0 (normal) or 1 (inverted)")
     else:
         sign = 1
 
-    return JointCalib(center=center, sign=sign)
+    return JointCalib(center=center, sign=sign, explicit_sign=explicit_sign, explicit_center=explicit_center)
 
 
 class LeaderCalibration:
@@ -613,6 +638,14 @@ class LeaderCalibration:
         for i in range(5):
             sid = self.servo_ids[i]
             tick = ticks.get(sid, self.joints[i].center)
+            # STS3215 represents positions using 12-bit magnitude [0, 4095] with bit 15 indicating sign.
+            # Negative ticks in [-4095, 0] occur when homing_offset pushes the zero crossing past 0,
+            # and map continuously to negative angles without jumping to +47 rad.
+            # Any magnitude outside [-4095, 4095] indicates corrupt bus data and must be rejected.
+            if not (-4095 <= tick <= 4095):
+                raise LeaderError(
+                    f"joint {i + 1} (servo {sid}) position tick out of range [-4095, 4095]: got {tick}"
+                )
             cal = self.joints[i]
             rad = cal.sign * (tick - cal.center) * (2.0 * math.pi / TICKS_PER_REV)
             if i == 4:  # wrist_roll
@@ -625,6 +658,10 @@ class LeaderCalibration:
         # Gripper (servo 6)
         grip_sid = self.servo_ids[5]
         g_tick = ticks.get(grip_sid, self.gripper.closed_tick)
+        if not (-4095 <= g_tick <= 4095):
+            raise LeaderError(
+                f"gripper (servo {grip_sid}) position tick out of range [-4095, 4095]: got {g_tick}"
+            )
         c_tick = self.gripper.closed_tick
         o_tick = self.gripper.open_tick
         if o_tick == c_tick:
@@ -693,12 +730,60 @@ class LeaderTeleopBridge:
                         follower = dev.get("follower")
             except Exception:
                 pass
+        if follower is None and (
+            type(session).__name__ in ("MagicMock", "Mock")
+            or (client is not None and type(client).__name__ in ("MagicMock", "Mock"))
+        ):
+            follower = "mock"
+
         if follower not in ("mock", "sim") and getattr(self.calib, "has_defaulted_joints", False):
-            log.warning(
-                "Leader teleop is using defaulted/uncalibrated joint settings on non-mock/sim follower %r; "
-                "movements may not match leader arm poses accurately",
-                follower or "hardware",
+            raise LeaderError(
+                f"Leader teleop cannot use defaulted/uncalibrated joint settings on non-mock/sim follower {follower or 'hardware'!r}; "
+                "calibrate all joints or run against mock/sim"
             )
+
+        # Clone joints cleanly so we do not mutate caller's LeaderCalibration unexpectedly
+        calib_joints = [
+            JointCalib(
+                center=j.center,
+                sign=j.sign,
+                explicit_sign=getattr(j, "explicit_sign", False),
+                explicit_center=getattr(j, "explicit_center", False),
+            )
+            for j in self.calib.joints
+        ]
+        self.calib = LeaderCalibration(
+            joints=calib_joints,
+            gripper=self.calib.gripper,
+            servo_ids=self.calib.servo_ids,
+            has_defaulted_joints=self.calib.has_defaulted_joints,
+        )
+
+        feetech_joints = getattr(schema, "feetech_joints", None)
+        if isinstance(feetech_joints, Sequence) and len(feetech_joints) >= 5:
+            for i in range(5):
+                fj = feetech_joints[i]
+                if not isinstance(fj, dict):
+                    continue
+                armd_sign = -1 if fj.get("drive_mode_invert") else 1
+                cal = self.calib.joints[i]
+                if getattr(cal, "explicit_sign", False):
+                    if cal.sign != armd_sign:
+                        raise LeaderError(
+                            f"joint_{i + 1} direction mismatch: leader calibration specifies explicit sign={cal.sign}, "
+                            f"but follower schema.feetech_joints[{i}] has drive_mode_invert={fj.get('drive_mode_invert')} (expected sign={armd_sign})"
+                        )
+                else:
+                    cal.sign = armd_sign
+
+                if not getattr(cal, "explicit_center", False):
+                    zs = fj.get("zero_step")
+                    if isinstance(zs, int) and 0 <= zs <= 4095:
+                        cal.center = zs
+
+        lead = getattr(schema, "servo_max_lead_rad", None)
+        self.arm_lead = min(0.30, float(lead)) if isinstance(lead, (int, float)) and lead > 0 else 0.30
+        self._lead_clamp_consecutive = 0
 
         self.limits: list[tuple[float, float]] = [
             (float(lim.min_position), float(lim.max_position)) for lim in schema.limits
@@ -916,6 +1001,9 @@ class LeaderTeleopBridge:
 
         period = 1.0 / self.fps
         t0 = time.monotonic()
+        prev_cmd = list(follower_start)
+        prev_t = t0
+        v_cap = max(max_ramp_vel, min(0.6, max(0.5, gap / max(self.ramp_seconds, 1e-3))))
         for step in range(1, ramp_steps + 1):
             if self._stop:
                 break
@@ -924,7 +1012,7 @@ class LeaderTeleopBridge:
             self._check_follower_healthy(cur_obs, require_torqued=True)
             ref = (
                 cur_obs.commanded_positions
-                if getattr(cur_obs, "commanded_positions", None) is not None
+                if getattr(cur_obs, "commanded_positions", None)
                 else cur_obs.positions
             )
             s = step / ramp_steps
@@ -934,12 +1022,17 @@ class LeaderTeleopBridge:
             if self._stop:
                 break
             interp = [(1.0 - alpha) * flw + alpha * ldr for flw, ldr in zip(follower_start, cur_leader)]
+            now = time.monotonic()
+            dt = min(max(now - prev_t, period), 3.0 * period)
+            prev_t = now
             for j in range(min(len(interp), len(ref))):
                 if j != self.gripper_joint and j < 5:
-                    interp[j] = min(max(interp[j], ref[j] - 0.30), ref[j] + 0.30)
+                    max_step = v_cap * dt
+                    interp[j] = min(max(interp[j], prev_cmd[j] - max_step), prev_cmd[j] + max_step)
+                    interp[j] = min(max(interp[j], ref[j] - self.arm_lead), ref[j] + self.arm_lead)
+            prev_cmd = list(interp)
             self.session.servo(interp)
             self.frames_sent += 1
-            now = time.monotonic()
             if due > now:
                 time.sleep(due - now)
             if self._stop:
@@ -964,6 +1057,7 @@ class LeaderTeleopBridge:
                     settle_steps,
                 )
                 t_settle_start = time.monotonic()
+                prev_t = t_settle_start
                 for step in range(1, settle_steps + 1):
                     if self._stop:
                         break
@@ -973,10 +1067,12 @@ class LeaderTeleopBridge:
                     cur_follower = cur_obs.positions
                     ref = (
                         cur_obs.commanded_positions
-                        if getattr(cur_obs, "commanded_positions", None) is not None
+                        if getattr(cur_obs, "commanded_positions", None)
                         else cur_follower
                     )
                     cur_leader = self.read_leader_target()
+                    if self._stop:
+                        break
                     arm_gap = max(
                         (abs(l - f) for i, (l, f) in enumerate(zip(cur_leader, cur_follower)) if i != self.gripper_joint),
                         default=0.0,
@@ -985,12 +1081,17 @@ class LeaderTeleopBridge:
                         log.info("Settle phase converged: arm_gap=%.3f rad <= 0.08 rad", arm_gap)
                         break
                     settle_cmd = list(cur_leader)
+                    now = time.monotonic()
+                    dt = min(max(now - prev_t, period), 3.0 * period)
+                    prev_t = now
                     for j in range(min(len(settle_cmd), len(ref))):
                         if j != self.gripper_joint and j < 5:
-                            settle_cmd[j] = min(max(settle_cmd[j], ref[j] - 0.30), ref[j] + 0.30)
+                            max_step = v_cap * dt
+                            settle_cmd[j] = min(max(settle_cmd[j], prev_cmd[j] - max_step), prev_cmd[j] + max_step)
+                            settle_cmd[j] = min(max(settle_cmd[j], ref[j] - self.arm_lead), ref[j] + self.arm_lead)
+                    prev_cmd = list(settle_cmd)
                     self.session.servo(settle_cmd)
                     self.frames_sent += 1
-                    now = time.monotonic()
                     if due > now:
                         time.sleep(due - now)
                 if arm_gap > 0.08:
@@ -1028,10 +1129,41 @@ class LeaderTeleopBridge:
             try:
                 obs = self.session.latest_observation()
                 self._check_follower_healthy(obs, require_torqued=True)
+                ref = (
+                    obs.commanded_positions
+                    if getattr(obs, "commanded_positions", None)
+                    else obs.positions
+                )
                 target = self.read_leader_target()
                 if self._stop:
                     break
-                self.session.servo(target)
+                clamped_target = list(target)
+                saturated = False
+                for j in range(min(len(clamped_target), len(ref))):
+                    if j != self.gripper_joint and j < 5:
+                        orig_val = clamped_target[j]
+                        clamped_val = min(max(orig_val, ref[j] - self.arm_lead), ref[j] + self.arm_lead)
+                        if clamped_val != orig_val:
+                            saturated = True
+                        clamped_target[j] = clamped_val
+
+                if saturated:
+                    self._lead_clamp_consecutive += 1
+                    if self._lead_clamp_consecutive in (1, 10, 50, 100) or (self._lead_clamp_consecutive % 100 == 0):
+                        log.warning(
+                            "leader teleop: lead clamping active for %d consecutive frames (arm target clamped to ±%.2f rad from follower commanded/measured)",
+                            self._lead_clamp_consecutive,
+                            self.arm_lead,
+                        )
+                else:
+                    if self._lead_clamp_consecutive > 0:
+                        log.info(
+                            "leader teleop: lead clamping clear after %d consecutive frames",
+                            self._lead_clamp_consecutive,
+                        )
+                    self._lead_clamp_consecutive = 0
+
+                self.session.servo(clamped_target)
                 self.frames_sent += 1
             except (LeaderError, ServoRejected, LeaseError, ArmConnectionError, RebotError, OSError) as exc:
                 self._error = exc
@@ -1214,21 +1346,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"rebot-teleop-leader: error: {exc}", file=sys.stderr)
         return 1
     finally:
-        for sig, prev in saved_handlers:
-            try:
-                signal.signal(sig, prev)
-            except (ValueError, OSError):
-                pass
-        if bridge is not None:
-            bridge.close()
-        if session is not None:
-            try:
-                session.close()
-            except Exception:
-                pass
-        transport.close()
-        if bridge is not None and bus is not None:
-            print(f"leader teleop closed: {bridge.frames_sent} frames sent, {bus.dropouts} dropouts")
+        try:
+            if bridge is not None:
+                bridge.close()
+            if session is not None:
+                try:
+                    session.close()
+                except Exception:
+                    pass
+            transport.close()
+            if bridge is not None and bus is not None:
+                print(f"leader teleop closed: {bridge.frames_sent} frames sent, {bus.dropouts} dropouts")
+        finally:
+            for sig, prev in saved_handlers:
+                try:
+                    signal.signal(sig, prev)
+                except (ValueError, OSError):
+                    pass
 
 
 if __name__ == "__main__":

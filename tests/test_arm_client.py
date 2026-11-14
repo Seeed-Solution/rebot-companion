@@ -644,3 +644,26 @@ def test_an_older_lease_grant_never_replaces_the_generation(armd):
         with pytest.raises(LeaseError):
             s._acquire_lease()
         assert s.generation == current
+
+
+def test_require_succeeds_immediately_after_open_prefetch_failure(armd):
+    """When open() prefetch of schema fails/times out, a subsequent require() must not fail with cooldown."""
+    armd.devplat = True
+    original_get_schema = armd.client.get_schema
+    fail_first = True
+
+    def flake_get_schema(*args, **kwargs):
+        nonlocal fail_first
+        if fail_first:
+            fail_first = False
+            raise ArmConnectionError("simulated schema timeout during prefetch")
+        return original_get_schema(*args, **kwargs)
+
+    armd.client.get_schema = flake_get_schema
+    with armd.client.session(client_id="prefetch-test", safe_exit="off") as s:
+        # open() ran, prefetch failed, but session opened cleanly
+        assert s._schema is None
+        assert s._last_schema_attempt is not None
+        # require() must succeed immediately without waiting 5s cooldown
+        s.require("poses", "Test poses")
+        assert s._schema is not None

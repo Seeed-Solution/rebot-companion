@@ -595,7 +595,21 @@ class Controller:
         if quat is not None:
             rpy = None
         elif roll_deg is None and pitch_deg is None and yaw_deg is None:
-            rpy = None
+            caps = sch.capabilities or {}
+            if orient_dof == 2 and caps.get("auto_yaw") is True:
+                obs = s.latest_observation()
+                cur_rpy: list[float] | None = None
+                if obs is not None and getattr(obs, "tcp", None) is not None:
+                    cur_rpy = _tcp_rpy_rad(obs.tcp)
+                if cur_rpy is None:
+                    raise ToolFail(
+                        "INVALID_ARGUMENT",
+                        "current TCP orientation unavailable to fill omitted orientation angles",
+                    )
+                rpy = [cur_rpy[0], cur_rpy[1], 0.0]
+                auto_yaw = True
+            else:
+                rpy = None
         else:
             if orient_dof is None:
                 raise ToolFail("CONNECTION", "observation schema unavailable; cannot determine arm orientation DOF")
@@ -976,7 +990,9 @@ def build_server(ctrl: Controller, allow_clear_fault: bool = False, allow_preemp
     @tool(
         "Straight-line move of end_link to (x, y, z) m in the base frame. Orientation: roll/pitch/yaw "
         "in degrees (URDF fixed-axis; missing angles keep the current value) or quat [w, x, y, z]; "
-        "omit both to keep the current orientation. Blocks until done."
+        "omit both to keep the current orientation (on 5-DOF arms with orient_dof=2, yaw is coupled: "
+        "omitted yaw or omitted orientation uses auto_yaw to solve yaw while maintaining pitch/roll). "
+        "Blocks until done."
     )
     async def move_to(
         x: float,

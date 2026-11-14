@@ -432,6 +432,7 @@ class ObservationSchema:
     orientation_dof: int | None = None
     gripper_policy: dict | None = None
     feetech_joints: list[dict] | None = None
+    servo_max_lead_rad: float | None = None
 
     @property
     def capabilities_version(self) -> int:
@@ -462,6 +463,8 @@ class ObservationSchema:
         gripper_policy = dict(d["gripper_policy"]) if isinstance(d.get("gripper_policy"), dict) else None
         profile_id = str(d["profile_id"]) if d.get("profile_id") is not None else None
         feetech_joints = list(d["feetech_joints"]) if isinstance(d.get("feetech_joints"), list) else None
+        raw_lead = d.get("servo_max_lead_rad")
+        servo_max_lead_rad = float(raw_lead) if raw_lead is not None else None
 
         return cls(
             dof=dof,
@@ -479,6 +482,7 @@ class ObservationSchema:
             orientation_dof=orientation_dof,
             gripper_policy=gripper_policy,
             feetech_joints=feetech_joints,
+            servo_max_lead_rad=servo_max_lead_rad,
         )
 
 
@@ -913,9 +917,6 @@ class ArmSession:
 
     def schema(self, timeout: float | None = None) -> ObservationSchema:
         if self._schema is None:
-            now = time.monotonic()
-            if self._last_schema_attempt is not None and now - self._last_schema_attempt < _SCHEMA_RETRY_COOLDOWN_S:
-                raise ArmConnectionError("schema fetch in cooldown after previous failure")
             try:
                 self._schema = self.client.get_schema(timeout=timeout)
                 self._last_schema_attempt = None

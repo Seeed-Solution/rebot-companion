@@ -451,3 +451,48 @@ async def test_describe_safety(armd, make_ctrl):
         d = body(await c.call_tool("describe_safety", {}))
     assert d["hardware"]["physical_estop"] is False
     assert "ABSENT" in d["summary"] and "WATCHDOG_TIMEOUT" in d["summary"] and "e_stop" in d["summary"]
+
+
+@pytest.mark.asyncio
+async def test_move_to_5dof_omitted_orientation_auto_yaw():
+    from unittest.mock import MagicMock
+    from rebot.client import ObservationSchema
+    from rebot_companion.mcp_server import Controller
+
+    mock_client = MagicMock()
+    mock_schema = ObservationSchema.from_dict({
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "orientation_dof": 2,
+        "capabilities": {"auto_yaw": True, "version": 6},
+        "limits": [
+            {"name": f"j{i}", "min_position": -3.14, "max_position": 3.14, "max_velocity": 2.0, "max_acceleration": 5.0}
+            for i in range(6)
+        ],
+    })
+    mock_client.get_schema.return_value = mock_schema
+
+    ctrl = Controller(mock_client, grabber=MagicMock(), detector=MagicMock())
+    mock_session = MagicMock()
+    mock_session.has_lease = True
+    mock_session.lease_lost = None
+    mock_session.closed_reason = None
+    ctrl.session = mock_session
+    mock_obs = MagicMock()
+    mock_obs.tcp = {"rpy_rad": [0.15, -0.25, 0.50]}
+    mock_obs.positions = [0.0] * 6
+    mock_session.latest_observation.return_value = mock_obs
+    mock_session.move_pose.return_value = MagicMock(
+        code="OK", message="", position=[0.25, 0.0, 0.20], rpy=[0.15, -0.25, 0.0],
+        success=True, duration_s=1.0, positions=[0.0] * 6, collision=False, error=None,
+    )
+
+    # When roll, pitch, and yaw are all omitted on 5-DOF arm with auto_yaw: True:
+    # preserves current roll and pitch, sets yaw=0.0 and auto_yaw=True
+    ctrl.move_to(0.25, 0.0, 0.20, roll_deg=None, pitch_deg=None, yaw_deg=None, quat=None, speed_mps=None, timeout_s=None)
+    _, kwargs = mock_session.move_pose.call_args
+    assert kwargs.get("auto_yaw") is True
+    assert kwargs.get("rpy")[0] == pytest.approx(0.15)
+    assert kwargs.get("rpy")[1] == pytest.approx(-0.25)
+    assert kwargs.get("rpy")[2] == 0.0
