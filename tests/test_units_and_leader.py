@@ -3183,7 +3183,3 @@ def test_lerobot_homing_offset_preserves_center_over_feetech_zero_step():
         assert bridge.calib.joints[i].center == 2048
         assert bridge.calib.joints[i].explicit_center is True
         assert getattr(bridge.calib.joints[i], "defaulted", False) is False
-
-
-
-

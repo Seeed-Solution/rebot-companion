@@ -697,26 +697,29 @@ def test_gripper_zero_check_raises_unsupported_on_so_arm101():
     mock_session.schema.return_value = sch_disabled_zero
 
     with patch.object(ArmdClient, "get_schema", return_value=sch_disabled_zero), patch.object(ArmSession, "open"):
-        arm = Arm(host="127.0.0.1", port=8765, enable=False)
-    arm.session = mock_session
-    with pytest.raises(UnsupportedError) as exc_info:
-        arm.gripper_zero_check()
-    assert exc_info.value.code == "UNSUPPORTED"
-    assert "gripper mechanical zero check is not supported" in str(exc_info.value)
+        arm = Arm(host="127.0.0.1", port=8765, enable=False, park_on_exit=False, handle_sigterm=False)
+    try:
+        arm.session = mock_session
+        with pytest.raises(UnsupportedError) as exc_info:
+            arm.gripper_zero_check()
+        assert exc_info.value.code == "UNSUPPORTED"
+        assert "gripper mechanical zero check is not supported" in str(exc_info.value)
 
-    # 2. gripper_policy zero_check_supported is False
-    sch_disabled_policy = ObservationSchema.from_dict({
-        "dof": 6,
-        "arm_dof": 5,
-        "gripper_joint": 5,
-        "limits": [],
-        "capabilities": {},
-        "gripper_policy": {"zero_check_supported": False},
-    })
-    mock_session._schema = sch_disabled_policy
-    with pytest.raises(UnsupportedError) as exc_info2:
-        arm.gripper_zero_check()
-    assert exc_info2.value.code == "UNSUPPORTED"
+        # 2. gripper_policy zero_check_supported is False
+        sch_disabled_policy = ObservationSchema.from_dict({
+            "dof": 6,
+            "arm_dof": 5,
+            "gripper_joint": 5,
+            "limits": [],
+            "capabilities": {},
+            "gripper_policy": {"zero_check_supported": False},
+        })
+        mock_session._schema = sch_disabled_policy
+        with pytest.raises(UnsupportedError) as exc_info2:
+            arm.gripper_zero_check()
+        assert exc_info2.value.code == "UNSUPPORTED"
+    finally:
+        arm.close()
 
 
 def test_armsession_open_heartbeat_starts_immediately_after_acquire_lease():
@@ -745,35 +748,39 @@ def test_armsession_open_heartbeat_starts_immediately_after_acquire_lease():
     session.schema = fake_schema
     session._acquire_lease = fake_acquire_lease
 
-    with patch("rebot._ws.connect", return_value=MagicMock()):
-        with patch("threading.Thread") as mock_thread_cls:
-            created_threads = []
-
-            def make_thread(target=None, name=None, daemon=None):
-                t = MagicMock()
-                t.name = name
-                t.start.side_effect = lambda: events.append(f"start_{name}")
-                created_threads.append(t)
-                return t
-
-            mock_thread_cls.side_effect = make_thread
-
-            session.open()
-
-    # Pre-lease schema was fetched with bounded timeout <= 1.5s
-    assert "schema(timeout=1.0)" in events
-    # Heartbeat thread started immediately after acquire_lease
-    idx_lease = events.index("acquire_lease")
-    idx_hb = events.index("start_armd-heartbeat")
-    assert idx_lease < idx_hb
-    # Shutdown on error tears down threads
-    with patch.object(session, "_shutdown") as mock_shutdown:
-        session._ws = None  # force re-open
-        session._acquire_lease = MagicMock(side_effect=RuntimeError("lease failed"))
+    try:
         with patch("rebot._ws.connect", return_value=MagicMock()):
-            with pytest.raises(RuntimeError, match="lease failed"):
+            with patch("threading.Thread") as mock_thread_cls:
+                created_threads = []
+
+                def make_thread(target=None, name=None, daemon=None):
+                    t = MagicMock()
+                    t.name = name
+                    t.start.side_effect = lambda: events.append(f"start_{name}")
+                    created_threads.append(t)
+                    return t
+
+                mock_thread_cls.side_effect = make_thread
+
                 session.open()
-        mock_shutdown.assert_called_once()
+
+        # Pre-lease schema was fetched with bounded timeout <= 1.5s
+        assert "schema(timeout=1.0)" in events
+        # Heartbeat thread started immediately after acquire_lease
+        idx_lease = events.index("acquire_lease")
+        idx_hb = events.index("start_armd-heartbeat")
+        assert idx_lease < idx_hb
+        # Shutdown on error tears down threads
+        with patch("threading.Thread"):
+            with patch.object(session, "_shutdown") as mock_shutdown:
+                session._ws = None  # force re-open
+                session._acquire_lease = MagicMock(side_effect=RuntimeError("lease failed"))
+                with patch("rebot._ws.connect", return_value=MagicMock()):
+                    with pytest.raises(RuntimeError, match="lease failed"):
+                        session.open()
+                mock_shutdown.assert_called_once()
+    finally:
+        session._stop.set()
 
 
 def test_mcp_server_auto_yaw_unsupported_when_explicitly_false():
