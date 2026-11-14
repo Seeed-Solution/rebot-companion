@@ -55,6 +55,8 @@ from rebot import _ws
 from rebot._http import host_url
 from rebot.client import ArmStatus
 
+from . import units
+
 log = logging.getLogger(__name__)
 
 CODEBASE_VERSION = "v3.0"
@@ -511,6 +513,7 @@ class LeRobotRecorder:
         frame_source: Any = None,
         connect_timeout: float = 5.0,
         with_camera: bool | None = None,
+        unit_mode: str = "rad",
     ) -> None:
         self.root = Path(root)
         if self.root.exists() and any(self.root.iterdir()):
@@ -530,6 +533,16 @@ class LeRobotRecorder:
         self.robot_type = robot_type
         self.joint_names = list(joint_names)
         self.connect_timeout = connect_timeout
+        self.unit_mode = units.resolve_unit_mode(unit_mode)
+        self.armd_host = armd_host
+        self.schema = None
+        self.profile_id: str | None = None
+        self.arm_dof: int | None = None
+        self.gripper_joint: int | None = None
+        self.limits: list[Any] | None = None
+        self.closed_rad: float | None = None
+        self.open_rad: float | None = None
+        self._schema_fetched = False
         if obs_source is None and armd_host is not None:
             obs_source = ObservationStream(armd_host, obs_hz=obs_hz or self.fps * 2, connect_timeout=connect_timeout)
         if frame_source is None and camera_url is not None:
@@ -557,10 +570,46 @@ class LeRobotRecorder:
 
     # ---- lifecycle -------------------------------------------------------------
 
+    def _fetch_schema(self) -> None:
+        if self._schema_fetched or self.armd_host is None:
+            return
+        self._schema_fetched = True
+        try:
+            from rebot.client import ArmdClient
+
+            client = ArmdClient(self.armd_host)
+            schema = client.get_schema()
+            self.schema = schema
+            self.profile_id = schema.profile_id
+            self.arm_dof = schema.arm_dof
+            self.gripper_joint = schema.gripper_joint
+            self.limits = schema.limits
+            if schema.joint_names and (self.joint_names == JOINT_NAMES or not self.joint_names):
+                self.joint_names = list(schema.joint_names)
+            policy = schema.gripper_policy or {}
+            if "closed_rad" in policy and "open_rad" in policy:
+                self.closed_rad = float(policy["closed_rad"])
+                self.open_rad = float(policy["open_rad"])
+        except Exception as exc:
+            log.info("schema fetch skipped or unavailable: %s", exc)
+        try:
+            from rebot._http import request
+
+            res = request(
+                "GET", host_url(self.armd_host, ARMD_PORT) + "/api/v1/gripper/calibration", timeout=self.connect_timeout
+            )
+            if res.ok:
+                calib = res.json()
+                if isinstance(calib, dict) and "points" in calib:
+                    pass
+        except Exception:
+            pass
+
     def open(self) -> LeRobotRecorder:
         """Start the sources and wait for the first observation / camera frame."""
         if self._opened:
             return self
+        self._fetch_schema()
         started = []
         try:
             for src in (self.obs_source, self.frame_source):
@@ -618,6 +667,8 @@ class LeRobotRecorder:
             raise RecorderError("sampling needs an observation source")
         if sample and not self._opened:
             self.open()
+        elif not self._schema_fetched:
+            self._fetch_schema()
         tmp = self.root / ".recording" / f"ep-{len(self._episodes):06d}"
         shutil.rmtree(tmp, ignore_errors=True)
         tmp.mkdir(parents=True)
@@ -649,8 +700,31 @@ class LeRobotRecorder:
         i = len(ep.state)
         if i == 0:
             self._dof = len(state)
+            if self.arm_dof is None:
+                self.arm_dof = 6 if self._dof >= 6 else self._dof
+            if self.gripper_joint is None and self._dof == 7:
+                self.gripper_joint = 6
         if len(state) != self._dof or len(action) != self._dof:
             raise ValueError(f"state and action need {self._dof} values")
+
+        if self.unit_mode != "rad":
+            state = units.from_armd(
+                state,
+                self.unit_mode,
+                limits=self.limits,
+                gripper_joint=self.gripper_joint,
+                closed_rad=self.closed_rad,
+                open_rad=self.open_rad,
+            )
+            action = units.from_armd(
+                action,
+                self.unit_mode,
+                limits=self.limits,
+                gripper_joint=self.gripper_joint,
+                closed_rad=self.closed_rad,
+                open_rad=self.open_rad,
+            )
+
         ep.state.append([float(x) for x in state])
         ep.action.append([float(x) for x in action])
         for name, values in (("velocity", velocity), ("effort", effort)):
@@ -730,7 +804,15 @@ class LeRobotRecorder:
                 arr = pa.array(values)
             arrays.append(arr)
             fields.append(pa.field(key, arr.type))
-        hf = {"info": {"features": {k: _hf_feature(features[k]) for k in columns}}}
+        hf = {
+            "info": {
+                "features": {k: _hf_feature(features[k]) for k in columns},
+                "unit_mode": self.unit_mode,
+                "profile_id": self.profile_id,
+                "arm_dof": self.arm_dof,
+                "gripper_joint": self.gripper_joint,
+            }
+        }
         schema = pa.schema(fields, metadata={"huggingface": json.dumps(hf)})
         data_path = self.root / DATA_PATH.format(chunk_index=chunk, file_index=file)
         data_path.parent.mkdir(parents=True, exist_ok=True)
@@ -864,7 +946,12 @@ class LeRobotRecorder:
 
     def _features(self) -> dict[str, dict]:
         dof = getattr(self, "_dof", len(self.joint_names))
-        names = self.joint_names if len(self.joint_names) == dof else [f"joint_{i + 1}" for i in range(dof)]
+        if self.schema is not None and self.schema.joint_names and len(self.schema.joint_names) == dof:
+            names = list(self.schema.joint_names)
+        elif len(self.joint_names) == dof:
+            names = list(self.joint_names)
+        else:
+            names = [f"joint_{i + 1}" for i in range(dof)]
         feats: dict[str, dict] = {
             "observation.state": {"dtype": "float32", "shape": [dof], "names": list(names)},
             "action": {"dtype": "float32", "shape": [dof], "names": list(names)},
@@ -912,6 +999,10 @@ class LeRobotRecorder:
             "video_path": VIDEO_PATH if self.has_video else None,
             "robot_type": self.robot_type,
             "splits": {"train": f"0:{len(self._episodes)}"},
+            "unit_mode": self.unit_mode,
+            "profile_id": self.profile_id,
+            "arm_dof": self.arm_dof,
+            "gripper_joint": self.gripper_joint,
         }
         _write_json(meta / "info.json", info)
         _write_json(meta / "stats.json", _jsonable(aggregate_stats(self._stats)))
@@ -1052,6 +1143,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--camera-key", default="observation.images.recamera")
     p.add_argument("--image-size", help="resize video to WxH (default: camera size)")
     p.add_argument("--vcodec", default="auto", help="auto (libsvtav1 if available, else h264), libsvtav1, h264")
+    p.add_argument(
+        "--unit-mode",
+        choices=["rad", "so101_norm", "deg"],
+        default="rad",
+        help="unit mode for state/action: rad (default, passthrough), so101_norm ([-100, 100], gripper [0, 100]), deg",
+    )
     p.add_argument("--no-prompt", action="store_true", help="start/save episodes without waiting for Enter")
     p.add_argument("--reset-s", type=float, default=0.0, help="pause between episodes with --no-prompt")
     args = p.parse_args(argv)
@@ -1071,6 +1168,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             extras=[e for e in args.extras.split(",") if e],
             image_size=size,
             video=VideoSettings(vcodec=args.vcodec),
+            unit_mode=args.unit_mode,
         )
         print(f"connecting to armd {args.armd}" + ("" if args.no_camera else f" and camera {args.camera}") + " ...")
         rec.open()
@@ -1104,6 +1202,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"{rec.num_episodes} episode(s) in {root}")
     return 0
 
+
+Recorder = LeRobotRecorder
 
 if __name__ == "__main__":
     sys.exit(main())

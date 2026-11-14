@@ -364,14 +364,16 @@ class Arm:
         rpy: Optional[Sequence[float]] = None,
         speed: Optional[float] = None,
         timeout: Optional[float] = None,
+        auto_yaw: Optional[bool] = None,
     ) -> ActionResult:
         """Straight-line move of the gripper to ``xyz`` (metres, arm base frame: x forward, y left, z up).
 
         ``rpy``: orientation in radians (roll, pitch, yaw); None keeps the current one.
         ``speed``: m/s (armd default 0.05).
+        ``auto_yaw``: when True on 5-DOF arms (orient_dof=2), armd solves yaw from position.
         """
         return self._motion(
-            lambda: self.session.move_pose(xyz, rpy=rpy, linear_speed=speed, timeout=timeout),
+            lambda: self.session.move_pose(xyz, rpy=rpy, linear_speed=speed, timeout=timeout, auto_yaw=auto_yaw),
             f"target {_fmt(xyz)}",
             timeout,
         )

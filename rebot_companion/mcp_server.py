@@ -291,7 +291,7 @@ class Controller:
             except Exception as exc:
                 log.warning("observation schema unavailable: %s", exc)
                 dof = len(self.observation().positions) if self.observation() else 7
-                self._schema = ObservationSchema(dof=dof, joint_names=[], limits=[], fields=[])
+                self._schema = ObservationSchema.from_dict({"dof": dof})
         return self._schema
 
     def gripper_joint(self) -> int | None:
@@ -503,11 +503,24 @@ class Controller:
             raise ToolFail("INVALID_ARGUMENT", "give roll/pitch/yaw or quat, not both")
         sch = self.schema()
         orient_dof = sch.orientation_dof or (2 if sch.arm_dof == 5 else 3)
+        auto_yaw = None
         if orient_dof == 2:
             # 2-DOF orientation arm (e.g. 5-arm): pitch/roll controllable, yaw is not independent.
-            # When all orientation angles are omitted or only yaw was given, pass rpy=None.
-            if roll_deg is None and pitch_deg is None:
+            # When all orientation angles are omitted, pass rpy=None.
+            if roll_deg is None and pitch_deg is None and yaw_deg is None:
                 rpy = None
+            elif yaw_deg is None and (roll_deg is not None or pitch_deg is not None):
+                obs = s.latest_observation()
+                cur_tcp = self.format_tcp(obs.tcp, obs.commanded_positions or obs.positions) if obs else None
+                cur = cur_tcp.get("rpy_deg") if cur_tcp else None
+                if not cur or len(cur) < 3:
+                    cur = [0.0, 0.0, 0.0]
+                rpy = [
+                    math.radians(roll_deg if roll_deg is not None else cur[0]),
+                    math.radians(pitch_deg if pitch_deg is not None else cur[1]),
+                    0.0,
+                ]
+                auto_yaw = True
             else:
                 obs = s.latest_observation()
                 cur_tcp = self.format_tcp(obs.tcp, obs.commanded_positions or obs.positions) if obs else None
@@ -517,8 +530,9 @@ class Controller:
                 rpy = [
                     math.radians(roll_deg if roll_deg is not None else cur[0]),
                     math.radians(pitch_deg if pitch_deg is not None else cur[1]),
-                    math.radians(yaw_deg if yaw_deg is not None else cur[2]),
+                    math.radians(yaw_deg),
                 ]
+                auto_yaw = None
         elif any(v is not None for v in (roll_deg, pitch_deg, yaw_deg)):
             obs = s.latest_observation()
             cur_tcp = self.format_tcp(obs.tcp, obs.commanded_positions or obs.positions) if obs else None
@@ -530,7 +544,10 @@ class Controller:
             if not cur or len(cur) < 3:
                 cur = [0.0, 0.0, 0.0]
             rpy = [math.radians(v if v is not None else c) for v, c in zip((roll_deg, pitch_deg, yaw_deg), cur)]
-        res = s.move_pose([x, y, z], rpy=rpy, quat=quat, linear_speed=speed_mps, timeout=timeout_s)
+        move_kwargs = {}
+        if auto_yaw is not None:
+            move_kwargs["auto_yaw"] = auto_yaw
+        res = s.move_pose([x, y, z], rpy=rpy, quat=quat, linear_speed=speed_mps, timeout=timeout_s, **move_kwargs)
         return self._action_dict(res)
 
     def move_relative(self, frame: str, d: list[float], rot_deg: dict, level: bool | None, speed_mps) -> dict:

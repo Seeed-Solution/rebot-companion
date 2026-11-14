@@ -306,8 +306,10 @@ rebot-companion/
 │   ├── arm_client.py           # re-export of rebot.client
 │   ├── camera_client.py        # reCamera rebot-vision / aruco-detector client (trigger / latest result)
 │   ├── snapshot.py             # JPEG snapshots from the H.264 stream + detection overlay
+│   ├── units.py                # rad <-> so101_norm <-> deg bidirectional unit conversions
 │   ├── lerobot_recorder.py     # LeRobot v3.0 dataset recorder (rebot-record)
 │   ├── policy_runner.py        # LeRobot / scripted policy -> armd servo stream (rebot-policy)
+│   ├── leader_teleop.py        # PC-side USB leader bridge -> armd servo (rebot-teleop-leader)
 │   ├── mcp_server.py           # stdio MCP server (rebot-mcp)
 │   ├── kinematics.py           # B601-DM FK (full URDF chain) and planar FK/IK (port of the Web cockpit)
 │   ├── ik.py                   # IK adapter: base-frame pose -> armd 7-joint vector (incl. gripper)
@@ -392,6 +394,15 @@ lease; REST `motion/*`, torque and `clear_fault` return `LEASE_REQUIRED`.
   `2 * expected_duration_s + 5` s, capped at 60 s; on timeout `stop` is sent and `MotionTimeout`
   raised. `ArmStatus.commanded_positions` and `ArmStatus.action` are empty / None on an armd
   without these fields.
+- SO-ARM101 follower: device serial `/dev/ttySC0` (`--follower so-arm101` in armd), 6 DOF
+  (5-DOF arm + 1 gripper). No gravity compensation, no mechanical zero-check, and no physical
+  e-stop (software stop only); resting pose is folded `park()`.
+- 5-DOF Cartesian motions (`orient_dof=2`): pitch and roll are directly controllable while yaw
+  is coupled to arm position. Pass `auto_yaw=True` to `move_to(xyz, rpy=..., auto_yaw=True)` (or omit
+  `yaw_deg` in `rebot-mcp`) to let armd solve the matching yaw angle automatically without `IK_UNREACHABLE`.
+- PC USB Leader Bridge (`rebot-teleop-leader`): streams 6-DOF STS3215 leader arm raw positions
+  (USB `/dev/ttyACM*`, `/dev/ttyUSB*`, or macOS `/dev/cu.usbmodem*`) directly to armd's WebSocket
+  servo interface with initial alignment guard, smooth quintic ramp-in, and clean parking on shutdown.
 
 ```python
 from rebot_companion import ArmdClient
@@ -748,9 +759,12 @@ timestamp and the camera's ms tail are other clocks; they are stored per episode
 `meta/rebot_episodes.jsonl` with the observation and camera sample ages. Camera pipeline and
 network delay are not compensated.
 
-Python API: `LeRobotRecorder(root, repo_id, fps=30, camera_url=..., armd_host=..., task=...)`
+Python API: `LeRobotRecorder(root, repo_id, fps=30, camera_url=..., armd_host=..., task=..., unit_mode="rad")`
 with `start_episode()`, `stop_episode()`, `save()`, `discard()`; `start_episode(sample=False)`
 plus `add_frame(state, action, image)` records scripted steps at a fixed `fps`.
+Use `--unit-mode {rad,so101_norm,deg}` (default `rad`) to normalize arm joints to `[-100, 100]`
+and gripper openness to `[0, 100]` (`so101_norm`), saving `unit_mode`, `profile_id`, `arm_dof`
+and `gripper_joint` metadata to `meta/info.json`.
 
 Verified (`tests/test_lerobot_recorder.py`, synthetic observations and libx264 Annex-B frames
 fed through the same PyAV decode path): file layout, indices, timestamps, stats and task
@@ -811,6 +825,7 @@ The runner imports them only for a learned policy.
 | `--servo-hz` | servo frame rate (default 50, armd's control rate) |
 | `--max-seconds` | run length (default 60) |
 | `--max-steps` | stop after this many policy steps (default: no limit) |
+| `--action-units`, `--state-units` | units for policy actions / observations: `auto` (default, reads `unit_mode` from dataset/policy `meta/info.json`, falls back to `rad`), `rad`, `so101_norm`, or `deg` |
 | `--task` | task text passed to the policy (language-conditioned policies) |
 | `--device` | torch device (default `cuda` when available, else `cpu`) |
 | `--no-park` | hold position at the end instead of parking |
@@ -818,15 +833,17 @@ The runner imports them only for a learned policy.
 | `--log` | per-step JSON lines (observation age, camera age, inference ms, step lag, action, state) and a summary line |
 | `--i-am-at-the-arm` | required when armd's follower (`GET /api/v1/safety/describe` `device.follower`) is not `mock` or `sim`, or unknown |
 
-The run is refused before taking the lease when the schema does not give 7 finite joint limits with
-min < max.
+The run is refused before taking the lease when the schema does not give finite joint limits with
+min < max or when policy action dimension does not match arm DOF (7 for B601-DM, 6 for SO-ARM101).
+The dynamic gripper joint (`schema.gripper_joint`) is automatically exempted from the lead clip.
 
-Observation, built like a `rebot-record` row: `observation.state` = armd `positions` (7, float32);
+Observation, built like a `rebot-record` row: `observation.state` = armd `positions` (converted
+to `--state-units`, float32);
 `observation.velocity` / `observation.effort` = `velocities` / `torques` when the policy has these
 inputs; the policy's single image input (for example `observation.images.recamera`) = the newest
 decoded reCamera frame, RGB uint8, resized with PyAV to the policy's input height and width (the
-recorder resizes with the same PyAV call before encoding). The action (7) is the joint target, the
-recorder's `commanded_positions`. Learned policies are loaded with lerobot's
+recorder resizes with the same PyAV call before encoding). The action is the joint target, the
+recorder's `commanded_positions` (converted from `--action-units` back to armd radians). Learned policies are loaded with lerobot's
 `PreTrainedConfig.from_pretrained`, `get_policy_class(type).from_pretrained` and the saved
 pre/post-processors (`make_pre_post_processors`), and stepped with `predict_action` (one action per
 step; ACT-style policies return the next action of their chunk). Policies with more than one camera

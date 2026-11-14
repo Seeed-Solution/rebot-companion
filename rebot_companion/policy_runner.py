@@ -68,9 +68,10 @@ from typing import Any
 
 import numpy as np
 
-from rebot.client import GRIPPER_INDEX, ArmdClient, ArmSession, ArmStatus
+from rebot.client import ArmdClient, ArmSession, ArmStatus, ObservationSchema
 from rebot.errors import ArmConnectionError, LeaseError, RebotError, ServoRejected
 
+from . import units
 from .lerobot_recorder import EXTRAS, JOINT_NAMES, armd_url
 
 log = logging.getLogger("rebot_companion.policy_runner")
@@ -152,6 +153,9 @@ class ReplayPolicy(Policy):
         if not actions:
             raise RunnerError(f"episode {episode} has no rows in {path}")
         self.actions = np.asarray(actions, dtype=np.float64)
+        self.action_dim = int(self.actions.shape[1])
+        self.info = info
+        self.unit_mode = info.get("unit_mode")
         self.name = f"replay:{root}:{episode}"
 
     def select(self, obs: dict[str, np.ndarray], step: int, t: float) -> np.ndarray | None:
@@ -539,6 +543,8 @@ class PolicyRunner:
         connect_timeout: float = 5.0,
         send_timeout_s: float = SEND_TIMEOUT_S,
         sender_join_s: float = 2 * SEND_TIMEOUT_S,
+        action_units: str = "auto",
+        state_units: str = "auto",
     ) -> None:
         if fps is None and policy.fps is None:
             raise ValueError(f"fps of {policy.name} is unknown ({policy.fps_problem or 'not given'}): pass --fps")
@@ -570,6 +576,15 @@ class PolicyRunner:
         self.log_path = Path(log_path) if log_path else None
         self.client_id = client_id
         self.connect_timeout = connect_timeout
+        self.action_units_requested = action_units
+        self.state_units_requested = state_units
+        self.action_units = "rad"
+        self.state_units = "rad"
+        self.dof = len(JOINT_NAMES)
+        self.gripper_joint: int | None = 6
+        self.closed_rad: float = 0.0
+        self.open_rad: float = -5.7
+        self.schema: ObservationSchema | None = None
         # The sender's in-flight send ends within send_timeout_s; joining it must allow for that plus margin,
         # else a slow but healthy send would be treated as a stuck sender (REST e-stop).
         self.send_timeout_s = _positive("send_timeout_s", send_timeout_s)
@@ -653,7 +668,7 @@ class PolicyRunner:
         if age > self.max_obs_age_s:
             return "stale_observation", f"newest observation is {age * 1000:.0f} ms old"
         pos = obs.positions
-        if len(pos) != len(JOINT_NAMES) or not all(math.isfinite(p) for p in pos):
+        if len(pos) != self.dof or not all(math.isfinite(p) for p in pos):
             return "bad_observation", f"positions {pos}"
         return None
 
@@ -698,24 +713,70 @@ class PolicyRunner:
             )
         res = self.client.request("GET", "/api/v1/observation/schema")
         res.raise_for_status()
-        schema = res.json()
-        lead = schema.get("servo_max_lead_rad")
+        raw_schema = res.json()
+        schema = ObservationSchema.from_dict(raw_schema)
+        self.schema = schema
+        self.dof = schema.dof
+        self.gripper_joint = schema.gripper_joint
+        if schema.gripper_policy:
+            if "closed_rad" in schema.gripper_policy:
+                self.closed_rad = float(schema.gripper_policy["closed_rad"])
+            if "open_rad" in schema.gripper_policy:
+                self.open_rad = float(schema.gripper_policy["open_rad"])
+        elif self.gripper_joint == 6:
+            self.closed_rad = 0.0
+            self.open_rad = -5.7
+        else:
+            self.closed_rad = 0.0
+            self.open_rad = 1.5
+
+        lead = raw_schema.get("servo_max_lead_rad")
         self.lead = float(lead) if isinstance(lead, (int, float)) and lead > 0 else DEFAULT_LEAD_RAD
-        dof = int(schema.get("dof") or 0)
-        if dof != len(JOINT_NAMES):
-            raise RunnerError(f"armd reports {dof} joints; rebot-policy drives the 7-DOF B601-DM")
+
+        policy_dof = None
+        if hasattr(self.policy, "action_dim") and self.policy.action_dim is not None:
+            policy_dof = self.policy.action_dim
+        elif (
+            hasattr(self.policy, "actions")
+            and hasattr(self.policy.actions, "shape")
+            and len(self.policy.actions.shape) > 1
+        ):
+            policy_dof = int(self.policy.actions.shape[1])
+        elif hasattr(self.policy, "dof"):
+            policy_dof = self.policy.dof
+
+        if policy_dof is not None and policy_dof != self.dof:
+            raise RunnerError(f"policy action dimension ({policy_dof}) does not match arm DOF ({self.dof})")
+
+        if isinstance(self.policy, SinePolicy) and self.policy.joint >= self.dof:
+            raise RunnerError(f"sine policy joint index {self.policy.joint + 1} exceeds arm DOF {self.dof}")
+
         try:
-            limits = [(float(lim["min_position"]), float(lim["max_position"])) for lim in schema.get("limits") or []]
+            limits = [
+                (float(lim["min_position"]), float(lim["max_position"])) for lim in raw_schema.get("limits") or []
+            ]
         except (KeyError, TypeError, ValueError) as exc:
             raise RunnerError(f"armd schema joint limits are malformed: {exc}") from exc
-        if len(limits) != dof or not all(
+        if len(limits) != self.dof or not all(
             math.isfinite(lo) and math.isfinite(hi) and hi - lo > 2 * LIMIT_MARGIN for lo, hi in limits
         ):
-            raise RunnerError(f"armd schema joint limits are unusable (need {dof} finite min < max): {limits}")
+            raise RunnerError(f"armd schema joint limits are unusable (need {self.dof} finite min < max): {limits}")
         self.limits = limits
 
+        policy_info = getattr(self.policy, "info", None)
+        self.action_units = units.resolve_unit_mode(self.action_units_requested, policy_info)
+        self.state_units = units.resolve_unit_mode(self.state_units_requested, policy_info)
+
     def _observation(self, obs: ArmStatus) -> dict[str, np.ndarray]:
-        out = {STATE_KEY: np.asarray(obs.positions, dtype=np.float32)}
+        positions = units.from_armd(
+            obs.positions,
+            self.state_units,
+            limits=self.limits,
+            gripper_joint=self.gripper_joint,
+            closed_rad=self.closed_rad,
+            open_rad=self.open_rad,
+        )
+        out = {STATE_KEY: np.asarray(positions, dtype=np.float32)}
         for key, attr in EXTRA_KEYS.items():
             if key in self.policy.inputs:
                 out[key] = np.asarray(getattr(obs, attr), dtype=np.float32)
@@ -760,7 +821,7 @@ class PolicyRunner:
         for j in range(len(out)):
             lim_lo, lim_hi = self.limits[j][0] + LIMIT_MARGIN, self.limits[j][1] - LIMIT_MARGIN
             lo, hi = lim_lo, lim_hi
-            if j != GRIPPER_INDEX:  # armd exempts the gripper from the lead cap
+            if self.gripper_joint is None or j != self.gripper_joint:  # armd exempts the gripper from the lead cap
                 m = measured[j]
                 lo, hi = max(lo, m - lead), min(hi, m + lead)
                 if lo > hi:
@@ -861,7 +922,7 @@ class PolicyRunner:
                 "wait for it or create a new policy"
             )
         self._read_arm()
-        self.result.lead_clips_per_joint = [0] * len(JOINT_NAMES)
+        self.result.lead_clips_per_joint = [0] * self.dof
         if self.log_path:
             self.log_path.parent.mkdir(parents=True, exist_ok=True)
             self._log_file = open(self.log_path, "w", encoding="utf-8")
@@ -1055,9 +1116,19 @@ class PolicyRunner:
                 self._end_of_policy("policy_done", f"{k} steps")
                 break
             action = np.asarray(action, dtype=np.float64).reshape(-1)
-            if action.shape[0] != len(JOINT_NAMES) or not np.all(np.isfinite(action)):
+            if action.shape[0] != self.dof or not np.all(np.isfinite(action)):
                 self.request_stop("bad_action", f"policy returned {action.tolist()}")
                 break
+            if self.action_units != "rad":
+                action_rad = units.to_armd(
+                    action.tolist(),
+                    self.action_units,
+                    limits=self.limits,
+                    gripper_joint=self.gripper_joint,
+                    closed_rad=self.closed_rad,
+                    open_rad=self.open_rad,
+                )
+                action = np.asarray(action_rad, dtype=np.float64)
             self._publish(action)
             self.result.steps = k + 1
             if self._log_file is not None:
@@ -1184,6 +1255,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--task", default="", help="task text for language-conditioned policies")
     p.add_argument("--device", help="torch device (default cuda if available, else cpu)")
     p.add_argument("--no-park", action="store_true", help="hold position at the end instead of parking")
+    p.add_argument(
+        "--action-units",
+        choices=["auto", "rad", "so101_norm", "deg"],
+        default="auto",
+        help="units for policy actions: auto (read from info.json, default rad), rad, so101_norm, deg",
+    )
+    p.add_argument(
+        "--state-units",
+        choices=["auto", "rad", "so101_norm", "deg"],
+        default="auto",
+        help="units for policy observations: auto (read from info.json, default rad), rad, so101_norm, deg",
+    )
     p.add_argument("--stall-s", type=float, default=1.0, help="stop when the policy gives no target for this long")
     p.add_argument("--max-frame-age", type=float, default=0.5, help="stop when the newest camera frame is older (s)")
     p.add_argument(
@@ -1244,6 +1327,8 @@ def _main(args: argparse.Namespace, handle: Any) -> int:
             max_frame_age_s=args.max_frame_age,
             max_obs_age_s=args.max_obs_age,
             log_path=args.log,
+            action_units=args.action_units,
+            state_units=args.state_units,
         )
         print(
             f"policy {policy.name}"

@@ -48,7 +48,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Optional, Sequence
 
 from . import _http, _ws
 from ._log import _log
@@ -323,6 +323,7 @@ class ArmStatus:
     previous_action: ActionStatus | None = None
     fault: dict | None = None  # {"code", "message", "recoverable"} (capability fault_codes)
     residual_torques: list[float] | None = None  # capability residual_torques
+    loads: list[float] | None = None
     collision: dict | None = None  # capability collision_guard; None while the guard is off or unavailable
     motion_limit: dict | None = None  # capability servo_guard: {"reason", "joint", "since_ms"} or None
     gripper_zero: dict | None = None  # capability gripper_zero: {"state", "j7", "offset_rad"}
@@ -358,6 +359,7 @@ class ArmStatus:
             ),
             fault=dict(d["fault"]) if isinstance(d.get("fault"), dict) else None,
             residual_torques=floats("residual_torques") if isinstance(d.get("residual_torques"), list) else None,
+            loads=floats("loads") if isinstance(d.get("loads"), list) else None,
             collision=dict(d["collision"]) if isinstance(d.get("collision"), dict) else None,
             motion_limit=dict(d["motion_limit"]) if isinstance(d.get("motion_limit"), dict) else None,
             gripper_zero=dict(d["gripper_zero"]) if isinstance(d.get("gripper_zero"), dict) else None,
@@ -1263,12 +1265,14 @@ class ArmSession:
         angular_speed: float | None = None,
         tag: str | None = None,
         timeout: float | None = None,
+        auto_yaw: Optional[bool] = None,
     ) -> ActionResult:
         """Straight-line Cartesian move of ``end_link`` to ``position`` (m, base frame).
 
         Orientation: ``rpy`` (rad, URDF fixed-axis ``Rz @ Ry @ Rx``) or ``quat`` ``[w, x, y, z]``;
         neither keeps the current orientation. armd defaults: 0.05 m/s, 0.5 rad/s.
         (:meth:`move_to` is the joint-space jog.)
+        ``auto_yaw``: when True on 5-DOF arms (orient_dof=2), armd solves yaw from position.
         """
         if rpy is not None and quat is not None:
             raise ValueError("give rpy or quat, not both")
@@ -1279,6 +1283,8 @@ class ArmSession:
         _put_speed(body, linear_speed, angular_speed)
         if tag is not None:
             body["tag"] = str(tag)
+        if auto_yaw is not None:
+            body["auto_yaw"] = bool(auto_yaw)
         return self._action("/api/v1/action/move_to", body, timeout, legacy_wait=None)
 
     def move_relative(
