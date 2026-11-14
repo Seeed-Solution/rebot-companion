@@ -224,6 +224,8 @@ class PosixSerialTransport(LeaderTransport):
             try:
                 chunk = os.read(self.fd, n - len(out))
             except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    break
                 continue
             if not chunk:
                 break
@@ -420,6 +422,7 @@ class JointCalib:
     sign: int = 1
     explicit_sign: bool = False
     explicit_center: bool = False
+    defaulted: bool = False
 
 
 @dataclass
@@ -433,6 +436,7 @@ def _parse_joint_calib(entry: dict, name: str) -> JointCalib:
         raise LeaderError(f"{name}: joint calibration entry must be a dict, got {type(entry).__name__}")
 
     explicit_center = False
+    defaulted = False
     if "center" not in entry:
         if "homing_offset" in entry:
             ho = entry["homing_offset"]
@@ -441,6 +445,7 @@ def _parse_joint_calib(entry: dict, name: str) -> JointCalib:
             except (ValueError, TypeError) as exc:
                 raise LeaderError(f"{name}: invalid 'homing_offset' {ho!r}") from exc
             center = DEFAULT_CENTER_TICK
+            explicit_center = True
             log.info(
                 "%s: found 'homing_offset' (%s) without 'center'; assuming homing_offset was written to servo EEPROM and using center=%d",
                 name,
@@ -449,6 +454,7 @@ def _parse_joint_calib(entry: dict, name: str) -> JointCalib:
             )
         else:
             center = DEFAULT_CENTER_TICK
+            defaulted = True
     else:
         try:
             center = int(entry["center"])
@@ -481,7 +487,13 @@ def _parse_joint_calib(entry: dict, name: str) -> JointCalib:
     else:
         sign = 1
 
-    return JointCalib(center=center, sign=sign, explicit_sign=explicit_sign, explicit_center=explicit_center)
+    return JointCalib(
+        center=center,
+        sign=sign,
+        explicit_sign=explicit_sign,
+        explicit_center=explicit_center,
+        defaulted=defaulted,
+    )
 
 
 class LeaderCalibration:
@@ -500,8 +512,10 @@ class LeaderCalibration:
         if len(set(self.servo_ids)) != 6 or any(not (1 <= s <= 253) for s in self.servo_ids):
             raise LeaderError(f"servo_ids must be 6 unique integers between 1 and 253, got {self.servo_ids}")
 
-        self.has_defaulted_joints = bool(has_defaulted_joints or joints is None)
-        self.joints = list(joints or [JointCalib() for _ in range(5)])
+        self.joints = list(joints or [JointCalib(defaulted=True) for _ in range(5)])
+        self.has_defaulted_joints = bool(
+            has_defaulted_joints or joints is None or any(getattr(j, "defaulted", False) for j in self.joints)
+        )
         if len(self.joints) != 5:
             raise LeaderError(f"joints must contain exactly 5 joint calibrations, got {len(self.joints)}")
         for i, j in enumerate(self.joints):
@@ -566,18 +580,26 @@ class LeaderCalibration:
             if len(d["joints"]) != 5:
                 raise LeaderError(f"'joints' list must contain exactly 5 joints, got {len(d['joints'])}")
             joints = [_parse_joint_calib(j, f"joint_{i + 1}") for i, j in enumerate(d["joints"])]
+            if any(getattr(j, "defaulted", False) for j in joints):
+                has_defaulted = True
         else:
             for i in range(5):
                 name = f"joint_{i + 1}"
                 alias = SO101_JOINT_ALIASES[i]
                 if name in d:
                     entry = d[name]
-                    joints.append(_parse_joint_calib(entry, name))
+                    j_cal = _parse_joint_calib(entry, name)
+                    joints.append(j_cal)
+                    if getattr(j_cal, "defaulted", False):
+                        has_defaulted = True
                 elif alias in d:
                     entry = d[alias]
-                    joints.append(_parse_joint_calib(entry, alias))
+                    j_cal = _parse_joint_calib(entry, alias)
+                    joints.append(j_cal)
+                    if getattr(j_cal, "defaulted", False):
+                        has_defaulted = True
                 else:
-                    joints.append(JointCalib())
+                    joints.append(JointCalib(defaulted=True))
                     has_defaulted = True
 
         grip_cfg = d.get("gripper") or {}
@@ -694,6 +716,7 @@ class LeaderTeleopBridge:
         schema: ObservationSchema,
         *,
         calib: LeaderCalibration | None = None,
+        follower: str | None = None,
         fps: int = DEFAULT_FPS,
         ramp_seconds: float = DEFAULT_RAMP_SECONDS,
         max_gap_rad: float = DEFAULT_MAX_GAP_RAD,
@@ -719,22 +742,17 @@ class LeaderTeleopBridge:
         self.allow_large_gap = allow_large_gap
         self.park_on_exit = park_on_exit
 
-        follower = None
-        client = getattr(session, "client", None)
-        if client is not None and hasattr(client, "get_safety_describe"):
-            try:
-                describe = client.get_safety_describe()
-                if isinstance(describe, dict):
-                    dev = describe.get("device")
-                    if isinstance(dev, dict):
-                        follower = dev.get("follower")
-            except Exception:
-                pass
-        if follower is None and (
-            type(session).__name__ in ("MagicMock", "Mock")
-            or (client is not None and type(client).__name__ in ("MagicMock", "Mock"))
-        ):
-            follower = "mock"
+        if follower is None:
+            client = getattr(session, "client", None)
+            if client is not None and hasattr(client, "get_safety_describe"):
+                try:
+                    describe = client.get_safety_describe()
+                    if isinstance(describe, dict):
+                        dev = describe.get("device")
+                        if isinstance(dev, dict):
+                            follower = dev.get("follower")
+                except Exception:
+                    pass
 
         if follower not in ("mock", "sim") and getattr(self.calib, "has_defaulted_joints", False):
             raise LeaderError(
@@ -749,6 +767,7 @@ class LeaderTeleopBridge:
                 sign=j.sign,
                 explicit_sign=getattr(j, "explicit_sign", False),
                 explicit_center=getattr(j, "explicit_center", False),
+                defaulted=getattr(j, "defaulted", False),
             )
             for j in self.calib.joints
         ]
@@ -776,7 +795,7 @@ class LeaderTeleopBridge:
                 else:
                     cal.sign = armd_sign
 
-                if not getattr(cal, "explicit_center", False):
+                if getattr(cal, "defaulted", False):
                     zs = fj.get("zero_step")
                     if isinstance(zs, int) and 0 <= zs <= 4095:
                         cal.center = zs
@@ -947,7 +966,7 @@ class LeaderTeleopBridge:
 
         base_steps = max(1, int(round(self.ramp_seconds * self.fps)))
         v_steps = math.ceil(1.875 * gap * self.fps / max_ramp_vel) if gap > 0 else 1
-        s_steps = math.ceil(1.875 * gap / 0.30) if gap > 0 else 1
+        s_steps = math.ceil(1.875 * gap / self.arm_lead) if gap > 0 else 1
         ramp_steps = max(base_steps, v_steps, s_steps, 1)
         log.info(
             "Alignment ramp planned: %d steps (%.2fs) for initial gap %.3f rad (max_ramp_vel=%.2f rad/s, fps=%g)",
@@ -982,7 +1001,7 @@ class LeaderTeleopBridge:
             leader_target = self.read_leader_target()
             post_gap = self._check_alignment_gap(leader_target, follower_start, stage="post-torque")
             v_steps_post = math.ceil(1.875 * post_gap * self.fps / max_ramp_vel) if post_gap > 0 else 1
-            s_steps_post = math.ceil(1.875 * post_gap / 0.30) if post_gap > 0 else 1
+            s_steps_post = math.ceil(1.875 * post_gap / self.arm_lead) if post_gap > 0 else 1
             safe_steps = max(ramp_steps, v_steps_post, s_steps_post, 1)
             if safe_steps != ramp_steps:
                 log.info(
@@ -1003,7 +1022,7 @@ class LeaderTeleopBridge:
         t0 = time.monotonic()
         prev_cmd = list(follower_start)
         prev_t = t0
-        v_cap = max(max_ramp_vel, min(0.6, max(0.5, gap / max(self.ramp_seconds, 1e-3))))
+        v_cap = max_ramp_vel
         for step in range(1, ramp_steps + 1):
             if self._stop:
                 break
@@ -1326,6 +1345,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             session,
             schema,
             calib=calib,
+            follower=follower,
             fps=args.fps,
             ramp_seconds=args.ramp_seconds,
             max_gap_rad=args.max_gap_rad,

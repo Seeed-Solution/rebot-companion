@@ -453,6 +453,7 @@ def test_leader_teleop_bridge_lifecycle_and_ramp():
     transport = MockLeaderTransport()
     bus = FeetechSerialBus(transport)
     mock_session = MagicMock()
+    mock_session.client.get_safety_describe.return_value = {"device": {"follower": "mock"}}
     mock_obs = MagicMock()
     # Follower starts at zero angles
     mock_obs.positions = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
@@ -520,6 +521,7 @@ def test_leader_bridge_rejects_missing_servos():
     # Missing servo 6
     bus.read_positions_sync.return_value = {1: 2048, 2: 2048, 3: 2048, 4: 2048, 5: 2048}
     mock_session = MagicMock()
+    mock_session.client.get_safety_describe.return_value = {"device": {"follower": "mock"}}
     schema = ObservationSchema.from_dict({
         "dof": 6,
         "arm_dof": 5,
@@ -555,6 +557,7 @@ def test_leader_bridge_arms_idle_follower_before_ramp():
     armed_obs.collision = None
 
     mock_session = MagicMock()
+    mock_session.client.get_safety_describe.return_value = {"device": {"follower": "mock"}}
     mock_session.wait_for_observation.side_effect = [idle_obs, armed_obs]
     mock_session.latest_observation.return_value = armed_obs
 
@@ -636,6 +639,7 @@ def test_posix_serial_custom_baud_darwin(monkeypatch):
 def test_leader_bridge_rejects_7dof_before_torque_or_servo():
     bus = MagicMock()
     mock_session = MagicMock()
+    mock_session.client.get_safety_describe.return_value = {"device": {"follower": "mock"}}
     mock_obs = MagicMock()
     mock_obs.is_stopped = False
     mock_obs.collision = None
@@ -1067,6 +1071,7 @@ def test_leader_bridge_preflight_failure_no_unload():
     bus = MagicMock()
     bus.read_positions_sync.return_value = {1: 2048, 2: 2048, 3: 2048, 4: 2048, 5: 2048, 6: 2048}
     mock_session = MagicMock()
+    mock_session.client.get_safety_describe.return_value = {"device": {"follower": "mock"}}
     mock_obs = MagicMock()
     mock_obs.positions = [1.0] * 6  # Gap > 0.5 rad
     mock_obs.safety_state = "Armed"
@@ -1103,6 +1108,7 @@ def test_leader_bridge_hard_gap_ceiling():
     bus = MagicMock()
     bus.read_positions_sync.return_value = {1: 2048, 2: 2048, 3: 2048, 4: 2048, 5: 2048, 6: 2048}
     mock_session = MagicMock()
+    mock_session.client.get_safety_describe.return_value = {"device": {"follower": "mock"}}
     mock_obs = MagicMock()
     mock_obs.positions = [3.5] * 6  # Gap > pi
     mock_obs.safety_state = "Armed"
@@ -1142,6 +1148,7 @@ def test_leader_bridge_hard_gap_ceiling():
 def test_leader_bridge_follower_fault_and_stale_telemetry():
     bus = MagicMock()
     mock_session = MagicMock()
+    mock_session.client.get_safety_describe.return_value = {"device": {"follower": "mock"}}
     schema = ObservationSchema.from_dict({
         "dof": 6,
         "arm_dof": 5,
@@ -1459,6 +1466,7 @@ def test_recorder_add_frame_strict_limit_validation(tmp_path: Path):
 def test_leader_teleop_exit_codes_and_fault_code_reporting():
     bus = MagicMock()
     session = MagicMock()
+    session.client.get_safety_describe.return_value = {"device": {"follower": "mock"}}
     schema = ObservationSchema.from_dict({
         "dof": 6,
         "arm_dof": 5,
@@ -1533,6 +1541,7 @@ def test_operator_present_enforces_max_gap_unless_allow_large_gap():
     bus = MagicMock()
     bus.read_positions_sync.return_value = {1: 2048, 2: 2048, 3: 2048, 4: 2048, 5: 2048, 6: 2048}
     mock_session = MagicMock()
+    mock_session.client.get_safety_describe.return_value = {"device": {"follower": "mock"}}
     mock_obs = MagicMock()
     mock_obs.positions = [0.8] * 6  # gap 0.8 rad: > max_gap_rad (0.5), < HARD_MAX_GAP_RAD (pi)
     mock_obs.safety_state = "Armed"
@@ -1601,6 +1610,7 @@ def test_leader_bridge_post_torque_gap_growth_fails_before_ramp():
     armed_obs.collision = None
 
     mock_session = MagicMock()
+    mock_session.client.get_safety_describe.return_value = {"device": {"follower": "mock"}}
     mock_session.wait_for_observation.side_effect = [idle_obs, armed_obs]
     mock_session.latest_observation.return_value = armed_obs
 
@@ -1923,6 +1933,7 @@ def test_leader_bridge_align_and_ramp_stop_preflight():
     bus = MagicMock()
     bus.read_positions_sync.return_value = {1: 2048, 2: 2048, 3: 2048, 4: 2048, 5: 2048, 6: 2048}
     mock_session = MagicMock()
+    mock_session.client.get_safety_describe.return_value = {"device": {"follower": "mock"}}
     idle_obs = MagicMock()
     idle_obs.positions = [0.0] * 6
     idle_obs.safety_state = "Idle"
@@ -1972,6 +1983,7 @@ def test_leader_bridge_quintic_ramp_step_limit_extended(monkeypatch):
     bus = MagicMock()
     bus.read_positions_sync.return_value = {1: 2048, 2: 2048, 3: 2048, 4: 2048, 5: 2048, 6: 2048}
     mock_session = MagicMock()
+    mock_session.client.get_safety_describe.return_value = {"device": {"follower": "mock"}}
     mock_session._frames = 0
     armed_obs = MagicMock()
     armed_obs.positions = [math.pi - 0.01] + [0.0] * 5
@@ -2233,6 +2245,7 @@ def test_leader_teleop_calibration_validation_and_aliases(tmp_path: Path):
 def test_leader_teleop_gripper_gap_exclusion_and_ramp_extension():
     bus = MagicMock()
     mock_session = MagicMock()
+    mock_session.client.get_safety_describe.return_value = {"device": {"follower": "mock"}}
     schema = ObservationSchema.from_dict({
         "dof": 6,
         "arm_dof": 5,
@@ -2273,6 +2286,7 @@ def test_leader_teleop_bounded_sync_fallback_and_stop_checks():
     bus.read_positions_sync = MagicMock(side_effect=fake_sync_read)
 
     mock_session = MagicMock()
+    mock_session.client.get_safety_describe.return_value = {"device": {"follower": "mock"}}
     schema = ObservationSchema.from_dict({
         "dof": 6,
         "arm_dof": 5,
@@ -2558,6 +2572,7 @@ def test_leader_teleop_calibration_hardening(tmp_path: Path):
     # 4. fps bounds in LeaderTeleopBridge: SERVO_MIN_RATE_HZ <= fps <= 100
     bus = MagicMock()
     session = MagicMock()
+    session.client.get_safety_describe.return_value = {"device": {"follower": "mock"}}
     sch = ObservationSchema.from_dict({
         "dof": 6, "arm_dof": 5, "gripper_joint": 5,
         "limits": [{"name": f"j{i}", "min_position": -3.0, "max_position": 3.0, "max_velocity": 1.0, "max_acceleration": 1.0} for i in range(6)],
@@ -2581,6 +2596,7 @@ def test_leader_bridge_velocity_bounded_ramp_and_settle():
     # Leader is at 0.6 rad on all joints
     bus.read_positions_sync.return_value = {1: 2439, 2: 2439, 3: 2439, 4: 2439, 5: 2439, 6: 2439}
     mock_session = MagicMock()
+    mock_session.client.get_safety_describe.return_value = {"device": {"follower": "mock"}}
     mock_obs = MagicMock()
     # Follower is at 0.0 rad: gap = 0.6 rad
     mock_obs.positions = [0.0] * 6
@@ -2751,6 +2767,7 @@ def test_leader_teleop_steady_state_lead_clamping_and_empty_commanded(caplog):
     # Leader is far at 1.5 rad on all joints
     bus.read_positions_sync.return_value = {1: 3025, 2: 3025, 3: 3025, 4: 3025, 5: 3025, 6: 2048}
     mock_session = MagicMock()
+    mock_session.client.get_safety_describe.return_value = {"device": {"follower": "mock"}}
     mock_obs = MagicMock()
     mock_obs.positions = [0.0] * 6
     # commanded_positions is empty list [] (falsy!)
@@ -2889,6 +2906,7 @@ def test_leader_teleop_moving_leader_ramp_slew_limit():
     bus.read_positions_sync.side_effect = read_sync
 
     mock_session = MagicMock()
+    mock_session.client.get_safety_describe.return_value = {"device": {"follower": "mock"}}
     mock_obs = MagicMock()
     mock_obs.positions = [0.0] * 6
     mock_obs.commanded_positions = [0.0] * 6
@@ -2932,6 +2950,7 @@ def test_leader_teleop_settle_phase_stop_before_servo():
 
     bus = MagicMock()
     mock_session = MagicMock()
+    mock_session.client.get_safety_describe.return_value = {"device": {"follower": "mock"}}
     mock_obs = MagicMock()
     mock_obs.positions = [0.0] * 6
     mock_obs.commanded_positions = [0.0] * 6
@@ -3118,6 +3137,53 @@ def test_deg_mode_loads_normalization_bounds_with_changed_gripper_bounds(tmp_pat
     obs_dict = runner._observation(obs)
     # gripper in deg mode maps [closed_rad, open_rad] -> [0, 100]
     assert obs_dict["observation.state"][5] == pytest.approx(100.0, abs=1e-3)
+
+
+def test_lerobot_homing_offset_preserves_center_over_feetech_zero_step():
+    """Real LeRobot JSON with homing_offset keeps cal.center == 2048 even when follower zero_step == 1850."""
+    bus = MagicMock()
+    calib_lerobot = LeaderCalibration.load({
+        "shoulder_pan": {"id": 1, "drive_mode": 0, "homing_offset": 55, "range_min": 1000, "range_max": 3000},
+        "shoulder_lift": {"id": 2, "drive_mode": 1, "homing_offset": -20, "range_min": 1100, "range_max": 2900},
+        "elbow_flex": {"id": 3, "drive_mode": 0, "homing_offset": 0, "range_min": 1200, "range_max": 2800},
+        "wrist_flex": {"id": 4, "drive_mode": 1, "homing_offset": 10, "range_min": 1300, "range_max": 2700},
+        "wrist_roll": {"id": 5, "drive_mode": 0, "homing_offset": 0, "range_min": 1400, "range_max": 2600},
+        "gripper": {"id": 6, "drive_mode": 0, "homing_offset": 0, "range_min": 1500, "range_max": 2500},
+    })
+    assert calib_lerobot.has_defaulted_joints is False
+    for j in calib_lerobot.joints:
+        assert j.center == 2048
+        assert j.explicit_center is True
+        assert getattr(j, "defaulted", False) is False
+
+    sch_dict = {
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "limits": [
+            {"name": f"j{i}", "min_position": -3.14, "max_position": 3.14, "max_velocity": 2.0, "max_acceleration": 5.0}
+            for i in range(6)
+        ],
+        "feetech_joints": [
+            {"drive_mode_invert": False, "zero_step": 1850},
+            {"drive_mode_invert": True, "zero_step": 1900},
+            {"drive_mode_invert": False, "zero_step": 2000},
+            {"drive_mode_invert": True, "zero_step": 2100},
+            {"drive_mode_invert": False, "zero_step": 2200},
+        ],
+    }
+    schema = ObservationSchema.from_dict(sch_dict)
+    mock_session = MagicMock()
+    mock_session.client.get_safety_describe.return_value = {"device": {"follower": "mock"}}
+
+    bridge = LeaderTeleopBridge(bus, mock_session, schema, calib=calib_lerobot)
+    # Even though follower feetech_joints has zero_step == 1850,
+    # joints were calibrated with homing_offset, so center MUST stay 2048!
+    for i in range(5):
+        assert bridge.calib.joints[i].center == 2048
+        assert bridge.calib.joints[i].explicit_center is True
+        assert getattr(bridge.calib.joints[i], "defaulted", False) is False
+
 
 
 
