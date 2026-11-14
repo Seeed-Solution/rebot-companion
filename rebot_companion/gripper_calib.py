@@ -177,9 +177,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     gripper_joint = schema.gripper_joint
     policy = schema.gripper_policy or {}
-    zero_check_supported = policy.get("zero_check_supported", True)
-    if schema.capabilities.get("gripper_zero") is False:
+    if policy.get("zero_check_supported") is False or schema.capabilities.get("gripper_zero") is False:
         zero_check_supported = False
+    else:
+        zero_check_supported = bool(
+            policy.get("zero_check_supported", False) or schema.capabilities.get("gripper_zero") is True
+        )
 
     try:
         calib = client.get_gripper_calibration()

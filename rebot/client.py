@@ -431,6 +431,7 @@ class ObservationSchema:
     gripper_joint: int | None = None
     orientation_dof: int | None = None
     gripper_policy: dict | None = None
+    feetech_joints: list[dict] | None = None
 
     @property
     def capabilities_version(self) -> int:
@@ -444,7 +445,10 @@ class ObservationSchema:
     def from_dict(cls, d: dict) -> ObservationSchema:
         dof = int(d["dof"])
         raw_arm_dof = d.get("arm_dof")
-        arm_dof = int(raw_arm_dof) if raw_arm_dof is not None else (6 if dof >= 6 else dof)
+        if raw_arm_dof is not None:
+            arm_dof = int(raw_arm_dof)
+        else:
+            arm_dof = 6 if dof == 7 else (dof if dof < 6 else None)
 
         raw_gripper_joint = d.get("gripper_joint")
         gripper_joint = int(raw_gripper_joint) if raw_gripper_joint is not None else (6 if dof == 7 else None)
@@ -453,10 +457,11 @@ class ObservationSchema:
         if raw_orientation_dof is not None:
             orientation_dof = int(raw_orientation_dof)
         else:
-            orientation_dof = 3 if arm_dof >= 6 else (2 if arm_dof == 5 else None)
+            orientation_dof = 3 if arm_dof == 6 else (2 if arm_dof == 5 else None)
 
         gripper_policy = dict(d["gripper_policy"]) if isinstance(d.get("gripper_policy"), dict) else None
         profile_id = str(d["profile_id"]) if d.get("profile_id") is not None else None
+        feetech_joints = list(d["feetech_joints"]) if isinstance(d.get("feetech_joints"), list) else None
 
         return cls(
             dof=dof,
@@ -473,6 +478,7 @@ class ObservationSchema:
             gripper_joint=gripper_joint,
             orientation_dof=orientation_dof,
             gripper_policy=gripper_policy,
+            feetech_joints=feetech_joints,
         )
 
 
@@ -508,8 +514,8 @@ class ArmdClient:
             transport=self._transport,
         )
 
-    def _get(self, path: str) -> Any:
-        res = self.request("GET", path)
+    def _get(self, path: str, timeout: float | None = None) -> Any:
+        res = self.request("GET", path, timeout=timeout)
         res.raise_for_status()
         return res.json()
 
@@ -553,9 +559,9 @@ class ArmdClient:
         """``GET /api/v1/observation`` (no lease required)."""
         return ArmStatus.from_dict(self._get("/api/v1/observation"))
 
-    def get_schema(self) -> ObservationSchema:
+    def get_schema(self, timeout: float | None = None) -> ObservationSchema:
         """``GET /api/v1/observation/schema`` (no lease required): DOF, joint names, limits, capabilities."""
-        return ObservationSchema.from_dict(self._get("/api/v1/observation/schema"))
+        return ObservationSchema.from_dict(self._get("/api/v1/observation/schema", timeout=timeout))
 
     def require(self, capability: str, what: str, schema: ObservationSchema | None = None) -> ObservationSchema:
         """Raise :class:`UnsupportedError` unless armd reports ``capability`` (capabilities version >= 6)."""
@@ -745,18 +751,18 @@ class ArmSession:
         self._threads = [reader]
         try:
             self.wait_for_observation(timeout=self.connect_timeout)
-            self._acquire_lease()
             if self._schema is None and self._gripper_joint is _GRIPPER_UNSET:
                 try:
-                    self.schema()
+                    self.schema(timeout=min(self.connect_timeout, 1.5))
                 except Exception:
                     pass
+            self._acquire_lease()
+            heartbeat = threading.Thread(target=self._heartbeat_loop, name="armd-heartbeat", daemon=True)
+            heartbeat.start()
+            self._threads.append(heartbeat)
         except BaseException:
             self._shutdown()
             raise
-        heartbeat = threading.Thread(target=self._heartbeat_loop, name="armd-heartbeat", daemon=True)
-        heartbeat.start()
-        self._threads.append(heartbeat)
         return self
 
     def close(self, release: bool = True) -> None:
@@ -905,13 +911,13 @@ class ArmSession:
                 raise ArmConnectionError(self._closed_reason)
             return self._obs
 
-    def schema(self) -> ObservationSchema:
+    def schema(self, timeout: float | None = None) -> ObservationSchema:
         if self._schema is None:
             now = time.monotonic()
             if self._last_schema_attempt is not None and now - self._last_schema_attempt < _SCHEMA_RETRY_COOLDOWN_S:
                 raise ArmConnectionError("schema fetch in cooldown after previous failure")
             try:
-                self._schema = self.client.get_schema()
+                self._schema = self.client.get_schema(timeout=timeout)
                 self._last_schema_attempt = None
             except Exception:
                 self._last_schema_attempt = time.monotonic()

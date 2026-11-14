@@ -118,6 +118,12 @@ def check_b601_compatibility(schema_or_profile: Any) -> None:
             raise ValueError(f"Local B601 kinematics cannot be used for arm with profile_id '{profile_id}'")
     if arm_dof is not None and arm_dof != 6:
         raise ValueError(f"Local B601 kinematics requires arm_dof=6, got {arm_dof}")
+    if profile_id is None and arm_dof is None:
+        dof = getattr(schema_or_profile, "dof", None)
+        if isinstance(schema_or_profile, dict):
+            dof = schema_or_profile.get("dof")
+        if dof is not None and dof != 7:
+            raise ValueError("Local B601 kinematics cannot be used for unlabeled non-7-DOF arm")
 
 
 def gripper_pose(

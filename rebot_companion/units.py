@@ -292,11 +292,13 @@ def load_lerobot_norm_bounds(
         raise ValueError(f"calibration file {p} must contain a JSON object, got {type(data).__name__}")
 
     joint_names = ("shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll")
-    model_joint_map = (
-        schema.model_joint_map
-        if schema is not None and hasattr(schema, "model_joint_map")
-        else (schema.get("model_joint_map") if isinstance(schema, dict) else None)
+    feetech_joints = (
+        getattr(schema, "feetech_joints", None)
+        if schema is not None
+        else None
     )
+    if feetech_joints is None and isinstance(schema, dict):
+        feetech_joints = schema.get("feetech_joints")
 
     limits: list[tuple[float, float]] = []
     for i, name in enumerate(joint_names):
@@ -315,30 +317,34 @@ def load_lerobot_norm_bounds(
         except (TypeError, ValueError) as exc:
             raise ValueError(f"{name}: invalid range_min/range_max in {entry}") from exc
 
+        if not (math.isfinite(range_min) and math.isfinite(range_max) and 0 <= range_min < range_max <= 4095):
+            raise ValueError(
+                f"{name}: tick bounds must satisfy 0 <= range_min < range_max <= 4095, got [{range_min}, {range_max}]"
+            )
+
         dm = entry.get("drive_mode", 0)
         drive_mode = bool(dm in (1, True, "1"))
-        sign = -1.0 if drive_mode else 1.0
-        center = float(entry.get("center", 2048))
 
         tick_neg100 = range_max if drive_mode else range_min
         tick_pos100 = range_min if drive_mode else range_max
 
-        raw_rad_neg100 = sign * (tick_neg100 - center) * (2.0 * math.pi / 4096.0)
-        raw_rad_pos100 = sign * (tick_pos100 - center) * (2.0 * math.pi / 4096.0)
-
-        if model_joint_map and i < len(model_joint_map):
-            m = model_joint_map[i]
-            if isinstance(m, dict):
-                m_sign = float(m.get("sign", 1.0))
-                m_off = float(m.get("offset_rad", 0.0))
-                rad_neg100 = m_sign * raw_rad_neg100 + m_off
-                rad_pos100 = m_sign * raw_rad_pos100 + m_off
-            else:
-                rad_neg100 = raw_rad_neg100
-                rad_pos100 = raw_rad_pos100
+        fj = (
+            feetech_joints[i]
+            if feetech_joints and i < len(feetech_joints) and isinstance(feetech_joints[i], dict)
+            else None
+        )
+        if fj is not None:
+            zero_step = float(fj.get("zero_step", 2048))
+            homing_applied = bool(fj.get("homing_applied_in_hw", False))
+            homing_offset = float(fj.get("homing_offset_steps", 0))
+            effective_zero = zero_step if homing_applied else zero_step + homing_offset
+            armd_sign = -1.0 if fj.get("drive_mode_invert") else 1.0
         else:
-            rad_neg100 = raw_rad_neg100
-            rad_pos100 = raw_rad_pos100
+            effective_zero = float(entry.get("zero_step", entry.get("center", 2048)))
+            armd_sign = 1.0
+
+        rad_neg100 = armd_sign * (tick_neg100 - effective_zero) * (2.0 * math.pi / 4096.0)
+        rad_pos100 = armd_sign * (tick_pos100 - effective_zero) * (2.0 * math.pi / 4096.0)
 
         limits.append((float(rad_neg100), float(rad_pos100)))
 
@@ -355,10 +361,13 @@ def load_lerobot_norm_bounds(
     except (TypeError, ValueError) as exc:
         raise ValueError(f"gripper: invalid range_min/range_max in {grip_entry}") from exc
 
+    if not (math.isfinite(g_min) and math.isfinite(g_max) and 0 <= g_min < g_max <= 4095):
+        raise ValueError(
+            f"gripper: tick bounds must satisfy 0 <= range_min < range_max <= 4095, got [{g_min}, {g_max}]"
+        )
+
     g_dm = grip_entry.get("drive_mode", 0)
     g_drive_mode = bool(g_dm in (1, True, "1"))
-    g_sign = -1.0 if g_drive_mode else 1.0
-    g_center = float(grip_entry.get("center", 2048))
 
     g_tick_closed = g_max if g_drive_mode else g_min
     g_tick_open = g_min if g_drive_mode else g_max
@@ -367,24 +376,34 @@ def load_lerobot_norm_bounds(
     if "open_tick" in grip_entry or "open" in grip_entry:
         g_tick_open = float(grip_entry.get("open_tick", grip_entry.get("open")))
 
-    raw_closed = g_sign * (g_tick_closed - g_center) * (2.0 * math.pi / 4096.0)
-    raw_open = g_sign * (g_tick_open - g_center) * (2.0 * math.pi / 4096.0)
+    if not (
+        math.isfinite(g_tick_closed)
+        and math.isfinite(g_tick_open)
+        and 0 <= g_tick_closed <= 4095
+        and 0 <= g_tick_open <= 4095
+        and g_tick_closed != g_tick_open
+    ):
+        raise ValueError(
+            f"gripper: tick bounds must satisfy 0 <= closed <= 4095, 0 <= open <= 4095 and closed != open, "
+            f"got closed={g_tick_closed}, open={g_tick_open}"
+        )
 
-    if model_joint_map and len(model_joint_map) > 5:
-        m = model_joint_map[5]
-        if isinstance(m, dict):
-            m_sign = float(m.get("sign", 1.0))
-            m_off = float(m.get("offset_rad", 0.0))
-            closed_rad = m_sign * raw_closed + m_off
-            open_rad = m_sign * raw_open + m_off
-        else:
-            closed_rad = raw_closed
-            open_rad = raw_open
+    fj_grip = (
+        feetech_joints[5]
+        if feetech_joints and len(feetech_joints) > 5 and isinstance(feetech_joints[5], dict)
+        else None
+    )
+    if fj_grip is not None:
+        g_zero_step = float(fj_grip.get("zero_step", 2048))
+        g_homing_applied = bool(fj_grip.get("homing_applied_in_hw", False))
+        g_homing_offset = float(fj_grip.get("homing_offset_steps", 0))
+        g_effective_zero = g_zero_step if g_homing_applied else g_zero_step + g_homing_offset
+        g_armd_sign = -1.0 if fj_grip.get("drive_mode_invert") else 1.0
     else:
-        closed_rad = raw_closed
-        open_rad = raw_open
+        g_effective_zero = float(grip_entry.get("zero_step", grip_entry.get("center", 2048)))
+        g_armd_sign = 1.0
 
-    closed_rad = float(closed_rad)
-    open_rad = float(open_rad)
+    closed_rad = float(g_armd_sign * (g_tick_closed - g_effective_zero) * (2.0 * math.pi / 4096.0))
+    open_rad = float(g_armd_sign * (g_tick_open - g_effective_zero) * (2.0 * math.pi / 4096.0))
     limits.append((closed_rad, open_rad))
     return limits, closed_rad, open_rad

@@ -430,6 +430,20 @@ class Arm:
         Closes the jaws until stall to measure the zero offset.
         Returns an ActionResult with stop_rad, offset_rad, and pass_ (or .passed).
         """
+        schema = getattr(self.session, "_schema", None)
+        if schema is None and hasattr(self.session, "schema"):
+            try:
+                schema = self.session.schema()
+            except Exception:
+                schema = None
+        if schema is not None:
+            caps = getattr(schema, "capabilities", None) or {}
+            policy = getattr(schema, "gripper_policy", None) or {}
+            if caps.get("gripper_zero") is False or policy.get("zero_check_supported") is False:
+                raise UnsupportedError(
+                    "gripper mechanical zero check is not supported on this arm",
+                    code="UNSUPPORTED",
+                )
         return self._motion(
             lambda: self.session.gripper_zero_check(
                 store_offset=store_offset,

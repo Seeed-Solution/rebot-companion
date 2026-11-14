@@ -1030,6 +1030,12 @@ class LeRobotRecorder:
             "arm_dof": self.arm_dof,
             "gripper_joint": self.gripper_joint,
         }
+        if self.limits:
+            info["normalization_bounds"] = {
+                "limits": [[float(l.min_position), float(l.max_position)] for l in self.limits],
+                "closed_rad": self.closed_rad,
+                "open_rad": self.open_rad,
+            }
         _write_json(meta / "info.json", info)
         _write_json(meta / "stats.json", _jsonable(aggregate_stats(self._stats)))
         pq.write_table(pa.Table.from_pylist(self._episodes), self.root / EPISODES_PATH)

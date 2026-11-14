@@ -781,6 +781,9 @@ class PolicyRunner:
         self._lerobot_limits: list[tuple[float, float]] | None = None
         self._lerobot_closed_rad: float | None = None
         self._lerobot_open_rad: float | None = None
+        self._recorded_limits: list[tuple[float, float]] | None = None
+        self._recorded_closed_rad: float | None = None
+        self._recorded_open_rad: float | None = None
         self.action_units = "rad"
         self.state_units = "rad"
         self.dof = len(JOINT_NAMES)
@@ -939,6 +942,15 @@ class PolicyRunner:
         )
 
         if self.lerobot_calib is not None:
+            if not (
+                self.dof == 6
+                and self.gripper_joint == 5
+                and (self.schema is None or self.schema.arm_dof in (None, 5))
+            ):
+                raise RunnerError(
+                    f"--lerobot-calib requires a 6-DOF arm with gripper_joint=5 (got dof={self.dof}, "
+                    f"gripper_joint={self.gripper_joint}, arm_dof={getattr(self.schema, 'arm_dof', None)})"
+                )
             l_limits, l_closed, l_open = units.load_lerobot_norm_bounds(self.lerobot_calib, schema=self.schema)
             self._lerobot_limits = l_limits
             self._lerobot_closed_rad = l_closed
@@ -1003,18 +1015,40 @@ class PolicyRunner:
         if (
             (self.action_units == "so101_norm" or self.state_units == "so101_norm")
             and self.lerobot_calib is None
-            and not (isinstance(policy_info, dict) and policy_info.get("rebot_unit_mode"))
         ):
-            log.warning(
-                "so101_norm is active without --lerobot-calib and without 'rebot_unit_mode' in metadata; "
-                "normalizing using armd schema joint limits (rebot-record convention). "
-                "If running an external LeRobot policy, pass --lerobot-calib <calib.json> to align motor ranges."
-            )
+            norm_b = policy_info.get("normalization_bounds") if isinstance(policy_info, dict) else None
+            if isinstance(norm_b, dict) and "limits" in norm_b:
+                rec_lims = norm_b["limits"]
+                if not isinstance(rec_lims, (list, tuple)) or len(rec_lims) != self.dof:
+                    raise RunnerError(
+                        f"normalization_bounds limits length ({len(rec_lims) if isinstance(rec_lims, (list, tuple)) else 'invalid'}) "
+                        f"does not match arm DOF ({self.dof})"
+                    )
+                self._recorded_limits = [(float(lim[0]), float(lim[1])) for lim in rec_lims]
+                if norm_b.get("closed_rad") is not None:
+                    self._recorded_closed_rad = float(norm_b["closed_rad"])
+                if norm_b.get("open_rad") is not None:
+                    self._recorded_open_rad = float(norm_b["open_rad"])
+            elif not (isinstance(policy_info, dict) and policy_info.get("rebot_unit_mode")):
+                log.warning(
+                    "so101_norm is active without --lerobot-calib and without 'rebot_unit_mode' in metadata; "
+                    "normalizing using armd schema joint limits (rebot-record convention). "
+                    "If running an external LeRobot policy, pass --lerobot-calib <calib.json> to align motor ranges."
+                )
 
     def _observation(self, obs: ArmStatus) -> dict[str, np.ndarray]:
-        limits = self._lerobot_limits if self._lerobot_limits is not None else self.limits
-        closed_rad = self._lerobot_closed_rad if self._lerobot_closed_rad is not None else self.closed_rad
-        open_rad = self._lerobot_open_rad if self._lerobot_open_rad is not None else self.open_rad
+        if self._lerobot_limits is not None:
+            limits = self._lerobot_limits
+            closed_rad = self._lerobot_closed_rad
+            open_rad = self._lerobot_open_rad
+        elif self._recorded_limits is not None:
+            limits = self._recorded_limits
+            closed_rad = self._recorded_closed_rad if self._recorded_closed_rad is not None else self.closed_rad
+            open_rad = self._recorded_open_rad if self._recorded_open_rad is not None else self.open_rad
+        else:
+            limits = self.limits
+            closed_rad = self.closed_rad
+            open_rad = self.open_rad
         positions = units.from_armd(
             obs.positions,
             self.state_units,
@@ -1193,7 +1227,8 @@ class PolicyRunner:
             if getattr(self.session, "_schema", None) is None:
                 if hasattr(self.session, "set_schema"):
                     self.session.set_schema(self.schema)
-                self.session._schema = self.schema
+                else:
+                    self.session._schema = self.schema
             try:
                 self._prepare()
                 t_start = time.monotonic()
@@ -1371,9 +1406,20 @@ class PolicyRunner:
                 self.request_stop("bad_action", f"policy returned {action.tolist()}")
                 break
             if self.action_units != "rad":
-                limits = self._lerobot_limits if self._lerobot_limits is not None else self.limits
-                closed_rad = self._lerobot_closed_rad if self._lerobot_closed_rad is not None else self.closed_rad
-                open_rad = self._lerobot_open_rad if self._lerobot_open_rad is not None else self.open_rad
+                if self._lerobot_limits is not None:
+                    limits = self._lerobot_limits
+                    closed_rad = self._lerobot_closed_rad
+                    open_rad = self._lerobot_open_rad
+                elif self._recorded_limits is not None:
+                    limits = self._recorded_limits
+                    closed_rad = (
+                        self._recorded_closed_rad if self._recorded_closed_rad is not None else self.closed_rad
+                    )
+                    open_rad = self._recorded_open_rad if self._recorded_open_rad is not None else self.open_rad
+                else:
+                    limits = self.limits
+                    closed_rad = self.closed_rad
+                    open_rad = self.open_rad
                 action_rad = units.to_armd(
                     action.tolist(),
                     self.action_units,

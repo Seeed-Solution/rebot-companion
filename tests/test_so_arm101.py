@@ -17,6 +17,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from rebot import (
+    Arm,
     ArmdClient,
     ArmObservation,
     ArmSession,
@@ -25,6 +26,7 @@ from rebot import (
     ObservationSchema,
     ServoJumpError,
     TcpPose,
+    UnsupportedError,
 )
 from rebot_companion.calibration import HandEyeResult, check_b601_compatibility, gripper_pose
 from rebot_companion.camera_client import MarkerDetection, ReCameraClient
@@ -127,9 +129,9 @@ def test_schema_fallback_when_fields_omitted():
 
     # Legacy armd with 6-DOF (dof=6, omitted fields):
     legacy_6 = ObservationSchema.from_dict({"dof": 6, "limits": []})
-    assert legacy_6.arm_dof == 6
+    assert legacy_6.arm_dof is None
     assert legacy_6.gripper_joint is None  # fallback for dof != 7 is None
-    assert legacy_6.orientation_dof == 3
+    assert legacy_6.orientation_dof is None
 
     # Legacy armd with 5-DOF (dof=5, omitted fields):
     legacy_5 = ObservationSchema.from_dict({"dof": 5, "limits": []})
@@ -664,3 +666,145 @@ def test_pipeline_fails_closed_when_get_schema_fails():
     res_ik = pipeline_ik.run_cycle()
     assert res_ik.success is False and res_ik.stage == "ik_solve"
     assert "schema network timeout" in res_ik.error_message
+
+
+def test_schema_fallback_unlabeled_6dof_fails_b601_compatibility():
+    # Legacy armd with 6-DOF (dof=6, omitted fields) yields arm_dof=None
+    sch = ObservationSchema.from_dict({"dof": 6, "limits": []})
+    assert sch.arm_dof is None
+    with pytest.raises(ValueError, match="Local B601 kinematics cannot be used for unlabeled non-7-DOF arm"):
+        check_b601_compatibility(sch)
+
+    # Dictionary with dof=6 and no profile_id/arm_dof also fails
+    with pytest.raises(ValueError, match="Local B601 kinematics cannot be used for unlabeled non-7-DOF arm"):
+        check_b601_compatibility({"dof": 6})
+
+    # Unlabeled 7-DOF arm is allowed
+    check_b601_compatibility({"dof": 7})
+
+
+def test_gripper_zero_check_raises_unsupported_on_so_arm101():
+    # 1. capabilities.gripper_zero is False
+    sch_disabled_zero = ObservationSchema.from_dict({
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "limits": [],
+        "capabilities": {"gripper_zero": False},
+    })
+    mock_session = MagicMock()
+    mock_session._schema = sch_disabled_zero
+    mock_session.schema.return_value = sch_disabled_zero
+
+    with patch.object(ArmdClient, "get_schema", return_value=sch_disabled_zero), patch.object(ArmSession, "open"):
+        arm = Arm(host="127.0.0.1", port=8765, enable=False)
+    arm.session = mock_session
+    with pytest.raises(UnsupportedError) as exc_info:
+        arm.gripper_zero_check()
+    assert exc_info.value.code == "UNSUPPORTED"
+    assert "gripper mechanical zero check is not supported" in str(exc_info.value)
+
+    # 2. gripper_policy zero_check_supported is False
+    sch_disabled_policy = ObservationSchema.from_dict({
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "limits": [],
+        "capabilities": {},
+        "gripper_policy": {"zero_check_supported": False},
+    })
+    mock_session._schema = sch_disabled_policy
+    with pytest.raises(UnsupportedError) as exc_info2:
+        arm.gripper_zero_check()
+    assert exc_info2.value.code == "UNSUPPORTED"
+
+
+def test_armsession_open_heartbeat_starts_immediately_after_acquire_lease():
+    import threading
+    import time
+    from unittest.mock import patch
+    import rebot._ws
+
+    client = MagicMock(spec=ArmdClient)
+    client.base_url = "http://127.0.0.1:8765"
+    session = ArmSession(client, connect_timeout=1.0)
+
+    events = []
+
+    def fake_wait_for_obs(timeout=None):
+        events.append("wait_for_observation")
+
+    def fake_schema(timeout=None):
+        events.append(f"schema(timeout={timeout})")
+        return MagicMock()
+
+    def fake_acquire_lease():
+        events.append("acquire_lease")
+
+    session.wait_for_observation = fake_wait_for_obs
+    session.schema = fake_schema
+    session._acquire_lease = fake_acquire_lease
+
+    with patch("rebot._ws.connect", return_value=MagicMock()):
+        with patch("threading.Thread") as mock_thread_cls:
+            created_threads = []
+
+            def make_thread(target=None, name=None, daemon=None):
+                t = MagicMock()
+                t.name = name
+                t.start.side_effect = lambda: events.append(f"start_{name}")
+                created_threads.append(t)
+                return t
+
+            mock_thread_cls.side_effect = make_thread
+
+            session.open()
+
+    # Pre-lease schema was fetched with bounded timeout <= 1.5s
+    assert "schema(timeout=1.0)" in events
+    # Heartbeat thread started immediately after acquire_lease
+    idx_lease = events.index("acquire_lease")
+    idx_hb = events.index("start_armd-heartbeat")
+    assert idx_lease < idx_hb
+    # Shutdown on error tears down threads
+    with patch.object(session, "_shutdown") as mock_shutdown:
+        session._ws = None  # force re-open
+        session._acquire_lease = MagicMock(side_effect=RuntimeError("lease failed"))
+        with patch("rebot._ws.connect", return_value=MagicMock()):
+            with pytest.raises(RuntimeError, match="lease failed"):
+                session.open()
+        mock_shutdown.assert_called_once()
+
+
+def test_mcp_server_auto_yaw_unsupported_when_explicitly_false():
+    mock_client = MagicMock()
+    mock_schema = ObservationSchema.from_dict({
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "orientation_dof": 2,
+        "capabilities": {"version": 6, "auto_yaw": False},
+        "limits": [
+            {"name": f"j{i}", "min_position": -3.14, "max_position": 3.14, "max_velocity": 2.0, "max_acceleration": 5.0}
+            for i in range(6)
+        ],
+    })
+    mock_client.get_schema.return_value = mock_schema
+
+    ctrl = Controller(mock_client, grabber=MagicMock(), detector=MagicMock())
+    mock_session = MagicMock()
+    mock_session.has_lease = True
+    mock_session.lease_lost = None
+    mock_session.closed_reason = None
+    ctrl.session = mock_session
+    mock_obs = MagicMock()
+    mock_obs.tcp = None
+    mock_obs.positions = [0.0] * 6
+    mock_obs.commanded_positions = None
+    mock_session.latest_observation.return_value = mock_obs
+
+    # yaw_deg is None on orient_dof == 2 with auto_yaw: False must raise ToolFail("UNSUPPORTED")
+    with pytest.raises(ToolFail) as exc_info:
+        ctrl.move_to(0.2, 0.0, 0.2, roll_deg=10.0, pitch_deg=20.0, yaw_deg=None, quat=None, speed_mps=None, timeout_s=None)
+    assert exc_info.value.code == "UNSUPPORTED"
+    assert "armd does not advertise auto_yaw capability" in exc_info.value.message

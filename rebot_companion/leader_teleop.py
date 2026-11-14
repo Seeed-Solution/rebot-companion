@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from rebot._http import host_url
-from rebot.client import ArmdClient, ArmSession, ObservationSchema
+from rebot.client import ArmdClient, ArmSession, ObservationSchema, SERVO_MIN_RATE_HZ
 from rebot.errors import ArmConnectionError, LeaseError, RebotError, ServoRejected
 from rebot_companion import units
 
@@ -231,7 +231,7 @@ class PosixSerialTransport(LeaderTransport):
         import termios
 
         try:
-            termios.tcflush(self.fd, termios.TCIOFLUSH)
+            termios.tcflush(self.fd, termios.TCIFLUSH)
         except Exception:
             pass
 
@@ -250,7 +250,7 @@ class PySerialTransport(LeaderTransport):
     def __init__(self, port: str, baud: int = DEFAULT_BAUD, timeout: float = 0.05) -> None:
         import serial
 
-        self.ser = serial.Serial(port, baudrate=baud, timeout=timeout)
+        self.ser = serial.Serial(port, baudrate=baud, timeout=timeout, write_timeout=0.1)
 
     def write(self, data: bytes) -> None:
         self.ser.write(data)
@@ -426,7 +426,7 @@ def _parse_joint_calib(entry: dict, name: str) -> JointCalib:
     if "center" not in entry:
         if "homing_offset" in entry:
             raise LeaderError(
-                f"{name}: raw EEPROM 'homing_offset' without 'center' tick cannot be calibrated; specify 'center'"
+                f"{name}: raw EEPROM 'homing_offset' without 'center' tick cannot be calibrated; specify 'center' (typically 2048 when homing_offset is written in servo EEPROM)"
             )
         center = DEFAULT_CENTER_TICK
     else:
@@ -434,6 +434,9 @@ def _parse_joint_calib(entry: dict, name: str) -> JointCalib:
             center = int(entry["center"])
         except (ValueError, TypeError) as exc:
             raise LeaderError(f"{name}: invalid 'center' tick {entry.get('center')!r}") from exc
+
+    if not (0 <= center <= 4095):
+        raise LeaderError(f"{name}: center tick must be in [0, 4095], got {center}")
 
     if "sign" in entry:
         try:
@@ -464,6 +467,7 @@ class LeaderCalibration:
         joints: Sequence[JointCalib] | None = None,
         gripper: GripperCalib | None = None,
         servo_ids: Sequence[int] = (1, 2, 3, 4, 5, 6),
+        has_defaulted_joints: bool = False,
     ) -> None:
         self.servo_ids = [int(s) for s in servo_ids]
         if len(self.servo_ids) != 6:
@@ -471,6 +475,7 @@ class LeaderCalibration:
         if len(set(self.servo_ids)) != 6 or any(not (1 <= s <= 253) for s in self.servo_ids):
             raise LeaderError(f"servo_ids must be 6 unique integers between 1 and 253, got {self.servo_ids}")
 
+        self.has_defaulted_joints = bool(has_defaulted_joints or joints is None)
         self.joints = list(joints or [JointCalib() for _ in range(5)])
         if len(self.joints) != 5:
             raise LeaderError(f"joints must contain exactly 5 joint calibrations, got {len(self.joints)}")
@@ -479,15 +484,21 @@ class LeaderCalibration:
                 raise LeaderError(f"joint {i + 1} must be a JointCalib instance, got {type(j)}")
             if j.sign not in (-1, 1):
                 raise LeaderError(f"joint {i + 1} sign must be -1 or 1, got {j.sign}")
-            if not (0 <= j.center < TICKS_PER_REV):
-                raise LeaderError(f"joint {i + 1} center must be in [0, {TICKS_PER_REV}), got {j.center}")
+            if not (0 <= j.center <= 4095):
+                raise LeaderError(f"joint {i + 1} center must be in [0, 4095], got {j.center}")
 
         self.gripper = gripper or GripperCalib()
+        if not (0 <= self.gripper.closed_tick <= 4095):
+            raise LeaderError(f"gripper closed_tick must be in [0, 4095], got {self.gripper.closed_tick}")
+        if not (0 <= self.gripper.open_tick <= 4095):
+            raise LeaderError(f"gripper open_tick must be in [0, 4095], got {self.gripper.open_tick}")
+        if self.gripper.closed_tick == self.gripper.open_tick:
+            raise LeaderError("gripper closed_tick and open_tick cannot be equal")
 
     @classmethod
     def load(cls, path_or_dict: str | Path | dict | None) -> LeaderCalibration:
         if path_or_dict is None:
-            return cls()
+            return cls(has_defaulted_joints=True)
         if isinstance(path_or_dict, dict):
             d = path_or_dict
         else:
@@ -506,6 +517,7 @@ class LeaderCalibration:
                     raise LeaderError(f"calibration file {p} is not valid JSON or YAML: {exc}") from exc
 
         joints: list[JointCalib] = []
+        has_defaulted = False
         SO101_JOINT_ALIASES = ("shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll")
         RECOGNIZED_TOP_KEYS = {
             "joints",
@@ -541,14 +553,52 @@ class LeaderCalibration:
                     joints.append(_parse_joint_calib(entry, alias))
                 else:
                     joints.append(JointCalib())
+                    has_defaulted = True
 
         grip_cfg = d.get("gripper") or {}
-        g_closed = int(grip_cfg.get("closed_tick", grip_cfg.get("closed", 2048)))
-        g_open = int(grip_cfg.get("open_tick", grip_cfg.get("open", 3072)))
+        g_closed = None
+        g_open = None
+        if "closed_tick" in grip_cfg or "closed" in grip_cfg:
+            try:
+                g_closed = int(grip_cfg.get("closed_tick", grip_cfg.get("closed")))
+            except (ValueError, TypeError) as exc:
+                raise LeaderError(f"invalid gripper closed_tick: {exc}") from exc
+        if "open_tick" in grip_cfg or "open" in grip_cfg:
+            try:
+                g_open = int(grip_cfg.get("open_tick", grip_cfg.get("open")))
+            except (ValueError, TypeError) as exc:
+                raise LeaderError(f"invalid gripper open_tick: {exc}") from exc
+        if g_closed is None or g_open is None:
+            # Support LeRobot gripper keys range_min / range_max (with optional drive_mode)
+            if "range_min" in grip_cfg and "range_max" in grip_cfg:
+                try:
+                    rmin = int(grip_cfg["range_min"])
+                    rmax = int(grip_cfg["range_max"])
+                except (ValueError, TypeError) as exc:
+                    raise LeaderError(f"invalid gripper range_min/range_max: {exc}") from exc
+                g_dm = grip_cfg.get("drive_mode", 0)
+                g_drive_mode = bool(g_dm in (1, True, "1"))
+                if g_closed is None:
+                    g_closed = rmax if g_drive_mode else rmin
+                if g_open is None:
+                    g_open = rmin if g_drive_mode else rmax
+            else:
+                if g_closed is None:
+                    g_closed = 2048
+                if g_open is None:
+                    g_open = 3072
+
+        if not (0 <= g_closed <= 4095) or not (0 <= g_open <= 4095) or g_closed == g_open:
+            raise LeaderError(
+                f"gripper closed_tick ({g_closed}) and open_tick ({g_open}) must be in 0..4095 and closed_tick != open_tick"
+            )
         gripper = GripperCalib(closed_tick=g_closed, open_tick=g_open)
 
         servo_ids = d.get("servo_ids") or (1, 2, 3, 4, 5, 6)
-        return cls(joints=joints, gripper=gripper, servo_ids=servo_ids)
+        inst = cls(joints=joints, gripper=gripper, servo_ids=servo_ids, has_defaulted_joints=has_defaulted)
+        return inst
+
+    from_file = load
 
     def ticks_to_rad(
         self,
@@ -614,8 +664,8 @@ class LeaderTeleopBridge:
         allow_large_gap: bool = False,
         park_on_exit: bool = True,
     ) -> None:
-        if not (isinstance(fps, (int, float)) and fps > 0):
-            raise LeaderError(f"fps must be positive, got {fps!r}")
+        if not (isinstance(fps, (int, float)) and math.isfinite(fps) and SERVO_MIN_RATE_HZ <= fps <= 100):
+            raise LeaderError(f"fps must be between {SERVO_MIN_RATE_HZ:g} and 100, got {fps!r}")
         if not (isinstance(max_gap_rad, (int, float)) and math.isfinite(max_gap_rad) and max_gap_rad > 0):
             raise LeaderError(f"max_gap_rad must be positive and finite, got {max_gap_rad!r}")
         if not (isinstance(ramp_seconds, (int, float)) and math.isfinite(ramp_seconds) and ramp_seconds >= 0.2):
@@ -631,6 +681,24 @@ class LeaderTeleopBridge:
         self.operator_present = operator_present
         self.allow_large_gap = allow_large_gap
         self.park_on_exit = park_on_exit
+
+        follower = None
+        client = getattr(session, "client", None)
+        if client is not None and hasattr(client, "get_safety_describe"):
+            try:
+                describe = client.get_safety_describe()
+                if isinstance(describe, dict):
+                    dev = describe.get("device")
+                    if isinstance(dev, dict):
+                        follower = dev.get("follower")
+            except Exception:
+                pass
+        if follower not in ("mock", "sim") and getattr(self.calib, "has_defaulted_joints", False):
+            log.warning(
+                "Leader teleop is using defaulted/uncalibrated joint settings on non-mock/sim follower %r; "
+                "movements may not match leader arm poses accurately",
+                follower or "hardware",
+            )
 
         self.limits: list[tuple[float, float]] = [
             (float(lim.min_position), float(lim.max_position)) for lim in schema.limits
@@ -683,23 +751,28 @@ class LeaderTeleopBridge:
 
         now = time.monotonic()
         ts = getattr(obs, "timestamp", None)
+        if not isinstance(ts, (int, float)):
+            ts = None
         frames = getattr(self.session, "_frames", None)
-        if self._last_obs_timestamp is None:
-            self._last_obs_timestamp = ts
-            self._last_obs_frames = frames
-            self._last_obs_time = now
-        elif (ts is not None and ts != self._last_obs_timestamp) or (
-            frames is not None and frames != self._last_obs_frames
-        ):
-            self._last_obs_timestamp = ts
-            self._last_obs_frames = frames
-            self._last_obs_time = now
-        else:
-            stale_threshold = max(0.5, 5.0 / self.fps)
-            if (now - self._last_obs_time) > stale_threshold:
-                raise LeaderError(
-                    f"follower telemetry is stale (unchanged for {now - self._last_obs_time:.2f}s > {stale_threshold:.2f}s)"
-                )
+        if not isinstance(frames, int):
+            frames = None
+        if ts is not None or frames is not None:
+            if self._last_obs_timestamp is None and self._last_obs_frames is None:
+                self._last_obs_timestamp = ts
+                self._last_obs_frames = frames
+                self._last_obs_time = now
+            elif (ts is not None and ts != self._last_obs_timestamp) or (
+                frames is not None and frames != self._last_obs_frames
+            ):
+                self._last_obs_timestamp = ts
+                self._last_obs_frames = frames
+                self._last_obs_time = now
+            else:
+                stale_threshold = max(0.5, 5.0 / self.fps)
+                if (now - self._last_obs_time) > stale_threshold:
+                    raise LeaderError(
+                        f"follower telemetry is stale (unchanged for {now - self._last_obs_time:.2f}s > {stale_threshold:.2f}s)"
+                    )
 
     def stop(self) -> None:
         self._stop = True
@@ -761,6 +834,8 @@ class LeaderTeleopBridge:
                 f"expected 6 DOF for SO-ARM101 (schema.dof={self.schema.dof}, "
                 f"schema.arm_dof={self.schema.arm_dof})"
             )
+        if len(self.limits) != 6:
+            raise LeaderError(f"expected 6 joint limits for SO-ARM101, got {len(self.limits)}")
 
         obs = self.session.wait_for_observation(timeout=5.0)
         self._check_follower_healthy(obs, require_torqued=False)
@@ -775,16 +850,28 @@ class LeaderTeleopBridge:
         leader_target = self.read_leader_target()
         gap = self._check_alignment_gap(leader_target, follower_start, stage="initial")
 
-        ramp_steps = max(1, int(round(self.ramp_seconds * self.fps)))
-        if ramp_steps > 0 and (1.875 * gap / ramp_steps) > 0.34:
-            safe_steps = max(ramp_steps, math.ceil(1.875 * gap / 0.34))
-            log.warning(
-                "Extending ramp from %d to %d steps (%.2fs) so quintic peak step stays within armd 0.35 rad servo limit",
-                ramp_steps,
-                safe_steps,
-                safe_steps / self.fps,
-            )
-            ramp_steps = safe_steps
+        v_maxes = [
+            float(lim.max_velocity)
+            for lim in self.schema.limits[:5]
+            if hasattr(lim, "max_velocity")
+            and math.isfinite(float(lim.max_velocity))
+            and float(lim.max_velocity) > 0
+        ]
+        min_v_max = min(v_maxes) if v_maxes else 0.6
+        max_ramp_vel = max(0.1, min(0.6, 0.8 * min_v_max))
+
+        base_steps = max(1, int(round(self.ramp_seconds * self.fps)))
+        v_steps = math.ceil(1.875 * gap * self.fps / max_ramp_vel) if gap > 0 else 1
+        s_steps = math.ceil(1.875 * gap / 0.30) if gap > 0 else 1
+        ramp_steps = max(base_steps, v_steps, s_steps, 1)
+        log.info(
+            "Alignment ramp planned: %d steps (%.2fs) for initial gap %.3f rad (max_ramp_vel=%.2f rad/s, fps=%g)",
+            ramp_steps,
+            ramp_steps / self.fps,
+            gap,
+            max_ramp_vel,
+            self.fps,
+        )
 
         if self._stop:
             return
@@ -809,10 +896,13 @@ class LeaderTeleopBridge:
             follower_start = list(obs.positions)
             leader_target = self.read_leader_target()
             post_gap = self._check_alignment_gap(leader_target, follower_start, stage="post-torque")
-            if ramp_steps > 0 and (1.875 * post_gap / ramp_steps) > 0.34:
-                safe_steps = max(ramp_steps, math.ceil(1.875 * post_gap / 0.34))
-                log.warning(
-                    "Extending ramp from %d to %d steps (%.2fs) so quintic peak step stays within armd 0.35 rad servo limit",
+            v_steps_post = math.ceil(1.875 * post_gap * self.fps / max_ramp_vel) if post_gap > 0 else 1
+            s_steps_post = math.ceil(1.875 * post_gap / 0.30) if post_gap > 0 else 1
+            safe_steps = max(ramp_steps, v_steps_post, s_steps_post, 1)
+            if safe_steps != ramp_steps:
+                log.info(
+                    "Re-sizing ramp steps for post-torque gap %.3f rad from %d to %d steps (%.2fs)",
+                    post_gap,
                     ramp_steps,
                     safe_steps,
                     safe_steps / self.fps,
@@ -832,6 +922,11 @@ class LeaderTeleopBridge:
             due = t0 + step * period
             cur_obs = self.session.latest_observation() or obs
             self._check_follower_healthy(cur_obs, require_torqued=True)
+            ref = (
+                cur_obs.commanded_positions
+                if getattr(cur_obs, "commanded_positions", None) is not None
+                else cur_obs.positions
+            )
             s = step / ramp_steps
             # Quintic polynomial: 10s^3 - 15s^4 + 6s^5 (smooth acceleration & deceleration)
             alpha = 10.0 * (s**3) - 15.0 * (s**4) + 6.0 * (s**5)
@@ -839,6 +934,9 @@ class LeaderTeleopBridge:
             if self._stop:
                 break
             interp = [(1.0 - alpha) * flw + alpha * ldr for flw, ldr in zip(follower_start, cur_leader)]
+            for j in range(min(len(interp), len(ref))):
+                if j != self.gripper_joint and j < 5:
+                    interp[j] = min(max(interp[j], ref[j] - 0.30), ref[j] + 0.30)
             self.session.servo(interp)
             self.frames_sent += 1
             now = time.monotonic()
@@ -846,6 +944,60 @@ class LeaderTeleopBridge:
                 time.sleep(due - now)
             if self._stop:
                 break
+
+        if not self._stop:
+            cur_obs = self.session.latest_observation() or obs
+            self._check_follower_healthy(cur_obs, require_torqued=True)
+            cur_follower = cur_obs.positions
+            cur_leader = self.read_leader_target()
+            arm_gap = max(
+                (abs(l - f) for i, (l, f) in enumerate(zip(cur_leader, cur_follower)) if i != self.gripper_joint),
+                default=0.0,
+            )
+            if arm_gap > 0.08:
+                settle_timeout = max(2.0, ramp_steps / self.fps)
+                settle_steps = int(math.ceil(settle_timeout * self.fps))
+                log.info(
+                    "Entering settle phase: arm_gap=%.3f rad > 0.08 rad (timeout=%.2fs, max %d steps)",
+                    arm_gap,
+                    settle_timeout,
+                    settle_steps,
+                )
+                t_settle_start = time.monotonic()
+                for step in range(1, settle_steps + 1):
+                    if self._stop:
+                        break
+                    due = t_settle_start + step * period
+                    cur_obs = self.session.latest_observation() or obs
+                    self._check_follower_healthy(cur_obs, require_torqued=True)
+                    cur_follower = cur_obs.positions
+                    ref = (
+                        cur_obs.commanded_positions
+                        if getattr(cur_obs, "commanded_positions", None) is not None
+                        else cur_follower
+                    )
+                    cur_leader = self.read_leader_target()
+                    arm_gap = max(
+                        (abs(l - f) for i, (l, f) in enumerate(zip(cur_leader, cur_follower)) if i != self.gripper_joint),
+                        default=0.0,
+                    )
+                    if arm_gap <= 0.08:
+                        log.info("Settle phase converged: arm_gap=%.3f rad <= 0.08 rad", arm_gap)
+                        break
+                    settle_cmd = list(cur_leader)
+                    for j in range(min(len(settle_cmd), len(ref))):
+                        if j != self.gripper_joint and j < 5:
+                            settle_cmd[j] = min(max(settle_cmd[j], ref[j] - 0.30), ref[j] + 0.30)
+                    self.session.servo(settle_cmd)
+                    self.frames_sent += 1
+                    now = time.monotonic()
+                    if due > now:
+                        time.sleep(due - now)
+                if arm_gap > 0.08:
+                    log.warning(
+                        "Settle phase finished with arm_gap=%.3f rad remaining (> 0.08 rad)",
+                        arm_gap,
+                    )
 
     def run(self) -> None:
         """Stream servo frames continuously at fps."""

@@ -13,7 +13,7 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 
-from rebot.client import ArmdClient, ArmSession, ArmStatus, JointLimit, ObservationSchema, _GRIPPER_UNSET
+from rebot.client import ArmdClient, ArmSession, ArmStatus, JointLimit, ObservationSchema, SERVO_MIN_RATE_HZ, _GRIPPER_UNSET
 from rebot_companion import units
 from rebot_companion.leader_teleop import (
     DEFAULT_WRIST_ROLL_LIMITS,
@@ -1559,6 +1559,7 @@ def test_operator_present_enforces_max_gap_unless_allow_large_gap():
     assert bridge1._activated is False
 
     # 2. allow_large_gap=True permits gap exceeding max_gap_rad up to pi
+    mock_session.servo.side_effect = lambda cmd: setattr(mock_obs, "positions", list(cmd))
     bridge2 = LeaderTeleopBridge(
         bus, mock_session, schema, fps=50, ramp_seconds=0.2, max_gap_rad=0.5, operator_present=False, allow_large_gap=True
     )
@@ -1858,6 +1859,7 @@ def test_sine_policy_schema_resolution():
     runner = PolicyRunner(client, parse_policy("sine:1:0.05:1"), max_seconds=0.01)
     mock_sess = MagicMock()
     mock_sess._schema = None
+    mock_sess.set_schema.side_effect = lambda s: setattr(mock_sess, "_schema", s)
     runner._loop = lambda: None
     runner._prepare = lambda: None
     with pytest.MonkeyPatch.context() as mp:
@@ -2269,7 +2271,7 @@ def test_units_load_lerobot_norm_bounds_and_roundtrip(tmp_path: Path):
     limits, closed_rad, open_rad = units.load_lerobot_norm_bounds(calib_json)
     assert len(limits) == 6
     assert limits[0][0] < limits[0][1]  # drive_mode 0: range_min < range_max
-    assert limits[1][0] < limits[1][1]  # tick_neg100 = 3072, tick_pos100 = 1024; sign = -1 -> rad_neg100 < rad_pos100
+    assert limits[1][0] > limits[1][1]  # tick_neg100 = 3072, tick_pos100 = 1024 -> rad_neg100 > rad_pos100 (not double-inverted)
 
     # Directional inverted motor test (where lo > hi)
     custom_limits = [(1.5, -1.5), (-1.5, 1.5), (0.0, 2.0), (0.0, 2.0), (0.0, 2.0), (0.0, 1.0)]
@@ -2387,5 +2389,305 @@ def test_mcp_fallback_schema_and_orientation_dof_guard():
     mock_session.latest_observation.return_value = obs
     with pytest.raises(ToolFail, match="observation schema unavailable; cannot determine arm orientation DOF"):
         ctrl.move_to(0.2, 0.0, 0.1, roll_deg=0.0, pitch_deg=45.0, yaw_deg=0.0, quat=None, speed_mps=None, timeout_s=None)
+
+
+def test_load_lerobot_norm_bounds_real_calib_motor_coords(tmp_path: Path):
+    calib_json = tmp_path / "lerobot_calib_real.json"
+    # Real LeRobot calib json with drive_mode=1 on shoulder_lift, no center (defaults to 2048)
+    calib_data = {
+        "shoulder_pan": {"range_min": 1024, "range_max": 3072, "drive_mode": 0},
+        "shoulder_lift": {"range_min": 1024, "range_max": 3072, "drive_mode": 1},
+        "elbow_flex": {"range_min": 1024, "range_max": 3072, "drive_mode": 0},
+        "wrist_flex": {"range_min": 1024, "range_max": 3072, "drive_mode": 0},
+        "wrist_roll": {"range_min": 1024, "range_max": 3072, "drive_mode": 0},
+        "gripper": {"range_min": 1500, "range_max": 2500, "drive_mode": 1},
+    }
+    calib_json.write_text(json.dumps(calib_data), encoding="utf-8")
+
+    # Schema with nonzero model_joint_map - MUST be ignored by load_lerobot_norm_bounds
+    schema_with_map = ObservationSchema.from_dict({
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "limits": [{"name": f"j{i}", "min_position": -3.0, "max_position": 3.0, "max_velocity": 1.0, "max_acceleration": 1.0} for i in range(6)],
+        "model_joint_map": [{"sign": -1.0, "offset_rad": 1.5707963} for _ in range(6)],
+    })
+
+    limits, closed_rad, open_rad = units.load_lerobot_norm_bounds(calib_json, schema=schema_with_map)
+    assert len(limits) == 6
+
+    # 1. Output is purely in armd motor coordinates (model_joint_map NOT applied)
+    # shoulder_pan: tick_neg100 = 1024, tick_pos100 = 3072
+    expected_pan_neg = (1024 - 2048) * (2 * math.pi / 4096)  # -pi/2
+    expected_pan_pos = (3072 - 2048) * (2 * math.pi / 4096)  # +pi/2
+    assert math.isclose(limits[0][0], expected_pan_neg, rel_tol=1e-5)
+    assert math.isclose(limits[0][1], expected_pan_pos, rel_tol=1e-5)
+
+    # 2. LeRobot drive_mode=1 is NOT double-inverted
+    # shoulder_lift drive_mode=1 -> tick_neg100 = range_max = 3072, tick_pos100 = range_min = 1024
+    expected_lift_neg = (3072 - 2048) * (2 * math.pi / 4096)  # +pi/2
+    expected_lift_pos = (1024 - 2048) * (2 * math.pi / 4096)  # -pi/2
+    assert math.isclose(limits[1][0], expected_lift_neg, rel_tol=1e-5)
+    assert math.isclose(limits[1][1], expected_lift_pos, rel_tol=1e-5)
+    assert limits[1][0] > limits[1][1]  # positive to negative, NOT double inverted!
+
+    # 3. Gripper drive_mode=1: closed=range_max (2500), open=range_min (1500)
+    expected_g_closed = (2500 - 2048) * (2 * math.pi / 4096)
+    expected_g_open = (1500 - 2048) * (2 * math.pi / 4096)
+    assert math.isclose(closed_rad, expected_g_closed, rel_tol=1e-5)
+    assert math.isclose(open_rad, expected_g_open, rel_tol=1e-5)
+    assert closed_rad > open_rad
+
+    # 4. Schema with feetech_joints applies armd motor conventions
+    schema_feetech = ObservationSchema.from_dict({
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "limits": [{"name": f"j{i}", "min_position": -3.0, "max_position": 3.0, "max_velocity": 1.0, "max_acceleration": 1.0} for i in range(6)],
+        "feetech_joints": [
+            {"zero_step": 2048, "homing_applied_in_hw": False, "homing_offset_steps": 100, "drive_mode_invert": True},
+            *([{"zero_step": 2048, "homing_applied_in_hw": True, "homing_offset_steps": 0, "drive_mode_invert": False}] * 5),
+        ],
+    })
+    limits_ft, _, _ = units.load_lerobot_norm_bounds(calib_json, schema=schema_feetech)
+    # effective_zero = 2048 + 100 = 2148, armd_sign = -1.0
+    expected_ft_neg = -1.0 * (1024 - 2148) * (2 * math.pi / 4096)
+    expected_ft_pos = -1.0 * (3072 - 2148) * (2 * math.pi / 4096)
+    assert math.isclose(limits_ft[0][0], expected_ft_neg, rel_tol=1e-5)
+    assert math.isclose(limits_ft[0][1], expected_ft_pos, rel_tol=1e-5)
+
+    # 5. Invalid tick bounds validation
+    bad_calib = dict(calib_data)
+    bad_calib["shoulder_pan"] = {"range_min": 3000, "range_max": 2000}  # min >= max
+    calib_json.write_text(json.dumps(bad_calib), encoding="utf-8")
+    with pytest.raises(ValueError, match="tick bounds must satisfy"):
+        units.load_lerobot_norm_bounds(calib_json)
+
+    bad_calib2 = dict(calib_data)
+    bad_calib2["shoulder_pan"] = {"range_min": -10, "range_max": 2000}  # < 0
+    calib_json.write_text(json.dumps(bad_calib2), encoding="utf-8")
+    with pytest.raises(ValueError, match="tick bounds must satisfy"):
+        units.load_lerobot_norm_bounds(calib_json)
+
+    bad_grip = dict(calib_data)
+    bad_grip["gripper"] = {"range_min": 2000, "range_max": 2000}  # closed == open
+    calib_json.write_text(json.dumps(bad_grip), encoding="utf-8")
+    with pytest.raises(ValueError, match="gripper: tick bounds must satisfy"):
+        units.load_lerobot_norm_bounds(calib_json)
+
+
+def test_leader_teleop_calibration_hardening(tmp_path: Path):
+    # 1. Gripper range_min / range_max support with drive_mode=1
+    calib_d = {
+        "joint_1": {"center": 2048, "sign": 1},
+        "joint_2": {"center": 2048, "sign": 1},
+        "joint_3": {"center": 2048, "sign": 1},
+        "joint_4": {"center": 2048, "sign": 1},
+        "joint_5": {"center": 2048, "sign": 1},
+        "gripper": {"range_min": 1200, "range_max": 2800, "drive_mode": 1},
+    }
+    c_file = tmp_path / "leader_calib.json"
+    c_file.write_text(json.dumps(calib_d), encoding="utf-8")
+    cal = LeaderCalibration.from_file(c_file)
+    assert cal.gripper.closed_tick == 2800  # drive_mode 1 -> closed = max
+    assert cal.gripper.open_tick == 1200
+
+    # 2. Out-of-bounds center or gripper tick raises LeaderError
+    with pytest.raises(LeaderError, match="center tick must be in"):
+        LeaderCalibration.load({"joint_1": {"center": 5000}})
+    with pytest.raises(LeaderError, match="gripper closed_tick .* must be in 0..4095"):
+        LeaderCalibration.load({"joint_1": {"center": 2048}, "gripper": {"closed_tick": 5000, "open_tick": 2048}})
+    with pytest.raises(LeaderError, match="gripper closed_tick .* must be in 0..4095 and closed_tick != open_tick"):
+        LeaderCalibration.load({"joint_1": {"center": 2048}, "gripper": {"closed_tick": 2048, "open_tick": 2048}})
+
+    # 3. homing_offset without center has improved error message
+    with pytest.raises(LeaderError, match="specify 'center' \\(typically 2048 when homing_offset is written in servo EEPROM\\)"):
+        LeaderCalibration.load({"joint_1": {"homing_offset": 50}})
+
+    # 4. fps bounds in LeaderTeleopBridge: SERVO_MIN_RATE_HZ <= fps <= 100
+    bus = MagicMock()
+    session = MagicMock()
+    sch = ObservationSchema.from_dict({
+        "dof": 6, "arm_dof": 5, "gripper_joint": 5,
+        "limits": [{"name": f"j{i}", "min_position": -3.0, "max_position": 3.0, "max_velocity": 1.0, "max_acceleration": 1.0} for i in range(6)],
+    })
+    with pytest.raises(LeaderError, match="fps must be between 10 and 100"):
+        LeaderTeleopBridge(bus, session, sch, fps=5)
+    with pytest.raises(LeaderError, match="fps must be between 10 and 100"):
+        LeaderTeleopBridge(bus, session, sch, fps=120)
+
+    # 5. len(self.limits) != 6 in align_and_ramp raises LeaderError
+    bridge_bad_lim = LeaderTeleopBridge(bus, session, sch, fps=50)
+    bridge_bad_lim.limits = [(-3.0, 3.0)] * 5  # only 5 limits
+    with pytest.raises(LeaderError, match="expected 6 joint limits for SO-ARM101"):
+        bridge_bad_lim.align_and_ramp()
+
+
+def test_leader_bridge_velocity_bounded_ramp_and_settle():
+    from unittest.mock import patch
+
+    bus = MagicMock()
+    # Leader is at 0.6 rad on all joints
+    bus.read_positions_sync.return_value = {1: 2439, 2: 2439, 3: 2439, 4: 2439, 5: 2439, 6: 2439}
+    mock_session = MagicMock()
+    mock_obs = MagicMock()
+    # Follower is at 0.0 rad: gap = 0.6 rad
+    mock_obs.positions = [0.0] * 6
+    mock_obs.commanded_positions = [0.0] * 6
+    mock_obs.safety_state = "Armed"
+    mock_obs.is_stopped = False
+    mock_obs.is_torqued = True
+    mock_obs.is_operational = True
+    mock_obs.collision = None
+    mock_session.wait_for_observation.return_value = mock_obs
+    mock_session.latest_observation.return_value = mock_obs
+
+    # Joint limits with max_velocity = 0.5 rad/s -> max_ramp_vel = min(0.6, 0.8 * 0.5) = 0.4 rad/s
+    schema = ObservationSchema.from_dict({
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "limits": [
+            {"name": f"j{i}", "min_position": -3.14, "max_position": 3.14, "max_velocity": 0.5, "max_acceleration": 5.0}
+            for i in range(6)
+        ],
+    })
+
+    sent_frames = []
+
+    def mock_servo(cmd):
+        sent_frames.append(list(cmd))
+        # follower lags: only advances by up to 0.05 rad per step toward cmd
+        new_pos = []
+        for cur, target in zip(mock_obs.positions, cmd):
+            delta = target - cur
+            step = math.copysign(min(abs(delta), 0.05), delta)
+            new_pos.append(cur + step)
+        mock_obs.positions = new_pos
+        mock_obs.commanded_positions = list(cmd)
+
+    mock_session.servo.side_effect = mock_servo
+
+    bridge = LeaderTeleopBridge(
+        bus, mock_session, schema, fps=50, ramp_seconds=0.2, max_gap_rad=1.0, allow_large_gap=True
+    )
+    with patch("time.sleep", return_value=None):
+        bridge.align_and_ramp()
+
+    assert bridge._activated is True
+    assert len(sent_frames) > 0
+    # Verify every frame step delta was bounded <= 0.30 rad (< 0.35 rad armd cap)
+    for i in range(1, len(sent_frames)):
+        for j in range(5):
+            delta = abs(sent_frames[i][j] - sent_frames[i - 1][j])
+            assert delta <= 0.3001, f"Frame {i} joint {j} jumped {delta:.4f} > 0.30 rad"
+
+    # Verify converged to leader target (gap <= 0.08 rad)
+    final_gap = max(abs(l - f) for l, f in zip(bridge.read_leader_target()[:5], mock_obs.positions[:5]))
+    assert final_gap <= 0.0801
+
+
+def test_normalized_recording_replay_regression_with_changed_arm_limits(tmp_path: Path):
+    from unittest.mock import patch
+
+    rec_root = tmp_path / "rec_norm_bounds"
+    # Create recorder with initial limits [-3.0, 3.0]
+    initial_limits = [
+        JointLimit(name=f"j{i}", min_position=-3.0, max_position=3.0, max_velocity=2.0, max_acceleration=5.0)
+        for i in range(6)
+    ]
+    recorder = LeRobotRecorder(
+        rec_root, "test/repo", unit_mode="so101_norm", fps=10, armd_host=None, camera_url=None
+    )
+    recorder.limits = initial_limits
+    recorder.closed_rad = 0.0
+    recorder.open_rad = 1.5
+    recorder.profile_id = "so-arm101"
+    recorder.arm_dof = 5
+    recorder.gripper_joint = 5
+
+    # Simulate saving episode and meta info
+    meta = rec_root / "meta"
+    meta.mkdir(parents=True, exist_ok=True)
+    summary = MagicMock()
+    summary.to_dict.return_value = {"episodes": 1}
+    recorder._episodes = [{"episode_index": 0, "dataset_to_index": 10}]
+    recorder._tasks = {}
+    recorder._stats = [{"action": {"min": np.zeros(6), "max": np.ones(6), "mean": np.zeros(6), "std": np.ones(6)}}]
+    with patch("pyarrow.parquet.write_table"), patch("rebot_companion.lerobot_recorder.aggregate_stats", return_value={}):
+        recorder._write_meta(summary)
+
+    # Check normalization_bounds persisted in info.json
+    info = json.loads((meta / "info.json").read_text(encoding="utf-8"))
+    assert "normalization_bounds" in info
+    assert info["normalization_bounds"]["limits"] == [[-3.0, 3.0]] * 6
+    assert info["normalization_bounds"]["closed_rad"] == 0.0
+    assert info["normalization_bounds"]["open_rad"] == 1.5
+
+    # Now run PolicyRunner against an arm with CHANGED/narrowed live limits [-2.0, 2.0]
+    narrowed_limits = [
+        {"name": f"j{i}", "min_position": -2.0, "max_position": 2.0, "max_velocity": 2.0, "max_acceleration": 5.0}
+        for i in range(6)
+    ]
+    mock_client = MagicMock()
+    mock_client.request.return_value.json.return_value = {
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "joint_names": [f"j{i}" for i in range(6)],
+        "limits": narrowed_limits,
+        "profile_id": "so-arm101",
+    }
+    mock_client.request.return_value.raise_for_status = lambda: None
+    mock_client.get_safety_describe.return_value = {"device": {"follower": "mock"}}
+
+    policy = MagicMock()
+    policy.info = info
+    policy.action_dim = 6
+    policy.inputs = ("observation.state",)
+    policy.image_key = None
+
+    runner = PolicyRunner(
+        mock_client,
+        policy,
+        camera=None,
+        action_units="so101_norm",
+        state_units="so101_norm",
+        fps=10,
+    )
+    runner._read_arm()
+    # PolicyRunner loaded recorded normalization_bounds
+    assert runner._recorded_limits == [(-3.0, 3.0)] * 6
+    assert runner._recorded_closed_rad == 0.0
+    assert runner._recorded_open_rad == 1.5
+    # Live limits are the narrowed limits
+    assert runner.limits == [(-2.0, 2.0)] * 6
+
+    # Normalization from_armd uses recorded limits
+    obs = ArmStatus(
+        timestamp=1.0,
+        positions=[0.0] * 6,
+        velocities=[0.0] * 6,
+        torques=[0.0] * 6,
+        temperatures=[25.0] * 6,
+        is_torqued=True,
+        safety_state="Armed",
+        epoch_id=1,
+    )
+    inp = runner._observation(obs)
+    assert len(inp["observation.state"]) == 6
+
+    # Mismatched limits length in normalization_bounds raises RunnerError
+    bad_info = dict(info)
+    bad_info["normalization_bounds"] = {"limits": [[-3.0, 3.0]] * 5}  # 5 instead of 6
+    bad_policy = MagicMock()
+    bad_policy.info = bad_info
+    bad_policy.action_dim = 6
+    bad_policy.inputs = ("observation.state",)
+    bad_policy.image_key = None
+
+    bad_runner = PolicyRunner(mock_client, bad_policy, camera=None, action_units="so101_norm", state_units="so101_norm", fps=10)
+    with pytest.raises(RunnerError, match="normalization_bounds limits length .* does not match arm DOF"):
+        bad_runner._read_arm()
 
 

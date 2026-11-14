@@ -320,23 +320,27 @@ class Controller:
         self._last_schema_attempt: float | None = None
         self._cached_fallback_schema: ObservationSchema | None = None
 
+    def _build_fallback_schema(self) -> ObservationSchema:
+        obs = self.observation()
+        dof = len(obs.positions) if obs and hasattr(obs, "positions") and obs.positions else 7
+        return ObservationSchema(
+            dof=dof,
+            joint_names=[],
+            limits=[],
+            fields=[],
+            capabilities={},
+            arm_dof=6 if dof == 7 else None,
+            gripper_joint=6 if dof == 7 else None,
+            orientation_dof=3 if dof == 7 else None,
+        )
+
     def schema(self) -> ObservationSchema:
         if self._schema is None:
             now = time.monotonic()
             if self._last_schema_attempt is not None and now - self._last_schema_attempt < _SCHEMA_RETRY_COOLDOWN_S:
                 if self._cached_fallback_schema is not None:
                     return self._cached_fallback_schema
-                dof = len(self.observation().positions) if self.observation() else 7
-                self._cached_fallback_schema = ObservationSchema(
-                    dof=dof,
-                    joint_names=[],
-                    limits=[],
-                    fields=[],
-                    capabilities={},
-                    arm_dof=6 if dof == 7 else None,
-                    gripper_joint=6 if dof == 7 else None,
-                    orientation_dof=3 if dof == 7 else None,
-                )
+                self._cached_fallback_schema = self._build_fallback_schema()
                 self._schema_is_fallback = True
                 return self._cached_fallback_schema
             try:
@@ -347,17 +351,7 @@ class Controller:
             except Exception as exc:
                 self._last_schema_attempt = time.monotonic()
                 log.warning("observation schema unavailable: %s", exc)
-                dof = len(self.observation().positions) if self.observation() else 7
-                self._cached_fallback_schema = ObservationSchema(
-                    dof=dof,
-                    joint_names=[],
-                    limits=[],
-                    fields=[],
-                    capabilities={},
-                    arm_dof=6 if dof == 7 else None,
-                    gripper_joint=6 if dof == 7 else None,
-                    orientation_dof=3 if dof == 7 else None,
-                )
+                self._cached_fallback_schema = self._build_fallback_schema()
                 self._schema_is_fallback = True
                 return self._cached_fallback_schema
         return self._schema
@@ -628,6 +622,9 @@ class Controller:
             if orient_dof == 2:
                 # 2-DOF orientation arm: pitch/roll controllable, yaw is coupled
                 if yaw_deg is None:
+                    caps = sch.capabilities or {}
+                    if caps.get("auto_yaw") is False:
+                        raise ToolFail("UNSUPPORTED", "armd does not advertise auto_yaw capability")
                     if roll_deg is None or pitch_deg is None:
                         if cur_rpy is None:
                             raise ToolFail(
