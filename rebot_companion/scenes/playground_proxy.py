@@ -149,6 +149,14 @@ class PlaygroundProxyServer:
                 headers[key.lower()] = val
                 header_list.append((key, val))
 
+            # The upstream gets armd's own origin below, so armd's same-origin check no longer
+            # sees the browser's: apply it here (Origin must match this proxy's Host).
+            origin = headers.get("origin")
+            if origin is not None and origin != f"http://{headers.get('host', '')}":
+                _send_response(writer, 403, "Forbidden", b"Cross-origin request refused")
+                writer.close()
+                return
+
             # 1. WebSocket upgrade check
             is_ws = headers.get("upgrade", "").lower() == "websocket"
             if is_ws:

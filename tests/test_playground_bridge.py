@@ -13,6 +13,7 @@ import ast
 import asyncio
 import json
 import socket
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -506,18 +507,26 @@ async def test_playground_proxy_http_origin_rewrite():
     async with proxy:
         proxy_port = proxy.port
 
-        def post_api() -> tuple[int, bytes]:
+        def post_api(origin: str) -> tuple[int, bytes]:
             payload = json.dumps({"test": 123}).encode("utf-8")
             req = urllib.request.Request(
                 f"http://127.0.0.1:{proxy_port}/api/v1/action/move_to",
                 data=payload,
-                headers={"Content-Type": "application/json", "Origin": "http://rogue-origin.com"},
+                headers={"Content-Type": "application/json", "Origin": origin},
                 method="POST",
             )
-            with urllib.request.urlopen(req, timeout=3.0) as resp:
-                return resp.status, resp.read()
+            try:
+                with urllib.request.urlopen(req, timeout=3.0) as resp:
+                    return resp.status, resp.read()
+            except urllib.error.HTTPError as e:
+                return e.code, e.read()
 
-        status, body = await asyncio.to_thread(post_api)
+        # another site's page is refused before it reaches armd
+        status, _ = await asyncio.to_thread(post_api, "http://rogue-origin.com")
+        assert status == 403
+        assert received_requests == []
+
+        status, body = await asyncio.to_thread(post_api, f"http://127.0.0.1:{proxy_port}")
         assert status == 200
         assert b'"ok": true' in body
 
@@ -552,7 +561,10 @@ async def test_playground_proxy_websocket_relay():
         proxy_port = proxy.port
         uri = f"ws://127.0.0.1:{proxy_port}/api/v1/ws"
 
-        async with websockets.asyncio.client.connect(uri, origin="http://browser.local") as client_ws:
+        with pytest.raises(websockets.exceptions.InvalidStatus):
+            async with websockets.asyncio.client.connect(uri, origin="http://browser.local"):
+                pass
+        async with websockets.asyncio.client.connect(uri, origin=f"http://127.0.0.1:{proxy_port}") as client_ws:
             await client_ws.send('{"type": "acquire_lease", "seq": 1}')
             reply = await client_ws.recv()
             assert reply == 'echo:{"type": "acquire_lease", "seq": 1}'
