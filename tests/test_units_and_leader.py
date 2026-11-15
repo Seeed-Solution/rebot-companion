@@ -4649,6 +4649,22 @@ def test_measured_ref_numpy_arrays_and_commanded():
     obs.positions = None
     obs.commanded_positions = []
     assert _measured_ref(obs) == []
+    obs.commanded_positions = None
+    assert _measured_ref(obs) == []
+
+
+def test_measured_ref_none_commanded_positions_and_telemetry_validation():
+    from types import SimpleNamespace
+    from rebot_companion.leader_teleop import _measured_ref, _validate_telemetry_ref, LeaderError
+
+    obs_none = SimpleNamespace(positions=None, commanded_positions=None)
+    assert _measured_ref(obs_none) == []
+    with pytest.raises(LeaderError, match="follower reference positions must have length 6"):
+        _validate_telemetry_ref(_measured_ref(obs_none))
+
+    obs_commanded = SimpleNamespace(positions=[], commanded_positions=[0.1] * 6)
+    assert _measured_ref(obs_commanded) == [0.1] * 6
+    assert _validate_telemetry_ref(_measured_ref(obs_commanded)) == [0.1] * 6
 
 
 def test_leader_teleop_disjoint_intervals_fail_closed():

@@ -827,7 +827,8 @@ def _measured_ref(obs: Any) -> list[Any]:
     commanded = getattr(obs, "commanded_positions", None)
     if commanded is not None and len(commanded) > 0:
         log.warning("leader teleop: obs.positions missing; falling back to commanded_positions as reference")
-    return list(commanded)
+        return list(commanded)
+    return []
 
 
 def _validate_telemetry_ref(ref: Any) -> list[float]:
