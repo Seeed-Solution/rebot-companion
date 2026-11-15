@@ -63,6 +63,7 @@ import signal
 import sys
 import threading
 import time
+import urllib.request
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1338,15 +1339,18 @@ class PolicyRunner:
                     "If running an external LeRobot policy, pass --lerobot-calib <calib.json> to align motor ranges."
                 )
 
-    def _observation(self, obs: ArmStatus) -> dict[str, np.ndarray]:
+    def _unit_bounds(self) -> tuple[Any, Any, Any]:
+        """``(limits, closed_rad, open_rad)`` for unit conversion: LeRobot calib, else recorded, else schema."""
         if self._lerobot_limits is not None:
-            limits = self._lerobot_limits
-            closed_rad = self._lerobot_closed_rad
-            open_rad = self._lerobot_open_rad
-        else:
-            limits = self._recorded_limits if self._recorded_limits is not None else self.limits
-            closed_rad = self._recorded_closed_rad if self._recorded_closed_rad is not None else self.closed_rad
-            open_rad = self._recorded_open_rad if self._recorded_open_rad is not None else self.open_rad
+            return self._lerobot_limits, self._lerobot_closed_rad, self._lerobot_open_rad
+        return (
+            self._recorded_limits if self._recorded_limits is not None else self.limits,
+            self._recorded_closed_rad if self._recorded_closed_rad is not None else self.closed_rad,
+            self._recorded_open_rad if self._recorded_open_rad is not None else self.open_rad,
+        )
+
+    def _observation(self, obs: ArmStatus) -> dict[str, np.ndarray]:
+        limits, closed_rad, open_rad = self._unit_bounds()
         positions = units.from_armd(
             obs.positions,
             self.state_units,
@@ -1499,6 +1503,49 @@ class PolicyRunner:
             return True
         return False
 
+    def _sandbox_get(self, path: str) -> Any:
+        """GET ``path`` from armd (via ``client.request`` when available, else urllib) and return the JSON body."""
+        if hasattr(self.client, "request"):
+            res = self.client.request("GET", path)
+            status = getattr(res, "status_code", getattr(res, "status", 200))
+            if isinstance(status, int) and status >= 400:
+                raise RuntimeError(f"HTTP {status}")
+            if hasattr(res, "raise_for_status") and callable(res.raise_for_status):
+                res.raise_for_status()
+            if hasattr(res, "json") and callable(res.json):
+                return res.json()
+            if hasattr(res, "text") and isinstance(res.text, str):
+                return json.loads(res.text) if res.text else {}
+            return {}
+        req = urllib.request.Request(
+            f"http://{self.host}:{self.port}{path}",
+            headers={"Accept": "application/json"},
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=5.0) as resp:
+            raw = resp.read().decode("utf-8")
+            return json.loads(raw) if raw else {}
+
+    def _sandbox_post(self, path: str, body: dict[str, Any], timeout: float) -> None:
+        """POST ``body`` to armd ``path`` (``client.request`` if available, else urllib); raises on HTTP errors."""
+        if hasattr(self.client, "request"):
+            res = self.client.request("POST", path, json=body)
+            if hasattr(res, "raise_for_status") and callable(res.raise_for_status):
+                res.raise_for_status()
+            elif hasattr(res, "status_code") and isinstance(res.status_code, int) and res.status_code >= 400:
+                raise RuntimeError(f"HTTP {res.status_code}")
+            elif hasattr(res, "status") and isinstance(res.status, int) and res.status >= 400:
+                raise RuntimeError(f"HTTP {res.status}")
+            return
+        req = urllib.request.Request(
+            f"http://{self.host}:{self.port}{path}",
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout):
+            pass
+
     def _check_sandbox_io(self) -> None:
         """Check armd sandbox mode and decide whether to enable sandbox IO forwarding."""
         if self._sandbox_io_checked:
@@ -1513,39 +1560,9 @@ class PolicyRunner:
             self._sandbox_io_enabled = False
             return
 
-        mode = None
         try:
-            if hasattr(self.client, "request"):
-                res = self.client.request("GET", "/api/v1/sandbox/state")
-                status = getattr(res, "status_code", getattr(res, "status", 200))
-                if isinstance(status, int) and status >= 400:
-                    raise RuntimeError(f"HTTP {status}")
-                if hasattr(res, "raise_for_status") and callable(res.raise_for_status):
-                    res.raise_for_status()
-                if hasattr(res, "json") and callable(res.json):
-                    data = res.json()
-                elif hasattr(res, "text") and isinstance(res.text, str):
-                    import json
-
-                    data = json.loads(res.text) if res.text else {}
-                else:
-                    data = {}
-                mode = data.get("mode") if isinstance(data, dict) else None
-            else:
-                import json
-                import urllib.error
-                import urllib.request
-
-                url = f"http://{self.host}:{self.port}/api/v1/sandbox/state"
-                req = urllib.request.Request(
-                    url,
-                    headers={"Accept": "application/json"},
-                    method="GET",
-                )
-                with urllib.request.urlopen(req, timeout=5.0) as resp:
-                    raw = resp.read().decode("utf-8")
-                    data = json.loads(raw) if raw else {}
-                    mode = data.get("mode") if isinstance(data, dict) else None
+            data = self._sandbox_get("/api/v1/sandbox/state")
+            mode = data.get("mode") if isinstance(data, dict) else None
         except Exception as exc:
             log.warning(
                 "Sandbox IO forwarding disabled: /api/v1/sandbox/state unavailable (%s). "
@@ -1577,28 +1594,8 @@ class PolicyRunner:
         try:
             if self.io_sender is not None:
                 self.io_sender(bool_resets)
-            elif hasattr(self.client, "request"):
-                res = self.client.request("POST", "/api/v1/sandbox/io", json={"updates": bool_resets})
-                if hasattr(res, "raise_for_status") and callable(res.raise_for_status):
-                    res.raise_for_status()
-                elif hasattr(res, "status_code") and isinstance(res.status_code, int) and res.status_code >= 400:
-                    raise RuntimeError(f"HTTP {res.status_code}")
-                elif hasattr(res, "status") and isinstance(res.status, int) and res.status >= 400:
-                    raise RuntimeError(f"HTTP {res.status}")
             else:
-                import json
-                import urllib.request
-
-                url = f"http://{self.host}:{self.port}/api/v1/sandbox/io"
-                data = json.dumps({"updates": bool_resets}).encode("utf-8")
-                req = urllib.request.Request(
-                    url,
-                    data=data,
-                    headers={"Content-Type": "application/json", "Accept": "application/json"},
-                    method="POST",
-                )
-                with urllib.request.urlopen(req, timeout=3.0):
-                    pass
+                self._sandbox_post("/api/v1/sandbox/io", {"updates": bool_resets}, timeout=3.0)
             self._last_io_sent.update(bool_resets)
         except Exception as exc:
             log.warning("Failed to reset boolean IO channels to False on stop: %s", exc)
@@ -1619,28 +1616,8 @@ class PolicyRunner:
         try:
             if self.io_sender is not None:
                 self.io_sender(changed)
-            elif hasattr(self.client, "request"):
-                res = self.client.request("POST", "/api/v1/sandbox/io", json={"updates": changed})
-                if hasattr(res, "raise_for_status") and callable(res.raise_for_status):
-                    res.raise_for_status()
-                elif hasattr(res, "status_code") and isinstance(res.status_code, int) and res.status_code >= 400:
-                    raise RuntimeError(f"HTTP {res.status_code}")
-                elif hasattr(res, "status") and isinstance(res.status, int) and res.status >= 400:
-                    raise RuntimeError(f"HTTP {res.status}")
             else:
-                import json
-                import urllib.request
-
-                url = f"http://{self.host}:{self.port}/api/v1/sandbox/io"
-                data = json.dumps({"updates": changed}).encode("utf-8")
-                req = urllib.request.Request(
-                    url,
-                    data=data,
-                    headers={"Content-Type": "application/json", "Accept": "application/json"},
-                    method="POST",
-                )
-                with urllib.request.urlopen(req, timeout=5.0):
-                    pass
+                self._sandbox_post("/api/v1/sandbox/io", {"updates": changed}, timeout=5.0)
             self._last_io_sent.update(changed)
         except Exception as exc:
             self.request_stop("io_delivery_failed", f"Failed to deliver IO updates: {exc}")
@@ -1683,11 +1660,8 @@ class PolicyRunner:
                 obs_hz=self.obs_hz,
                 send_timeout=self.send_timeout_s,
             ).open()
-            if getattr(self.session, "_schema", None) is None:
-                if hasattr(self.session, "set_schema"):
-                    self.session.set_schema(self.schema)
-                else:
-                    self.session._schema = self.schema
+            if self.session._schema is None:
+                self.session.set_schema(self.schema)
             try:
                 self._prepare()
                 t_start = time.monotonic()
@@ -1866,14 +1840,7 @@ class PolicyRunner:
                 self.request_stop("bad_action", f"policy returned {action.tolist()}")
                 break
             if self.action_units != "rad":
-                if self._lerobot_limits is not None:
-                    limits = self._lerobot_limits
-                    closed_rad = self._lerobot_closed_rad
-                    open_rad = self._lerobot_open_rad
-                else:
-                    limits = self._recorded_limits if self._recorded_limits is not None else self.limits
-                    closed_rad = self._recorded_closed_rad if self._recorded_closed_rad is not None else self.closed_rad
-                    open_rad = self._recorded_open_rad if self._recorded_open_rad is not None else self.open_rad
+                limits, closed_rad, open_rad = self._unit_bounds()
                 action_rad = units.to_armd(
                     action.tolist(),
                     self.action_units,
