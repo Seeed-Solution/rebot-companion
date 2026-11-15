@@ -4626,9 +4626,118 @@ def test_measured_ref_numpy_arrays_and_commanded():
     assert _measured_ref(obs) == []
 
 
-def test_leader_teleop_transient_droop_recovery_and_fail_closed(caplog):
+def test_leader_teleop_disjoint_intervals_fail_closed():
+    from rebot_companion.leader_teleop import (
+        LeaderTeleopBridge,
+        LeaderTeleopError,
+        LeaderCalibration,
+        _clamp_lead_and_step,
+    )
+
+    # 1. Direct _clamp_lead_and_step: immediately fails closed on disjoint intervals
+    # prev = 0.0, max_step = 0.05 -> step window [-0.05, 0.05]
+    # ref = 0.28, max_lead = 0.15 -> lead window [0.13, 0.43]
+    # Intervals are disjoint -> raises LeaderTeleopError immediately!
+    with pytest.raises(LeaderTeleopError, match="disjoint lead and step intervals"):
+        _clamp_lead_and_step(
+            0.0, prev_val=0.0, ref_val=0.28, max_step=0.05, max_lead=0.15,
+            j_min=-2.0, j_max=2.0, joint_index=0
+        )
+
+    # When intervals intersect, output strictly satisfies:
+    # |out - prev| <= max_step, |out - ref| <= max_lead, and j_min <= out <= j_max
+    for val in (-1.0, 0.0, 0.05, 0.10, 0.20, 1.0):
+        out = _clamp_lead_and_step(
+            val, prev_val=0.05, ref_val=0.10, max_step=0.05, max_lead=0.15,
+            j_min=-1.0, j_max=1.0, joint_index=0
+        )
+        assert abs(out - 0.05) <= 0.05 + 1e-9
+        assert abs(out - 0.10) <= 0.15 + 1e-9
+        assert -1.0 <= out <= 1.0
+
+    # 2. LeaderTeleopBridge.run(): when disjoint interval occurs during streaming:
+    # fails closed immediately, calls session.unload once, bridge.close does not double-park.
+    mock_bus = MagicMock()
+    mock_session = MagicMock()
+    mock_session.client = MagicMock()
+    mock_schema = ObservationSchema.from_dict({
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "limits": [
+            {"name": f"j{i}", "min_position": -2.0, "max_position": 2.0, "max_velocity": 1.0, "max_acceleration": 1.0}
+            for i in range(6)
+        ],
+        "gripper_policy": {"closed_rad": 0.0, "open_rad": 1.5},
+        "servo_max_lead_rad": 0.15,
+    })
+    calib = LeaderCalibration()
+    bridge = LeaderTeleopBridge(mock_bus, mock_session, mock_schema, calib=calib, follower="mock", fps=50)
+
+    bridge.align_and_ramp = MagicMock()
+    bridge._activated = True
+    bridge._last_servo_cmd = [0.0] * 6
+
+    # Observation where follower reference moved far away (disjoint from step)
+    obs_disjoint = MagicMock()
+    obs_disjoint.is_stopped = False
+    obs_disjoint.safety_state = "Armed"
+    obs_disjoint.is_torqued = True
+    obs_disjoint.is_operational = True
+    obs_disjoint.fault = None
+    obs_disjoint.collision = None
+    obs_disjoint.motion_limit = None
+    obs_disjoint.positions = [0.50, 0.0, 0.0, 0.0, 0.0, 0.5]
+    obs_disjoint.commanded_positions = [0.50, 0.0, 0.0, 0.0, 0.0, 0.5]
+    mock_session.latest_observation.return_value = obs_disjoint
+    bridge.read_leader_target = MagicMock(return_value=[0.0] * 6)
+
+    bridge.run()
+
+    # Teleop failed closed
+    assert bridge._error is not None
+    assert isinstance(bridge._error, LeaderTeleopError)
+    assert "disjoint" in str(bridge._error)
+
+    # Session.unload was called once for fail-closed park
+    assert mock_session.unload.call_count == 1
+    assert bridge._parked is True
+
+    # Closing bridge does not park again
+    bridge.close()
+    assert mock_session.unload.call_count == 1
+
+    # Verify no frame was emitted with joint limits or step violations
+    for call in mock_session.servo.call_args_list:
+        frame = call[0][0]
+        for j, val in enumerate(frame):
+            if j < 5:
+                assert abs(val - 0.0) <= 0.15 + 1e-9
+
+
+def test_validate_telemetry_ref_rejects_bool_and_warns_on_commanded_fallback(caplog):
     import logging
-    from rebot_companion.leader_teleop import LeaderTeleopBridge, LeaderTeleopError, LeaderCalibration
+    from rebot_companion.leader_teleop import _validate_telemetry_ref, _measured_ref, LeaderError
+
+    # Reject bool in telemetry ref
+    with pytest.raises(LeaderError, match="follower reference position\\[0\\] must be numeric, got True"):
+        _validate_telemetry_ref([True, 0.0, 0.0, 0.0, 0.0, 0.0])
+
+    with pytest.raises(LeaderError, match="follower reference position\\[3\\] must be numeric, got False"):
+        _validate_telemetry_ref([0.0, 0.0, 0.0, False, 0.0, 0.0])
+
+    # Fallback to commanded_positions logs warning
+    obs = MagicMock()
+    obs.positions = []
+    obs.commanded_positions = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
+    with caplog.at_level(logging.WARNING):
+        res = _measured_ref(obs)
+        assert res == [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
+        assert "obs.positions missing; falling back to commanded_positions" in caplog.text
+
+
+def test_align_and_ramp_rejects_nan_before_torque_enabled():
+    from rebot_companion.leader_teleop import LeaderTeleopBridge, LeaderError, LeaderCalibration
 
     mock_bus = MagicMock()
     mock_session = MagicMock()
@@ -4647,116 +4756,140 @@ def test_leader_teleop_transient_droop_recovery_and_fail_closed(caplog):
     calib = LeaderCalibration()
     bridge = LeaderTeleopBridge(mock_bus, mock_session, mock_schema, calib=calib, follower="mock")
 
-    # 1. Sequential recovery feeding each sent command back as prev across consecutive frames.
-    # ref_val = 0.28, max_step = 0.05, max_lead = 0.15, j_min = -2.0, j_max = 2.0
-    # lead window: [0.13, 0.43].
-    # Target val = 0.0, start prev = 0.0.
-    # Frame 1: prev=0.0 -> lead_nearest=0.13, gap_step=0.13 <= 0.15, step_j=[-0.05, 0.05], out=0.05.
-    # Frame 2: prev=0.05 -> lead_nearest=0.13, gap_step=0.08 <= 0.15, step_j=[0.00, 0.10], out=0.10.
-    # Frame 3: prev=0.10 -> step_j=[0.05, 0.15], overlaps lead window [0.13, 0.43] -> normal clamp -> out=0.13.
-    prev = 0.0
-    ref_val = 0.28
-    max_step = 0.05
-    max_lead = 0.15
-    j_min, j_max = -2.0, 2.0
-    with caplog.at_level(logging.WARNING):
-        # Frame 1 (recovery 1)
-        cmd1 = bridge._clamp_with_transient_droop_recovery(
-            0.0, prev_val=prev, ref_val=ref_val, max_step=max_step, max_lead=max_lead,
-            j_min=j_min, j_max=j_max, joint_index=0
-        )
-        assert abs(cmd1 - prev) <= max_step + 1e-12
-        assert j_min <= cmd1 <= j_max
-        assert cmd1 == pytest.approx(0.05)
-        assert bridge._transient_disjoint_counts[0] == 1
-        prev = cmd1
+    # Initial observation has NaN position and is NOT torqued
+    bad_obs = MagicMock()
+    bad_obs.is_stopped = False
+    bad_obs.safety_state = "Armed"
+    bad_obs.is_torqued = False
+    bad_obs.is_operational = False
+    bad_obs.fault = None
+    bad_obs.collision = None
+    bad_obs.motion_limit = None
+    bad_obs.positions = [float("nan"), 0.0, 0.0, 0.0, 0.0, 0.0]
+    mock_session.wait_for_observation.return_value = bad_obs
 
-        # Frame 2 (recovery 2)
-        cmd2 = bridge._clamp_with_transient_droop_recovery(
-            0.0, prev_val=prev, ref_val=ref_val, max_step=max_step, max_lead=max_lead,
-            j_min=j_min, j_max=j_max, joint_index=0
-        )
-        assert abs(cmd2 - prev) <= max_step + 1e-12
-        assert j_min <= cmd2 <= j_max
-        assert cmd2 == pytest.approx(0.10)
-        assert bridge._transient_disjoint_counts[0] == 2
-        prev = cmd2
+    with pytest.raises(LeaderError, match="follower reference position\\[0\\] must be finite"):
+        bridge.align_and_ramp()
 
-        # Frame 3 (converged to lead window [0.13, 0.43])
-        cmd3 = bridge._clamp_with_transient_droop_recovery(
-            0.0, prev_val=prev, ref_val=ref_val, max_step=max_step, max_lead=max_lead,
-            j_min=j_min, j_max=j_max, joint_index=0
-        )
-        assert abs(cmd3 - prev) <= max_step + 1e-12
-        assert j_min <= cmd3 <= j_max
-        assert cmd3 == pytest.approx(0.13)
-        assert 0.13 <= cmd3 <= 0.43
-        # In frame 3, normal clamp succeeded, streak incremented to 1 (not reset because streak < 10)
-        assert bridge._recovery_streak_ok[0] == 1
-        assert bridge._transient_disjoint_counts[0] == 2
+    # Crucial: session.torque(True) must NOT have been called!
+    mock_session.torque.assert_not_called()
 
-    assert "transient disjoint interval" in caplog.text
 
-    # 2. Alternating recover -> ok -> recover -> ok pattern FAILS CLOSED on the 6th disjoint event!
-    bridge._transient_disjoint_counts = [0] * 6
-    bridge._recovery_streak_ok = [0] * 6
-    bridge._last_disjoint_ts = [0.0] * 6
+def test_arm_session_move_to_validations():
+    mock_client = MagicMock()
+    session = ArmSession(mock_client, "http://localhost:8765/ws")
 
-    for k in range(1, 6):
-        # Disjoint recovery frame
-        c_rec = bridge._clamp_with_transient_droop_recovery(
-            0.0, prev_val=0.0, ref_val=0.22, max_step=0.05, max_lead=0.15,
-            j_min=j_min, j_max=j_max, joint_index=0
-        )
-        assert abs(c_rec - 0.0) <= max_step + 1e-12
-        assert j_min <= c_rec <= j_max
-        assert bridge._transient_disjoint_counts[0] == k
-        assert bridge._recovery_streak_ok[0] == 0
+    # None target_positions
+    with pytest.raises(ValueError, match="target_positions cannot be None"):
+        session.move_to(None)
 
-        # Healthy / ok frame: single ok frame MUST NOT reset transient_disjoint_counts
-        c_ok = bridge._clamp_with_transient_droop_recovery(
-            0.0, prev_val=0.0, ref_val=0.0, max_step=0.05, max_lead=0.15,
-            j_min=j_min, j_max=j_max, joint_index=0
-        )
-        assert c_ok == pytest.approx(0.0)
-        assert bridge._transient_disjoint_counts[0] == k
-        assert bridge._recovery_streak_ok[0] == 1
+    # Non-iterable
+    with pytest.raises(ValueError, match="target_positions must be an iterable"):
+        session.move_to(12345)
 
-    # 6th disjoint event fails closed with LeaderTeleopError (LeaderError)
-    with pytest.raises(LeaderTeleopError, match="disjoint lead and step intervals"):
-        bridge._clamp_with_transient_droop_recovery(
-            0.0, prev_val=0.0, ref_val=0.22, max_step=0.05, max_lead=0.15,
-            j_min=j_min, j_max=j_max, joint_index=0
-        )
+    # Empty iterable
+    with pytest.raises(ValueError, match="target_positions cannot be empty"):
+        session.move_to([])
 
-    # 3. Healthy frames only reset when streak >= 10 AND elapsed >= 1.0s
-    bridge._transient_disjoint_counts = [3] * 6
-    bridge._recovery_streak_ok = [0] * 6
-    bridge._last_disjoint_ts = [time.monotonic() - 2.0] * 6
-    # 9 consecutive healthy frames: streak = 9 < 10, does not reset
-    for _ in range(9):
-        bridge._clamp_with_transient_droop_recovery(
-            0.0, prev_val=0.0, ref_val=0.0, max_step=0.05, max_lead=0.15, joint_index=0
-        )
-    assert bridge._transient_disjoint_counts[0] == 3
-    assert bridge._recovery_streak_ok[0] == 9
-    # 10th consecutive healthy frame: resets!
-    bridge._clamp_with_transient_droop_recovery(
-        0.0, prev_val=0.0, ref_val=0.0, max_step=0.05, max_lead=0.15, joint_index=0
+    # Boolean element rejected
+    with pytest.raises(ValueError, match="target_positions\\[0\\] must be numeric, got True"):
+        session.move_to([True, 0.0, 0.0, 0.0, 0.0, 0.0])
+
+    # Non-numeric element rejected
+    with pytest.raises(ValueError, match="target_positions\\[1\\] must be numeric, got 'abc'"):
+        session.move_to([0.0, "abc", 0.0, 0.0, 0.0, 0.0])
+
+    # Non-finite element rejected
+    with pytest.raises(ValueError, match="target_positions\\[2\\] must be finite"):
+        session.move_to([0.0, 0.0, float("nan"), 0.0, 0.0, 0.0])
+
+    # Schema DOF mismatch when schema is set
+    schema = ObservationSchema.from_dict({
+        "dof": 6,
+        "limits": [
+            {"name": f"j{i}", "min_position": -2.0, "max_position": 2.0, "max_velocity": 1.0, "max_acceleration": 1.0}
+            for i in range(6)
+        ],
+    })
+    session.set_schema(schema)
+    with pytest.raises(ValueError, match="target_positions length \\(2\\) does not match schema DOF \\(6\\)"):
+        session.move_to([0.0, 0.0])
+
+    # Schema-less session does not require 6 DOF
+    session_no_schema = ArmSession(mock_client, "http://localhost:8765/ws")
+    session_no_schema.command = MagicMock(return_value={"type": "command_ack"})
+    # wait=False returns None immediately without waiting
+    res = session_no_schema.move_to([0.1, 0.2], wait=False)
+    assert res is None
+    session_no_schema.command.assert_called_once_with(
+        "/api/v1/motion/jog", {"target_positions": [0.1, 0.2]}
     )
-    assert bridge._transient_disjoint_counts[0] == 0
-    assert bridge._recovery_streak_ok[0] == 0
 
-    # 4. Large discontinuity gap exceeding safe_jump_cap immediately fails closed
-    # ref_val=1.0 -> lead window [0.85, 1.15], gap_step = 0.85 > safe_jump_cap (0.15)
-    with pytest.raises(LeaderTeleopError, match="disjoint lead and step intervals"):
-        bridge._clamp_with_transient_droop_recovery(
-            0.0, prev_val=0.0, ref_val=1.0, max_step=0.05, max_lead=0.15, joint_index=0
+
+def test_units_load_lerobot_norm_bounds_null_fallback(tmp_path):
+    calib_json = tmp_path / "calib_nulls.json"
+    content = {
+        "shoulder_pan": {"range_min": 100, "range_max": 3900, "zero_step": None, "center": 2048},
+        "shoulder_lift": {"range_min": 200, "range_max": 3800, "zero_step": None, "center": 2048},
+        "elbow_flex": {"range_min": 300, "range_max": 3700, "zero_step": None, "center": 2048},
+        "wrist_flex": {"range_min": 400, "range_max": 3600, "zero_step": None, "center": 2048},
+        "wrist_roll": {"range_min": 500, "range_max": 3500, "zero_step": None, "center": 2048},
+        "gripper": {
+            "range_min": 100,
+            "range_max": 3900,
+            "zero_step": None,
+            "center": 2048,
+            "closed_tick": None,
+            "closed": 1500,
+            "open_tick": None,
+            "open": 2500,
+        },
+    }
+    calib_json.write_text(json.dumps(content), encoding="utf-8")
+
+    limits, closed_rad, open_rad = units.load_lerobot_norm_bounds(calib_json)
+    assert len(limits) == 6
+    assert closed_rad is not None
+    assert open_rad is not None
+    assert math.isfinite(closed_rad)
+    assert math.isfinite(open_rad)
+
+
+def test_policy_runner_init_unit_override_with_deg_policy_and_calib(tmp_path):
+    from rebot_companion.policy_runner import PolicyRunner, RunnerError
+
+    mock_client = MagicMock()
+    calib_file = tmp_path / "calib.json"
+    calib_file.write_text("{}", encoding="utf-8")
+
+    mock_policy_deg = MagicMock()
+    mock_policy_deg.fps = 10
+    mock_policy_deg.image_key = None
+    mock_policy_deg.name = "deg_policy"
+    mock_policy_deg.info = {"unit_mode": "deg"}
+
+    # When explicit action_units="so101_norm" and state_units="rad", preview does NOT resolve to "deg",
+    # so __init__ succeeds without spuriously raising RunnerError!
+    runner = PolicyRunner(
+        mock_client,
+        mock_policy_deg,
+        lerobot_calib=calib_file,
+        action_units="so101_norm",
+        state_units="rad",
+    )
+    assert runner.action_units_requested == "so101_norm"
+    assert runner.state_units_requested == "rad"
+
+    # But when action_units="auto" with metadata unit_mode="deg", preview resolves to "deg",
+    # so __init__ DOES raise RunnerError!
+    with pytest.raises(RunnerError, match="incompatible with 'deg' unit mode"):
+        PolicyRunner(
+            mock_client,
+            mock_policy_deg,
+            lerobot_calib=calib_file,
+            action_units="auto",
+            state_units="auto",
         )
-
-    # 5. Non-finite input fails closed immediately without entering droop recovery
-    with pytest.raises(LeaderTeleopError, match="val must be finite"):
-        bridge._clamp_with_transient_droop_recovery(float("nan"), 0.0, 0.0, 0.05, 0.3)
 
 
 def test_arm_status_older_armd_omitting_gripper_fields():

@@ -20,13 +20,20 @@ from __future__ import annotations
 import json
 import logging
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 log = logging.getLogger("rebot_companion.units")
 
 SUPPORTED_UNIT_MODES = ("rad", "so101_norm", "deg")
+
+
+def _first_non_none(entry: Mapping[str, Any], *keys: str) -> Any:
+    for k in keys:
+        if k in entry and entry[k] is not None:
+            return entry[k]
+    return None
 
 
 def _finite_float(val: Any, label: str) -> float:
@@ -474,8 +481,8 @@ def load_lerobot_norm_bounds(
                     name,
                 )
 
-        if "zero_step" in entry or "center" in entry:
-            raw_c = entry["zero_step"] if "zero_step" in entry else entry["center"]
+        raw_c = _first_non_none(entry, "zero_step", "center")
+        if raw_c is not None:
             effective_zero = _finite_float(raw_c, f"{name}.center")
         elif "homing_offset" in entry:
             effective_zero = zero_step_fj
@@ -515,11 +522,11 @@ def load_lerobot_norm_bounds(
 
     g_tick_closed = g_max if g_drive_mode else g_min
     g_tick_open = g_min if g_drive_mode else g_max
-    if "closed_tick" in grip_entry or "closed" in grip_entry:
-        raw_gc = grip_entry.get("closed_tick", grip_entry.get("closed"))
+    raw_gc = _first_non_none(grip_entry, "closed_tick", "closed")
+    if raw_gc is not None:
         g_tick_closed = _finite_float(raw_gc, "gripper.closed_tick")
-    if "open_tick" in grip_entry or "open" in grip_entry:
-        raw_go = grip_entry.get("open_tick", grip_entry.get("open"))
+    raw_go = _first_non_none(grip_entry, "open_tick", "open")
+    if raw_go is not None:
         g_tick_open = _finite_float(raw_go, "gripper.open_tick")
 
     if not (
@@ -567,9 +574,9 @@ def load_lerobot_norm_bounds(
                 "gripper: homing_offset in calibration JSON cannot be cross-verified against schema homing_offset_steps"
             )
 
-    if "zero_step" in grip_entry or "center" in grip_entry:
-        raw_gc = grip_entry.get("zero_step", grip_entry.get("center"))
-        g_effective_zero = _finite_float(raw_gc, "gripper.center")
+    raw_gz = _first_non_none(grip_entry, "zero_step", "center")
+    if raw_gz is not None:
+        g_effective_zero = _finite_float(raw_gz, "gripper.center")
     elif "homing_offset" in grip_entry:
         g_effective_zero = g_zero_step_fj
     else:

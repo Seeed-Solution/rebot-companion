@@ -828,6 +828,7 @@ The runner imports them only for a learned policy.
 | `--max-seconds` | run length (default 60) |
 | `--max-steps` | stop after this many policy steps (default: no limit) |
 | `--action-units`, `--state-units` | units for policy actions / observations: `auto` (default, reads `unit_mode` from dataset/policy `meta/info.json`, falls back to `rad`), `rad`, `so101_norm`, or `deg` |
+| `--override-unit-mode` | allow explicit `--action-units` or `--state-units` to override conflicting policy metadata `unit_mode` |
 | `--task` | task text passed to the policy (language-conditioned policies) |
 | `--device` | torch device (default `cuda` when available, else `cpu`) |
 | `--no-park` | hold position at the end instead of parking |

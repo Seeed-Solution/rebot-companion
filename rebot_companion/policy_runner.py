@@ -911,6 +911,17 @@ class _Segment:
         return self.start + (self.end - self.start) * a
 
 
+def _check_lerobot_calib_compatible(
+    lerobot_calib: str | Path | None,
+    action_units: str,
+    state_units: str,
+) -> None:
+    if lerobot_calib is not None and ("deg" in (action_units, state_units)):
+        raise RunnerError(
+            "--lerobot-calib is incompatible with 'deg' unit mode; it calibrates 'so101_norm' [-100, 100] ranges"
+        )
+
+
 class PolicyRunner:
     """One policy run on one armd. ``client`` is a :class:`rebot.client.ArmdClient`; ``camera`` is any
     source with ``latest() -> (host_monotonic_s, frame) | None`` (optional ``start()``,
@@ -977,18 +988,11 @@ class PolicyRunner:
         self.state_units_requested = state_units
         self.override_unit_mode = bool(override_unit_mode)
         self.lerobot_calib = lerobot_calib
-        if self.lerobot_calib is not None:
-            if "deg" in (action_units, state_units):
-                raise RunnerError(
-                    "--lerobot-calib is incompatible with 'deg' unit mode; it calibrates 'so101_norm' [-100, 100] ranges"
-                )
-            p_info = getattr(policy, "info", None)
-            if isinstance(p_info, dict):
-                p_unit = p_info.get("unit_mode") or p_info.get("rebot_unit_mode")
-                if p_unit == "deg" and (action_units == "auto" or state_units == "auto"):
-                    raise RunnerError(
-                        "--lerobot-calib is incompatible with 'deg' unit mode; it calibrates 'so101_norm' [-100, 100] ranges"
-                    )
+        p_info = getattr(policy, "info", None)
+        info_dict = p_info if isinstance(p_info, dict) else None
+        preview_action_units = units.resolve_unit_mode(action_units, info_dict, require_metadata=False)
+        preview_state_units = units.resolve_unit_mode(state_units, info_dict, require_metadata=False)
+        _check_lerobot_calib_compatible(self.lerobot_calib, preview_action_units, preview_state_units)
 
         self._lerobot_limits: list[tuple[float, float]] | None = None
         self._lerobot_closed_rad: float | None = None
@@ -1244,10 +1248,7 @@ class PolicyRunner:
                 self.state_units_requested, policy_info, require_metadata=require_meta
             )
 
-        if self.lerobot_calib is not None and ("deg" in (self.action_units, self.state_units)):
-            raise RunnerError(
-                "--lerobot-calib is incompatible with 'deg' unit mode; it calibrates 'so101_norm' [-100, 100] ranges"
-            )
+        _check_lerobot_calib_compatible(self.lerobot_calib, self.action_units, self.state_units)
 
         if isinstance(policy_info, dict):
             meta_unit = policy_info.get("unit_mode") or policy_info.get("rebot_unit_mode")

@@ -541,6 +541,7 @@ class LeRobotRecorder:
         self.unit_mode = unit_mode
         self.armd_host = armd_host
         self.schema = None
+        self._dof: int | None = None
         self.profile_id: str | None = None
         self.arm_dof: int | None = None
         self.gripper_joint: int | None = None
@@ -722,17 +723,21 @@ class LeRobotRecorder:
             raise ValueError("image is required: the dataset has a camera feature")
         i = len(ep.state)
         if i == 0:
-            self._dof = len(state)
-            if self.schema is None and self._dof == 7:
-                if self.arm_dof is None:
-                    self.arm_dof = 6
-                if self.gripper_joint is None:
-                    self.gripper_joint = 6
-        if len(state) != self._dof or len(action) != self._dof:
-            raise ValueError(f"state and action need {self._dof} values")
+            dof = len(state)
+            arm_dof = 6 if (self.schema is None and dof == 7 and self.arm_dof is None) else self.arm_dof
+            gripper_joint = 6 if (self.schema is None and dof == 7 and self.gripper_joint is None) else self.gripper_joint
+        else:
+            dof = self._dof
+            arm_dof = self.arm_dof
+            gripper_joint = self.gripper_joint
+
+        if len(state) != dof or len(action) != dof:
+            raise ValueError(f"state and action need {dof} values")
 
         for vec_name, vec in (("state", state), ("action", action)):
             for idx, x in enumerate(vec):
+                if isinstance(x, bool):
+                    raise ValueError(f"{vec_name}[{idx}] must be numeric, got {x!r}")
                 try:
                     xf = float(x)
                 except (ValueError, TypeError) as exc:
@@ -740,58 +745,70 @@ class LeRobotRecorder:
                 if not math.isfinite(xf):
                     raise ValueError(f"{vec_name}[{idx}] must be finite, got {x!r}")
 
+        extra_rows: dict[str, list[float]] = {}
         for name, values in (("velocity", velocity), ("effort", effort)):
             if name in ep.extras:
-                if values is None or len(values) != self._dof:
-                    raise ValueError(f"{name} needs {self._dof} values")
+                if values is None or len(values) != dof:
+                    raise ValueError(f"{name} needs {dof} values")
+                row: list[float] = []
                 for idx, x in enumerate(values):
+                    if isinstance(x, bool):
+                        raise ValueError(f"{name}[{idx}] must be numeric, got {x!r}")
                     try:
                         xf = float(x)
                     except (ValueError, TypeError) as exc:
                         raise ValueError(f"{name}[{idx}] must be numeric, got {x!r}") from exc
                     if not math.isfinite(xf):
                         raise ValueError(f"{name}[{idx}] must be finite, got {x!r}")
+                    row.append(xf)
+                extra_rows[name] = row
 
+        converted_state = state
+        converted_action = action
         if self.unit_mode != "rad":
             if not self.limits or len(self.limits) != len(state):
                 raise RuntimeError(
                     f"unit_mode {self.unit_mode!r} requires joint limits matching state dim {len(state)}, "
                     f"got limits={self.limits}"
                 )
-            if self.unit_mode == "so101_norm" and self.gripper_joint is None:
-                if not (self.schema is not None and self.arm_dof in (6, 7) and self.arm_dof == self._dof):
+            if self.unit_mode == "so101_norm" and gripper_joint is None:
+                if not (self.schema is not None and arm_dof in (6, 7) and arm_dof == dof):
                     raise RuntimeError(
                         f"unit_mode {self.unit_mode!r} requires gripper_joint to be set"
                     )
-            state = units.from_armd(
+            converted_state = units.from_armd(
                 state,
                 self.unit_mode,
                 limits=self.limits,
-                gripper_joint=self.gripper_joint,
+                gripper_joint=gripper_joint,
                 closed_rad=self.closed_rad,
                 open_rad=self.open_rad,
             )
-            action = units.from_armd(
+            converted_action = units.from_armd(
                 action,
                 self.unit_mode,
                 limits=self.limits,
-                gripper_joint=self.gripper_joint,
+                gripper_joint=gripper_joint,
                 closed_rad=self.closed_rad,
                 open_rad=self.open_rad,
             )
 
-        ep.state.append([float(x) for x in state])
-        ep.action.append([float(x) for x in action])
-        for name, values in (("velocity", velocity), ("effort", effort)):
-            if name in ep.extras:
-                if values is None or len(values) != self._dof:
-                    raise ValueError(f"{name} needs {self._dof} values")
-                ep.extras[name].append([float(x) for x in values])
+        stat_img = None
         if ep.video is not None:
-            ep.video.put(image)
             every = max(1, round(self.fps * STATS_IMAGE_EVERY_S))
             if i % every == 0:
-                ep.stat_images.append(_stats_image(image))
+                stat_img = _stats_image(image)
+            ep.video.put(image)
+
+        self._dof = dof
+        self.arm_dof = arm_dof
+        self.gripper_joint = gripper_joint
+        ep.state.append([float(x) for x in converted_state])
+        ep.action.append([float(x) for x in converted_action])
+        for name, row in extra_rows.items():
+            ep.extras[name].append(row)
+        if stat_img is not None:
+            ep.stat_images.append(stat_img)
         ep.summary.frames = i + 1
         return i
 
@@ -1000,7 +1017,7 @@ class LeRobotRecorder:
                 setattr(s, max_attr, round(1000 * float(np.max(ages)), 2))
 
     def _features(self) -> dict[str, dict]:
-        dof = getattr(self, "_dof", len(self.joint_names))
+        dof = self._dof if self._dof is not None else len(self.joint_names)
         if self._custom_joint_names and len(self.joint_names) == dof:
             names = list(self.joint_names)
         elif self.schema is not None and self.schema.joint_names and len(self.schema.joint_names) == dof:

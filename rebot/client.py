@@ -1406,8 +1406,18 @@ class ArmSession:
         acceleration limits. Arrival means armd reports the trajectory finished
         (state left ``Moving``) and measured positions are within ``tolerance``.
         """
+        if target_positions is None:
+            raise ValueError("target_positions cannot be None")
+        try:
+            raw_target = list(target_positions)
+        except TypeError as exc:
+            raise ValueError(f"target_positions must be an iterable, got {type(target_positions).__name__}") from exc
+        if not raw_target:
+            raise ValueError("target_positions cannot be empty")
         target = []
-        for idx, x in enumerate(target_positions):
+        for idx, x in enumerate(raw_target):
+            if isinstance(x, bool):
+                raise ValueError(f"target_positions[{idx}] must be numeric, got {x!r}")
             try:
                 xf = float(x)
             except (ValueError, TypeError) as exc:
@@ -1415,6 +1425,11 @@ class ArmSession:
             if not math.isfinite(xf):
                 raise ValueError(f"target_positions[{idx}] must be finite, got {x!r}")
             target.append(xf)
+
+        if self._schema is not None and getattr(self._schema, "dof", None) is not None:
+            expected_dof = int(self._schema.dof)
+            if len(target) != expected_dof:
+                raise ValueError(f"target_positions length ({len(target)}) does not match schema DOF ({expected_dof})")
         body: dict = {"target_positions": target}
         if duration is not None:
             try:
