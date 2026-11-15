@@ -33,6 +33,40 @@ MIME_TYPES: dict[str, str] = {
     ".map": "application/json",
 }
 
+ALLOWED_WS_PATHS = ("/api/v1/ws", "/api/v1/detection/ws", "/results")
+
+
+def _is_origin_valid(headers: dict[str, str]) -> bool:
+    """Validate client Origin against Host header for same-origin proxying.
+
+    Allows absent Origin (CLI / curl loopback requests).
+    Requires Origin to match Host (case-insensitive) when present.
+    """
+    origin = headers.get("origin")
+    if origin is None:
+        return True
+    u = urllib.parse.urlsplit(origin)
+    scheme = u.scheme.lower()
+    if scheme not in ("http", "https"):
+        return False
+    host = headers.get("host", "").lower()
+    netloc = u.netloc.lower()
+
+    def _norm(s: str, n: str) -> str:
+        if ":" in n:
+            h, _, p = n.partition(":")
+            if (s == "http" and p == "80") or (s == "https" and p == "443"):
+                return h
+        return n
+
+    if not (netloc == host or _norm(scheme, netloc) == _norm(scheme, host)):
+        return False
+    if u.path not in ("", "/"):
+        return False
+    if u.query or u.fragment:
+        return False
+    return True
+
 
 def _send_response(
     writer: asyncio.StreamWriter,
@@ -152,7 +186,25 @@ class PlaygroundProxyServer:
             # 1. WebSocket upgrade check
             is_ws = headers.get("upgrade", "").lower() == "websocket"
             if is_ws:
-                await self._proxy_websocket(reader, writer, line, header_list)
+                if pathname not in ALLOWED_WS_PATHS:
+                    _send_response(writer, 404, "Not Found", b"WebSocket endpoint not allowed")
+                    writer.close()
+                    return
+
+            # Origin validation on all WebSocket upgrades and all non-GET/HEAD HTTP requests
+            if is_ws or (method not in ("GET", "HEAD")):
+                if not _is_origin_valid(headers):
+                    _send_response(
+                        writer,
+                        403,
+                        "Forbidden",
+                        b"Cross-origin proxy requests are not allowed",
+                    )
+                    writer.close()
+                    return
+
+            if is_ws:
+                await self._proxy_websocket(reader, writer, line, header_list, headers=headers)
                 return
 
             # 2. HTTP API proxy check (/api/v1/*)
@@ -173,7 +225,13 @@ class PlaygroundProxyServer:
         writer: asyncio.StreamWriter,
         initial_line: bytes,
         header_list: list[tuple[str, str]],
+        headers: dict[str, str] | None = None,
     ) -> None:
+        if headers is not None and not _is_origin_valid(headers):
+            _send_response(writer, 403, "Forbidden", b"Cross-origin proxy requests are not allowed")
+            writer.close()
+            return
+
         try:
             u_reader, u_writer = await asyncio.open_connection(self._u_host, self._u_port)
         except Exception as exc:
@@ -225,6 +283,16 @@ class PlaygroundProxyServer:
         cl_str = headers.get("content-length")
         content_length = int(cl_str) if cl_str and cl_str.isdigit() else 0
         body = await reader.readexactly(content_length) if content_length > 0 else b""
+
+        if method not in ("GET", "HEAD") and not _is_origin_valid(headers):
+            _send_response(
+                writer,
+                403,
+                "Forbidden",
+                b"Cross-origin proxy requests are not allowed",
+            )
+            writer.close()
+            return
 
         try:
             u_reader, u_writer = await asyncio.open_connection(self._u_host, self._u_port)
