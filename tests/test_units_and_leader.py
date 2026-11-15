@@ -4104,6 +4104,7 @@ def test_clamp_lead_and_step_disjoint_diagnostic_message():
 
 
 def test_onnx_policy_unit_mode_omitted_so_arm_vs_7dof(tmp_path: Path):
+    pytest.importorskip("onnxruntime")
     from rebot_companion.onnx_policy import scaffold_onnx_policy
     from rebot_companion.policy_runner import OnnxPolicy
     from rebot_companion.units import resolve_unit_mode
@@ -4133,6 +4134,7 @@ def test_policy_runner_rejects_lerobot_calib_with_deg(tmp_path: Path):
     mock_client = MagicMock()
     mock_policy = MagicMock()
     mock_policy.fps = 10
+    mock_policy.action_dim = 7
     mock_policy.image_key = None
     mock_policy.name = "mock_policy"
     mock_policy.info = {"unit_mode": "rad"}
@@ -4163,14 +4165,26 @@ def test_policy_runner_warns_on_unit_mode_metadata_mismatch(caplog):
     from rebot_companion.policy_runner import PolicyRunner
 
     mock_client = MagicMock()
+    mock_client.get_safety_describe.return_value = {"device": {"follower": "mock"}}
+    mock_res = MagicMock()
+    mock_res.json.return_value = {
+        "dof": 7,
+        "arm_dof": 7,
+        "gripper_joint": 6,
+        "profile_id": "generic",
+        "limits": [{"name": f"j{i}", "min_position": -3.0, "max_position": 3.0, "max_velocity": 1.0, "max_acceleration": 1.0} for i in range(7)],
+    }
+    mock_client.request.return_value = mock_res
     mock_policy = MagicMock()
     mock_policy.fps = 10
+    mock_policy.action_dim = 7
     mock_policy.image_key = None
     mock_policy.name = "mock_policy"
     mock_policy.info = {"unit_mode": "rad"}
 
     with caplog.at_level(logging.WARNING):
-        PolicyRunner(mock_client, mock_policy, action_units="deg", state_units="so101_norm")
+        runner = PolicyRunner(mock_client, mock_policy, action_units="deg", state_units="so101_norm")
+        runner._read_arm()
     assert "differs from policy metadata unit_mode" in caplog.text
 
 
@@ -4212,7 +4226,7 @@ def test_clamp_lead_and_step_non_finite_rejection():
 
 
 def test_leader_teleop_gripper_clamp_across_phases():
-    from rebot_companion.leader_teleop import LeaderTeleopBridge
+    from rebot_companion.leader_teleop import LeaderTeleopBridge, LeaderError
 
     bus = MagicMock()
     session = MagicMock()
@@ -4232,17 +4246,68 @@ def test_leader_teleop_gripper_clamp_across_phases():
     clamped_max = bridge._clamp_gripper_step_and_range(2.0, prev_val=1.4)
     assert clamped_max == pytest.approx(1.5, abs=1e-3)
 
+    # Clamping against lower limit (0.0)
+    clamped_min = bridge._clamp_gripper_step_and_range(-1.0, prev_val=0.1)
+    assert clamped_min == pytest.approx(0.0, abs=1e-3)
+
+    # Disjoint intervals raise LeaderError
+    with pytest.raises(LeaderError, match="too far from permitted range"):
+        bridge._clamp_gripper_step_and_range(0.5, prev_val=-0.5)
+
+    with pytest.raises(LeaderError, match="must be numeric"):
+        bridge._clamp_gripper_step_and_range(True, prev_val=0.0)
+
+    # Real align_and_ramp test starting with out-of-range gripper + reaching ramp & settle
+    mock_obs = MagicMock()
+    mock_obs.is_stopped = False
+    mock_obs.safety_state = "Armed"
+    mock_obs.fault = None
+    mock_obs.collision = None
+    mock_obs.motion_limit = None
+    mock_obs.is_torqued = True
+    mock_obs.is_operational = True
+    follower_positions = [0.0, 0.0, 0.0, 0.0, 0.0, 0.1]
+    mock_obs.positions = list(follower_positions)
+    mock_obs.commanded_positions = list(follower_positions)
+    session.wait_for_observation.return_value = mock_obs
+    session.latest_observation.return_value = mock_obs
+
+    # Leader arm gap of 0.2 rad and gripper target at 1.8 rad (outside [0.0, 1.5])
+    leader_target = [0.2, 0.0, 0.0, 0.0, 0.0, 1.8]
+    bridge.read_leader_target = MagicMock(return_value=leader_target)
+
+    def mock_servo(cmd):
+        mock_obs.positions = list(cmd)
+        mock_obs.commanded_positions = list(cmd)
+
+    session.servo.side_effect = mock_servo
+
+    bridge.align_and_ramp()
+    assert bridge.frames_sent > 0
+    # Every servo command sent must have gripper in [0.0, 1.5]
+    for call in session.servo.call_args_list:
+        cmd = call[0][0]
+        assert 0.0 <= cmd[5] <= 1.5 + 1e-4
+
 
 def test_client_finite_float_validation_and_null_handling():
-    from rebot.client import _vec, _put_speed, TcpPose, GripperStatus, ArmSession, UnsupportedError
+    from rebot.client import _vec, _put_speed, _safe_int, _safe_float, TcpPose, GripperStatus, ArmSession, UnsupportedError
 
-    # 1. _vec rejects NaN, Inf, and wrong length
+    # 1. _safe_int and _safe_float reject bool and non-finite floats
+    assert _safe_int(True, 42) == 42
+    assert _safe_int(False, 42) == 42
+    assert _safe_int(float("nan"), 42) == 42
+    assert _safe_int(float("inf"), 42) == 42
+    assert _safe_float(True, 3.14) == 3.14
+    assert _safe_float(float("nan"), 3.14) == 3.14
+
+    # 2. _vec rejects NaN, Inf, and wrong length
     with pytest.raises(ValueError, match="must be finite"):
         _vec([1.0, float("nan"), 3.0], 3, "test_vec")
     with pytest.raises(ValueError, match="needs 3 values"):
         _vec([1.0, 2.0], 3, "test_vec")
 
-    # 2. _put_speed rejects <= 0 or non-finite speed
+    # 3. _put_speed rejects <= 0 or non-finite speed
     body = {}
     with pytest.raises(ValueError, match="must be positive"):
         _put_speed(body, linear=0.0, angular=1.0)
@@ -4251,19 +4316,44 @@ def test_client_finite_float_validation_and_null_handling():
     with pytest.raises(ValueError, match="must be finite"):
         _put_speed(body, linear=float("inf"), angular=1.0)
 
-    # 3. TcpPose.from_dict tolerates None/null in lists
-    pose = TcpPose.from_dict({"xyz_m": [None, 0.2, 0.3], "rpy_rad": [None, 0.1, 0.2]})
-    assert pose.xyz_m == [0.2, 0.3]
-    assert pose.rpy_rad == [0.1, 0.2]
+    # 4. TcpPose.from_dict rejects invalid/None elements in xyz_m
+    with pytest.raises(ValueError, match="invalid xyz_m vector"):
+        TcpPose.from_dict({"xyz_m": [None, 0.2, 0.3], "rpy_rad": [None, 0.1, 0.2]})
+    with pytest.raises(ValueError, match="invalid xyz_m vector"):
+        TcpPose.from_dict({"xyz_m": [0.1, 0.2]})
+    with pytest.raises(ValueError, match="invalid xyz_m vector"):
+        TcpPose.from_dict({"xyz_m": [0.1, True, 0.3]})
 
-    # 4. GripperStatus.from_dict tolerates None/null fields
-    grip = GripperStatus.from_dict({"joint": None, "rad": None, "fraction": None, "opening_m": None})
-    assert grip.joint == 0
-    assert grip.rad == 0.0
-    assert grip.fraction == 0.0
-    assert grip.opening_m is None
+    # Valid xyz_m with invalid optional vectors becomes None instead of dropping/shifting
+    pose = TcpPose.from_dict({"xyz_m": [0.1, 0.2, 0.3], "rpy_rad": [None, 0.1, 0.2], "quat_wxyz": [1.0, 0.0, 0.0]})
+    assert pose.xyz_m == [0.1, 0.2, 0.3]
+    assert pose.rpy_rad is None
+    assert pose.quat_wxyz is None
 
-    # 5. ArmSession.servo rejects empty, NaN, and Inf
+    # ArmStatus.from_dict sets tcp=None on malformed tcp without crashing
+    st = ArmStatus.from_dict({"tcp": {"xyz_m": [None, 0.2, 0.3]}})
+    assert st.tcp is None
+
+    # 5. GripperStatus.from_dict requires valid joint, rad, and fraction
+    with pytest.raises(ValueError):
+        GripperStatus.from_dict({"joint": None, "rad": 0.0, "fraction": 0.0})
+    with pytest.raises(ValueError):
+        GripperStatus.from_dict({"joint": True, "rad": 0.0, "fraction": 0.0})
+    with pytest.raises(ValueError):
+        GripperStatus.from_dict({"joint": 5, "rad": float("nan"), "fraction": 0.0})
+    with pytest.raises(ValueError):
+        GripperStatus.from_dict({"joint": 5, "rad": 0.0, "fraction": None})
+
+    valid_grip = GripperStatus.from_dict({"joint": 5, "rad": 0.5, "fraction": 0.25, "opening_m": None, "stalled": False})
+    assert valid_grip.joint == 5
+    assert valid_grip.rad == 0.5
+    assert valid_grip.fraction == 0.25
+
+    # ArmStatus.from_dict sets gripper=None on malformed gripper without fabricating closed 0.0
+    st_grip = ArmStatus.from_dict({"gripper": {"joint": None, "rad": None, "fraction": None}})
+    assert st_grip.gripper is None
+
+    # 6. ArmSession.servo rejects empty, NaN, and Inf
     mock_client = MagicMock()
     s = ArmSession(mock_client)
     with pytest.raises(ValueError, match="cannot be empty"):
@@ -4271,7 +4361,7 @@ def test_client_finite_float_validation_and_null_handling():
     with pytest.raises(ValueError, match="must be finite"):
         s.servo([0.0, float("nan"), 0.0, 0.0, 0.0, 0.0])
 
-    # 6. ArmSession.move_pose with _schema=None: auto_yaw=True raises UnsupportedError, auto_yaw=False strips auto_yaw
+    # 7. ArmSession.move_pose with _schema=None: auto_yaw=True raises UnsupportedError, auto_yaw=False strips auto_yaw
     s._action = MagicMock()
     s._schema = None
     mock_client.get_schema.side_effect = ConnectionError("offline")
@@ -4334,3 +4424,128 @@ def test_load_lerobot_norm_bounds_homing_offset_mismatch_raises(tmp_path: Path):
 
     with pytest.raises(ValueError, match="homing_offset mismatch"):
         units.load_lerobot_norm_bounds(calib_json, schema=schema_feetech)
+
+
+def test_leader_teleop_fail_closed_single_park_on_align_error():
+    bus = MagicMock()
+    session = MagicMock()
+    session.client.get_safety_describe.return_value = {"device": {"follower": "mock"}}
+    schema = ObservationSchema.from_dict({
+        "dof": 6, "arm_dof": 5, "gripper_joint": 5,
+        "limits": [{"name": f"j{i}", "min_position": -3.0, "max_position": 3.0, "max_velocity": 1.0, "max_acceleration": 1.0} for i in range(6)],
+    })
+    bridge = LeaderTeleopBridge(bus, session, schema, fps=50, follower="mock", park_on_exit=True)
+
+    def failing_align():
+        bridge._activated = True
+        raise ValueError("simulated align failure")
+
+    bridge.align_and_ramp = failing_align
+    bridge.run()
+
+    assert bridge._error is not None
+    assert bridge._parked is True
+    session.unload.assert_called_once_with(wait=True, timeout=15.0)
+
+    # Calling close() subsequently must not double-park
+    bridge.close()
+    assert session.unload.call_count == 1
+
+
+def test_leader_teleop_fail_closed_single_park_on_servo_error():
+    bus = MagicMock()
+    session = MagicMock()
+    session.client.get_safety_describe.return_value = {"device": {"follower": "mock"}}
+    schema = ObservationSchema.from_dict({
+        "dof": 6, "arm_dof": 5, "gripper_joint": 5,
+        "limits": [{"name": f"j{i}", "min_position": -3.0, "max_position": 3.0, "max_velocity": 1.0, "max_acceleration": 1.0} for i in range(6)],
+    })
+    bridge = LeaderTeleopBridge(bus, session, schema, fps=50, follower="mock", park_on_exit=True)
+
+    def mock_align():
+        bridge._activated = True
+
+    bridge.align_and_ramp = mock_align
+    mock_obs = MagicMock()
+    mock_obs.is_stopped = False
+    mock_obs.safety_state = "Armed"
+    mock_obs.is_torqued = True
+    mock_obs.is_operational = True
+    mock_obs.positions = [0.0] * 6
+    mock_obs.commanded_positions = [0.0] * 6
+    mock_obs.fault = None
+    mock_obs.collision = None
+    mock_obs.motion_limit = None
+    session.latest_observation.return_value = mock_obs
+    bridge.read_leader_target = MagicMock(return_value=[0.0] * 6)
+
+    # servo raises unexpected ValueError
+    session.servo.side_effect = ValueError("simulated unexpected servo crash")
+
+    with pytest.raises(ValueError, match="simulated unexpected servo crash"):
+        bridge.run()
+
+    assert bridge._error is not None
+    assert bridge._parked is True
+    session.unload.assert_called_once_with(wait=True, timeout=15.0)
+
+    # Calling close() must not double park
+    bridge.close()
+    assert session.unload.call_count == 1
+
+
+def test_arm_session_servo_numpy_truthiness():
+    import threading
+    mock_client = MagicMock()
+    s = ArmSession(mock_client)
+    s._state = threading.Condition()
+    s._servo_error = None
+    s._last_servo = None
+    s._check_lease = MagicMock(return_value=1)
+    s._send = MagicMock()
+    s._epoch = 1
+    s.client_id = "test"
+    # numpy array with all zeros; evaluating bool(np.zeros(6)) raises ValueError in numpy
+    arr = np.zeros(6)
+    s.servo(arr)
+    assert s._send.call_count == 1
+
+
+def test_arm_session_servo_6dof_no_schema_jump_protection():
+    import threading
+    from rebot.errors import ServoJumpError
+    mock_client = MagicMock()
+    s = ArmSession(mock_client)
+    s._state = threading.Condition()
+    s._servo_error = None
+    s._schema = None
+    s._gripper_joint = _GRIPPER_UNSET
+    s._last_servo = (time.monotonic(), [0.0] * 6)
+    s._check_lease = MagicMock(return_value=1)
+    s._send = MagicMock()
+    s._epoch = 1
+    s.client_id = "test"
+    # Joint 6 (index 5) jumping by 0.5 rad (> 0.35 rad) must raise ServoJumpError
+    with pytest.raises(ServoJumpError, match="servo frame joint 6 steps"):
+        s.servo([0.0, 0.0, 0.0, 0.0, 0.0, 0.5])
+
+
+def test_arm_session_request_cleans_pending_on_send_error():
+    mock_client = MagicMock()
+    s = ArmSession(mock_client)
+    s._ws = MagicMock()
+    s._closed_reason = None
+    s._send = MagicMock(side_effect=ValueError("Out of range float values are not JSON compliant"))
+    with pytest.raises(ValueError, match="Out of range float"):
+        s._request("test_kind", 123, {"foo": float("nan")}, timeout=1.0)
+    assert len(s._pending) == 0
+
+
+def test_arm_session_move_pose_auto_yaw_none_no_schema_fetch():
+    mock_client = MagicMock()
+    s = ArmSession(mock_client)
+    s._action = MagicMock()
+    s._schema = None
+    s._last_schema_attempt = None
+    s.move_pose([0.2, 0.0, 0.1], auto_yaw=None)
+    mock_client.get_schema.assert_not_called()

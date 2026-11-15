@@ -944,6 +944,7 @@ class LeaderTeleopBridge:
 
         self._stop = False
         self._activated = False
+        self._parked = False
         self._error: BaseException | None = None
         self._last_servo_cmd: list[float] | None = None
         self.frames_sent = 0
@@ -1082,16 +1083,23 @@ class LeaderTeleopBridge:
     def _clamp_gripper_step_and_range(self, target_val: float, prev_val: float) -> float:
         """Clamp gripper target against per-frame max step and follower limits/bounds."""
         for name, v in (("target_val", target_val), ("prev_val", prev_val)):
+            if isinstance(v, bool):
+                raise LeaderError(f"gripper {name} must be numeric, got {v!r}")
             try:
                 vf = float(v)
             except (ValueError, TypeError) as exc:
-                raise LeaderTeleopError(f"gripper {name} must be numeric, got {v!r}") from exc
+                raise LeaderError(f"gripper {name} must be numeric, got {v!r}") from exc
             if not math.isfinite(vf):
-                raise LeaderTeleopError(f"gripper {name} must be finite, got {v!r}")
+                raise LeaderError(f"gripper {name} must be finite, got {v!r}")
 
         max_gripper_step = max(
             0.30, 0.25 * abs(self.follower_gripper_open - self.follower_gripper_closed)
         )
+        if isinstance(max_gripper_step, bool) or not math.isfinite(max_gripper_step) or max_gripper_step < 0:
+            raise LeaderError(
+                f"max_gripper_step must be non-negative finite float, got {max_gripper_step!r}"
+            )
+
         follower_limits = getattr(self, "follower_limits", None) or self.limits
         gj = self.gripper_joint if self.gripper_joint is not None else 5
         if follower_limits and len(follower_limits) > gj:
@@ -1100,9 +1108,21 @@ class LeaderTeleopBridge:
         else:
             g_lo = min(self.follower_gripper_open, self.follower_gripper_closed)
             g_hi = max(self.follower_gripper_open, self.follower_gripper_closed)
+        g_lo = float(g_lo)
+        g_hi = float(g_hi)
 
-        clamped = min(max(float(target_val), prev_val - max_gripper_step), prev_val + max_gripper_step)
-        clamped = min(max(clamped, g_lo), g_hi)
+        step_lo = float(prev_val) - max_gripper_step
+        step_hi = float(prev_val) + max_gripper_step
+        eff_lo = max(step_lo, g_lo)
+        eff_hi = min(step_hi, g_hi)
+        if eff_lo > eff_hi + 1e-9:
+            raise LeaderError(
+                f"gripper position {float(prev_val):.4f} rad is too far from permitted range [{g_lo:.4f}, {g_hi:.4f}] "
+                f"within step limit {max_gripper_step:.4f} rad"
+            )
+        if eff_lo > eff_hi:
+            eff_lo = eff_hi = 0.5 * (eff_lo + eff_hi)
+        clamped = min(max(float(target_val), eff_lo), eff_hi)
         return float(clamped)
 
     def align_and_ramp(self) -> None:
@@ -1318,114 +1338,122 @@ class LeaderTeleopBridge:
     def run(self) -> None:
         """Stream servo frames continuously at fps."""
         self._error = None
+        self._parked = False
         self.bus.disable_torque(self.calib.servo_ids)
         try:
-            self.align_and_ramp()
-        except Exception as exc:
-            self._error = exc
-            log.error("leader alignment/ramp failed: %s", exc)
-            return
-
-        period = 1.0 / self.fps
-        t0 = time.monotonic()
-        prev_t = t0 - period
-        k = 0
-        v_caps = self._arm_velocity_caps()
-        while not self._stop:
-            due = t0 + k * period
-            now = time.monotonic()
-            if now - due > period:
-                t0 = now
-                k = 0
-                due = t0
-            elif due > now:
-                time.sleep(due - now)
-            if self._stop:
-                break
-
-            now = time.monotonic()
-            dt = min(max(now - prev_t, 1e-3), 3.0 * period)
-            prev_t = now
-
             try:
-                obs = self.session.latest_observation()
-                self._check_follower_healthy(obs, require_torqued=True)
-                ref = _validate_telemetry_ref(_measured_ref(obs))
-                target = self.read_leader_target()
+                self.align_and_ramp()
+            except Exception as exc:
+                self._error = exc
+                log.error("leader alignment/ramp failed: %s", exc)
+                return
+
+            period = 1.0 / self.fps
+            t0 = time.monotonic()
+            prev_t = t0 - period
+            k = 0
+            v_caps = self._arm_velocity_caps()
+            while not self._stop:
+                due = t0 + k * period
+                now = time.monotonic()
+                if now - due > period:
+                    t0 = now
+                    k = 0
+                    due = t0
+                elif due > now:
+                    time.sleep(due - now)
                 if self._stop:
                     break
-                clamped_target = list(target)
-                prev = self._last_servo_cmd or list(ref)
-                saturated = False
-                if len(ref) < len(clamped_target):
-                    raise LeaderError(f"follower reference length ({len(ref)}) < target length ({len(clamped_target)})")
-                for j in range(min(len(clamped_target), len(ref))):
-                    if j != self.gripper_joint and j < 5:
-                        orig_val = clamped_target[j]
-                        j_min, j_max = self.limits[j] if j < len(self.limits) else (None, None)
-                        v_cap_j = v_caps[j] if j < len(v_caps) else 0.6
-                        v_run_j = 0.8 * v_cap_j
-                        max_frame_step_j = min(0.30, v_run_j * dt)
-                        clamped_val = _clamp_lead_and_step(
-                            orig_val,
-                            prev[j],
-                            ref[j],
-                            max_frame_step_j,
-                            self.arm_lead,
-                            j_min=j_min,
-                            j_max=j_max,
-                            joint_index=j,
-                        )
-                        if clamped_val != orig_val:
-                            saturated = True
-                        clamped_target[j] = clamped_val
 
-                gj = self.gripper_joint if self.gripper_joint is not None else 5
-                if gj is not None and gj < len(clamped_target) and gj < len(prev):
-                    clamped_target[gj] = self._clamp_gripper_step_and_range(clamped_target[gj], prev[gj])
+                now = time.monotonic()
+                dt = min(max(now - prev_t, 1e-3), 3.0 * period)
+                prev_t = now
 
-                if saturated:
-                    self._lead_clamp_consecutive += 1
-                    if self._lead_clamp_consecutive in (1, 10, 50, 100) or (self._lead_clamp_consecutive % 100 == 0):
-                        log.warning(
-                            "leader teleop: lead clamping active for %d consecutive frames (arm target clamped to ±%.2f rad from follower commanded/measured)",
-                            self._lead_clamp_consecutive,
-                            self.arm_lead,
-                        )
-                else:
-                    if self._lead_clamp_consecutive > 0:
-                        log.info(
-                            "leader teleop: lead clamping clear after %d consecutive frames",
-                            self._lead_clamp_consecutive,
-                        )
-                    self._lead_clamp_consecutive = 0
+                try:
+                    obs = self.session.latest_observation()
+                    self._check_follower_healthy(obs, require_torqued=True)
+                    ref = _validate_telemetry_ref(_measured_ref(obs))
+                    target = self.read_leader_target()
+                    if self._stop:
+                        break
+                    clamped_target = list(target)
+                    prev = self._last_servo_cmd or list(ref)
+                    saturated = False
+                    if len(ref) < len(clamped_target):
+                        raise LeaderError(f"follower reference length ({len(ref)}) < target length ({len(clamped_target)})")
+                    for j in range(min(len(clamped_target), len(ref))):
+                        if j != self.gripper_joint and j < 5:
+                            orig_val = clamped_target[j]
+                            j_min, j_max = self.limits[j] if j < len(self.limits) else (None, None)
+                            v_cap_j = v_caps[j] if j < len(v_caps) else 0.6
+                            v_run_j = 0.8 * v_cap_j
+                            max_frame_step_j = min(0.30, v_run_j * dt)
+                            clamped_val = _clamp_lead_and_step(
+                                orig_val,
+                                prev[j],
+                                ref[j],
+                                max_frame_step_j,
+                                self.arm_lead,
+                                j_min=j_min,
+                                j_max=j_max,
+                                joint_index=j,
+                            )
+                            if clamped_val != orig_val:
+                                saturated = True
+                            clamped_target[j] = clamped_val
 
-                self.session.servo(clamped_target)
-                self._last_servo_cmd = list(clamped_target)
-                self.frames_sent += 1
-            except (LeaderError, ServoRejected, LeaseError, ArmConnectionError, RebotError, OSError) as exc:
+                    gj = self.gripper_joint if self.gripper_joint is not None else 5
+                    if gj is not None and gj < len(clamped_target) and gj < len(prev):
+                        clamped_target[gj] = self._clamp_gripper_step_and_range(clamped_target[gj], prev[gj])
+
+                    if saturated:
+                        self._lead_clamp_consecutive += 1
+                        if self._lead_clamp_consecutive in (1, 10, 50, 100) or (self._lead_clamp_consecutive % 100 == 0):
+                            log.warning(
+                                "leader teleop: lead clamping active for %d consecutive frames (arm target clamped to ±%.2f rad from follower commanded/measured)",
+                                self._lead_clamp_consecutive,
+                                self.arm_lead,
+                            )
+                    else:
+                        if self._lead_clamp_consecutive > 0:
+                            log.info(
+                                "leader teleop: lead clamping clear after %d consecutive frames",
+                                self._lead_clamp_consecutive,
+                            )
+                        self._lead_clamp_consecutive = 0
+
+                    self.session.servo(clamped_target)
+                    self._last_servo_cmd = list(clamped_target)
+                    self.frames_sent += 1
+                except (LeaderError, ServoRejected, LeaseError, ArmConnectionError, RebotError, OSError) as exc:
+                    self._error = exc
+                    log.error("servo streaming stopped: %s", exc)
+                    break
+                except (KeyboardInterrupt, SystemExit):
+                    raise
+                except BaseException as exc:
+                    self._error = exc
+                    raise
+                k += 1
+        except Exception as exc:
+            if self._error is None:
                 self._error = exc
-                log.error("servo streaming stopped: %s", exc)
-                break
-            except (KeyboardInterrupt, SystemExit):
-                raise
-            except BaseException as exc:
-                self._error = exc
-                raise
-            k += 1
-
-        if self._error is not None and self.park_on_exit and self._activated:
-            try:
-                self.session.unload(wait=True, timeout=15.0)
-            except Exception as exc:
-                log.warning("fail-closed park on error failed: %s", exc)
+            raise
+        finally:
+            if self._error is not None and self.park_on_exit and self._activated and not self._parked:
+                try:
+                    self.session.unload(wait=True, timeout=15.0)
+                    self._parked = True
+                except Exception as exc:
+                    log.warning("fail-closed park on error failed: %s", exc)
 
     def close(self) -> None:
         """Clean shutdown: park and release lease."""
         try:
-            if self.park_on_exit and self._activated:
+            if self.park_on_exit and self._activated and not self._parked:
                 log.info("parking follower arm ...")
                 self.session.unload(wait=True, timeout=15.0)
+                self._parked = True
         except Exception as exc:
             log.warning("park on exit failed: %s", exc)
 

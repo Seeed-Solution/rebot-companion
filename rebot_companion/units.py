@@ -457,7 +457,7 @@ def load_lerobot_norm_bounds(
 
         if "homing_offset" in entry:
             calib_ho = _finite_float(entry["homing_offset"], f"{name}.homing_offset")
-            if fj is not None and not homing_applied and ("homing_offset_steps" in fj or fj.get("homing_offset_steps") is not None):
+            if fj is not None and not homing_applied and fj.get("homing_offset_steps") is not None:
                 if abs(calib_ho - homing_offset_steps) > 1e-4:
                     raise ValueError(
                         f"{name}: homing_offset mismatch between calibration JSON ({calib_ho}) and "
@@ -542,7 +542,7 @@ def load_lerobot_norm_bounds(
 
     if "homing_offset" in grip_entry:
         g_calib_ho = _finite_float(grip_entry["homing_offset"], "gripper.homing_offset")
-        if fj_grip is not None and not g_homing_applied and ("homing_offset_steps" in fj_grip or fj_grip.get("homing_offset_steps") is not None):
+        if fj_grip is not None and not g_homing_applied and fj_grip.get("homing_offset_steps") is not None:
             if abs(g_calib_ho - g_homing_offset_steps) > 1e-4:
                 raise ValueError(
                     f"gripper: homing_offset mismatch between calibration JSON ({g_calib_ho}) and "

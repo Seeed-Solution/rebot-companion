@@ -374,16 +374,6 @@ class Arm:
         """
         if auto_yaw is not None and not isinstance(auto_yaw, bool):
             raise ValueError(f"auto_yaw must be bool or None, got {type(auto_yaw).__name__}: {auto_yaw!r}")
-        if getattr(self, "schema", None) is None:
-            sess = getattr(self, "session", None)
-            if sess is not None:
-                if getattr(sess, "_schema", None) is not None:
-                    self.schema = sess._schema
-                elif hasattr(sess, "schema") and callable(sess.schema):
-                    try:
-                        self.schema = sess.schema(timeout=1.0)
-                    except Exception:
-                        pass
         schema_obj = getattr(self, "schema", None) or getattr(getattr(self, "session", None), "_schema", None)
         caps = getattr(schema_obj, "capabilities", None) or {}
         has_auto_yaw_cap = bool(isinstance(caps, dict) and caps.get("auto_yaw") is True)

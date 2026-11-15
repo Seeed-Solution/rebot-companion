@@ -399,7 +399,7 @@ class OnnxPolicy(Policy):
                 raw_json = json.loads(policy_json_path.read_text(encoding="utf-8"))
                 if isinstance(raw_json, dict):
                     raw_unit_mode = raw_json.get("unit_mode")
-            except Exception:
+            except (OSError, ValueError, TypeError):
                 raw_unit_mode = None
 
         if raw_unit_mode is not None:
@@ -988,24 +988,6 @@ class PolicyRunner:
                         "--lerobot-calib is incompatible with 'deg' unit mode; it calibrates 'so101_norm' [-100, 100] ranges"
                     )
 
-        p_info = getattr(policy, "info", None)
-        if isinstance(p_info, dict):
-            meta_unit = p_info.get("unit_mode") or p_info.get("rebot_unit_mode")
-            if meta_unit is not None:
-                meta_unit_str = str(meta_unit).strip()
-                if meta_unit_str:
-                    if action_units != "auto" and action_units != meta_unit_str:
-                        log.warning(
-                            "explicit action_units %r differs from policy metadata unit_mode %r",
-                            action_units,
-                            meta_unit_str,
-                        )
-                    if state_units != "auto" and state_units != meta_unit_str:
-                        log.warning(
-                            "explicit state_units %r differs from policy metadata unit_mode %r",
-                            state_units,
-                            meta_unit_str,
-                        )
         self._lerobot_limits: list[tuple[float, float]] | None = None
         self._lerobot_closed_rad: float | None = None
         self._lerobot_open_rad: float | None = None

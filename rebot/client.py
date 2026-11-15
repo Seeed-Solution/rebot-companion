@@ -124,32 +124,59 @@ ACTION_TERMINAL_STATES = ("done", "failed", "cancelled")
 
 
 def _opt_float(v: Any) -> float | None:
-    if v is None:
+    if v is None or isinstance(v, bool):
         return None
     try:
         vf = float(v)
         return vf if math.isfinite(vf) else None
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, OverflowError):
         return None
 
 
 def _safe_float(v: Any, default: float = 0.0) -> float:
-    if v is None:
+    if v is None or isinstance(v, bool):
         return default
     try:
         vf = float(v)
         return vf if math.isfinite(vf) else default
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, OverflowError):
         return default
 
 
 def _safe_int(v: Any, default: int = 0) -> int:
-    if v is None:
+    if v is None or isinstance(v, bool):
         return default
     try:
+        if isinstance(v, float):
+            if not math.isfinite(v):
+                return default
         return int(v)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, OverflowError):
         return default
+
+
+def _req_int(v: Any, name: str = "value") -> int:
+    if v is None or isinstance(v, bool):
+        raise ValueError(f"{name} must be an integer, got {v!r}")
+    try:
+        if isinstance(v, float):
+            if not math.isfinite(v):
+                raise ValueError(f"{name} must be finite, got {v!r}")
+        return int(v)
+    except (ValueError, TypeError, OverflowError) as exc:
+        raise ValueError(f"{name} must be an integer, got {v!r}") from exc
+
+
+def _req_float(v: Any, name: str = "value") -> float:
+    if v is None or isinstance(v, bool):
+        raise ValueError(f"{name} must be a float, got {v!r}")
+    try:
+        vf = float(v)
+        if not math.isfinite(vf):
+            raise ValueError(f"{name} must be finite, got {v!r}")
+        return vf
+    except (ValueError, TypeError, OverflowError) as exc:
+        raise ValueError(f"{name} must be a float, got {v!r}") from exc
 
 
 @dataclass
@@ -253,6 +280,25 @@ class ActionResult:
         return self.action is None or self.action.state == "done"
 
 
+def _checked_float_vec(raw: Any, expected_len: int) -> list[float] | None:
+    if raw is None or not isinstance(raw, (list, tuple)):
+        return None
+    if len(raw) != expected_len:
+        return None
+    res: list[float] = []
+    for x in raw:
+        if x is None or isinstance(x, bool):
+            return None
+        try:
+            xf = float(x)
+            if not math.isfinite(xf):
+                return None
+            res.append(xf)
+        except (ValueError, TypeError, OverflowError):
+            return None
+    return res
+
+
 @dataclass
 class TcpPose:
     """End-effector pose in arm base frame (metres and radians / quaternion [w, x, y, z])."""
@@ -263,37 +309,15 @@ class TcpPose:
 
     @classmethod
     def from_dict(cls, d: dict) -> TcpPose:
-        def _safe_floats(key: str) -> list[float] | None:
-            raw = d.get(key)
-            if raw is None or not isinstance(raw, (list, tuple)):
-                return None
-            res = []
-            for x in raw:
-                if x is not None:
-                    try:
-                        xf = float(x)
-                        if math.isfinite(xf):
-                            res.append(xf)
-                    except (ValueError, TypeError):
-                        pass
-            return res
-
-        raw_xyz = d.get("xyz_m")
-        xyz_list: list[float] = []
-        if isinstance(raw_xyz, (list, tuple)):
-            for x in raw_xyz:
-                if x is not None:
-                    try:
-                        xf = float(x)
-                        if math.isfinite(xf):
-                            xyz_list.append(xf)
-                    except (ValueError, TypeError):
-                        pass
-
+        if not isinstance(d, dict):
+            raise ValueError(f"tcp pose must be a dict, got {d!r}")
+        xyz = _checked_float_vec(d.get("xyz_m"), 3)
+        if xyz is None:
+            raise ValueError("invalid xyz_m vector")
         return cls(
-            xyz_m=xyz_list,
-            rpy_rad=_safe_floats("rpy_rad"),
-            quat_wxyz=_safe_floats("quat_wxyz"),
+            xyz_m=xyz,
+            rpy_rad=_checked_float_vec(d.get("rpy_rad"), 3),
+            quat_wxyz=_checked_float_vec(d.get("quat_wxyz"), 4),
         )
 
     def to_dict(self) -> dict:
@@ -325,10 +349,15 @@ class GripperStatus:
 
     @classmethod
     def from_dict(cls, d: dict) -> GripperStatus:
+        if not isinstance(d, dict):
+            raise ValueError(f"gripper status must be a dict, got {d!r}")
+        joint = _req_int(d.get("joint"), "joint")
+        rad = _req_float(d.get("rad"), "rad")
+        fraction = _req_float(d.get("fraction"), "fraction")
         return cls(
-            joint=_safe_int(d.get("joint"), 0),
-            rad=_safe_float(d.get("rad"), 0.0),
-            fraction=_safe_float(d.get("fraction"), 0.0),
+            joint=joint,
+            rad=rad,
+            fraction=fraction,
             opening_m=_opt_float(d.get("opening_m")),
             stalled=bool(d.get("stalled", False)),
         )
@@ -389,6 +418,20 @@ class ArmStatus:
     def from_dict(cls, d: dict) -> ArmStatus:
         name, reason, detail = _parse_safety_state(d.get("safety_state"))
         floats = lambda key: [float(x) for x in d.get(key) or []]  # noqa: E731
+        tcp = None
+        if isinstance(d.get("tcp"), dict):
+            try:
+                tcp = TcpPose.from_dict(d["tcp"])
+            except (TypeError, ValueError):
+                tcp = None
+
+        gripper = None
+        if isinstance(d.get("gripper"), dict):
+            try:
+                gripper = GripperStatus.from_dict(d["gripper"])
+            except (TypeError, ValueError):
+                gripper = None
+
         return cls(
             timestamp=float(d.get("timestamp", 0.0)),
             positions=floats("positions"),
@@ -418,8 +461,8 @@ class ArmStatus:
             collision=dict(d["collision"]) if isinstance(d.get("collision"), dict) else None,
             motion_limit=dict(d["motion_limit"]) if isinstance(d.get("motion_limit"), dict) else None,
             gripper_zero=dict(d["gripper_zero"]) if isinstance(d.get("gripper_zero"), dict) else None,
-            tcp=TcpPose.from_dict(d["tcp"]) if isinstance(d.get("tcp"), dict) else None,
-            gripper=GripperStatus.from_dict(d["gripper"]) if isinstance(d.get("gripper"), dict) else None,
+            tcp=tcp,
+            gripper=gripper,
         )
 
     @property
@@ -1076,14 +1119,10 @@ class ArmSession:
         if obs is not None:
             if len(obs.positions) == 7:
                 return 6
-            if len(obs.positions) == 6:
-                return 5
             return None
         if pos_len is not None:
             if pos_len == 7:
                 return 6
-            if pos_len == 6:
-                return 5
             return None
         return None
 
@@ -1228,7 +1267,7 @@ class ArmSession:
                 self._pending[(kind, key)] = p
             try:
                 self._send(message)
-            except ArmdError:
+            except Exception:
                 with self._state:
                     self._pending.pop((kind, key), None)
                 raise
@@ -1484,17 +1523,15 @@ class ArmSession:
         """
         if auto_yaw is not None and not isinstance(auto_yaw, bool):
             raise ValueError(f"auto_yaw must be bool or None, got {type(auto_yaw).__name__}: {auto_yaw!r}")
-        if getattr(self, "_schema", None) is None:
-            if hasattr(self, "schema") and callable(self.schema):
-                try:
-                    self.schema(timeout=1.0)
-                except Exception:
-                    pass
-            elif hasattr(self, "get_schema") and callable(self.get_schema):
-                try:
-                    self._schema = self.get_schema(timeout=1.0)
-                except Exception:
-                    pass
+        if auto_yaw is not None and getattr(self, "_schema", None) is None:
+            now = time.monotonic()
+            last_att = getattr(self, "_last_schema_attempt", None)
+            if last_att is None or (now - last_att >= _SCHEMA_RETRY_COOLDOWN_S):
+                if hasattr(self, "schema") and callable(self.schema):
+                    try:
+                        self.schema(timeout=1.0)
+                    except Exception:
+                        pass
         caps = getattr(getattr(self, "_schema", None), "capabilities", None) or {}
         has_auto_yaw_cap = bool(isinstance(caps, dict) and caps.get("auto_yaw") is True)
         if not has_auto_yaw_cap:
@@ -1876,10 +1913,18 @@ class ArmSession:
         since the previous call is raised here as :class:`ServoRejected`.
         """
         self._raise_servo_error()
-        if not positions:
+        if positions is None:
+            raise ValueError("servo positions cannot be None")
+        try:
+            raw_positions = list(positions)
+        except TypeError as exc:
+            raise ValueError(f"servo positions must be an iterable, got {type(positions).__name__}") from exc
+        if not raw_positions:
             raise ValueError("servo positions cannot be empty")
         target = []
-        for idx, x in enumerate(positions):
+        for idx, x in enumerate(raw_positions):
+            if isinstance(x, bool):
+                raise ValueError(f"servo position[{idx}] must be numeric, got {x!r}")
             try:
                 xf = float(x)
             except (ValueError, TypeError) as exc:
@@ -1901,11 +1946,6 @@ class ArmSession:
             obs = self.latest_observation()
             ref = obs.positions if obs is not None else None
         gj = self._cached_gripper_joint(len(target))
-        if gj is None and self._schema is None:
-            if len(target) == 6:
-                gj = 5
-            elif len(target) >= 7:
-                gj = 6
         if ref is not None and len(ref) == len(target):
             for i, (t, r) in enumerate(zip(target, ref)):
                 if gj is not None and i == gj:
