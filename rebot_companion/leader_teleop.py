@@ -60,10 +60,14 @@ class LeaderError(RuntimeError):
 
 
 LeaderTeleopError = LeaderError
+_DisjointLeadError = LeaderTeleopError
 
 
-class _DisjointLeadError(LeaderTeleopError):
-    pass
+def _is_bool(val: Any) -> bool:
+    return isinstance(val, bool) or (
+        type(val).__name__ in ("bool", "bool_")
+        and type(val).__module__.split(".")[0] == "numpy"
+    )
 
 
 # --------------------------------------------------------------------------- packet codec
@@ -753,11 +757,11 @@ def _clamp_lead_and_step(
         ("max_step", max_step),
         ("max_lead", max_lead),
     ):
-        if isinstance(v, bool):
+        if _is_bool(v):
             raise LeaderTeleopError(f"{name} must be numeric, got {v!r}")
         try:
             vf = float(v)
-        except (ValueError, TypeError) as exc:
+        except (ValueError, TypeError, OverflowError) as exc:
             raise LeaderTeleopError(f"{name} must be numeric, got {v!r}") from exc
         if not math.isfinite(vf):
             raise LeaderTeleopError(f"{name} must be finite, got {v!r}")
@@ -770,22 +774,22 @@ def _clamp_lead_and_step(
     max_lead = converted["max_lead"]
 
     if j_min is not None:
-        if isinstance(j_min, bool):
+        if _is_bool(j_min):
             raise LeaderTeleopError(f"j_min must be numeric, got {j_min!r}")
         try:
             jf_min = float(j_min)
-        except (ValueError, TypeError) as exc:
+        except (ValueError, TypeError, OverflowError) as exc:
             raise LeaderTeleopError(f"j_min must be numeric, got {j_min!r}") from exc
         if not math.isfinite(jf_min):
             raise LeaderTeleopError(f"j_min must be finite, got {j_min!r}")
         j_min = jf_min
 
     if j_max is not None:
-        if isinstance(j_max, bool):
+        if _is_bool(j_max):
             raise LeaderTeleopError(f"j_max must be numeric, got {j_max!r}")
         try:
             jf_max = float(j_max)
-        except (ValueError, TypeError) as exc:
+        except (ValueError, TypeError, OverflowError) as exc:
             raise LeaderTeleopError(f"j_max must be numeric, got {j_max!r}") from exc
         if not math.isfinite(jf_max):
             raise LeaderTeleopError(f"j_max must be finite, got {j_max!r}")
@@ -805,10 +809,10 @@ def _clamp_lead_and_step(
 
     if lo > hi + 1e-9:
         j_str = f"joint {joint_index + 1}: " if joint_index is not None else ""
-        raise _DisjointLeadError(
-            f"{j_str}disjoint lead and step intervals (prev_val={prev_val:.4f}, "
+        raise LeaderTeleopError(
+            f"{j_str}disjoint lead, step, or joint-limit intervals (prev_val={prev_val:.4f}, "
             f"ref_val={ref_val:.4f}, max_step={max_step:.4f}, max_lead={max_lead:.4f}, "
-            f"lo={lo:.4f}, hi={hi:.4f}); follower moved away from command (pushed/blocked or tracking lag)"
+            f"lo={lo:.4f}, hi={hi:.4f}); follower moved away from command or limit conflict"
         )
     if lo > hi:
         return 0.5 * (lo + hi)
@@ -823,8 +827,7 @@ def _measured_ref(obs: Any) -> list[Any]:
     commanded = getattr(obs, "commanded_positions", None)
     if commanded is not None and len(commanded) > 0:
         log.warning("leader teleop: obs.positions missing; falling back to commanded_positions as reference")
-        return list(commanded)
-    return []
+    return list(commanded)
 
 
 def _validate_telemetry_ref(ref: Any) -> list[float]:
@@ -833,11 +836,11 @@ def _validate_telemetry_ref(ref: Any) -> list[float]:
         raise LeaderError(f"follower reference positions must have length 6, got {ref!r}")
     validated: list[float] = []
     for i, x in enumerate(ref):
-        if isinstance(x, bool):
+        if _is_bool(x):
             raise LeaderError(f"follower reference position[{i}] must be numeric, got {x!r}")
         try:
             val = float(x)
-        except (ValueError, TypeError) as exc:
+        except (ValueError, TypeError, OverflowError) as exc:
             raise LeaderError(f"follower reference position[{i}] must be numeric, got {x!r}") from exc
         if not math.isfinite(val):
             raise LeaderError(f"follower reference position[{i}] must be finite, got {x!r}")
@@ -952,9 +955,23 @@ class LeaderTeleopBridge:
         self.arm_lead = min(0.30, float(lead)) if isinstance(lead, (int, float)) and lead > 0 else 0.30
         self._lead_clamp_consecutive = 0
 
-        self.limits: list[tuple[float, float]] = [
-            (float(lim.min_position), float(lim.max_position)) for lim in schema.limits
-        ]
+        parsed_limits: list[tuple[float, float]] = []
+        for i, lim in enumerate(schema.limits):
+            j_min_raw = getattr(lim, "min_position", None)
+            j_max_raw = getattr(lim, "max_position", None)
+            for name, val in ((f"joint {i + 1} min_position", j_min_raw), (f"joint {i + 1} max_position", j_max_raw)):
+                if _is_bool(val):
+                    raise LeaderError(f"{name} must be numeric, got {val!r}")
+                try:
+                    vf = float(val)
+                except (ValueError, TypeError, OverflowError) as exc:
+                    raise LeaderError(f"{name} must be numeric, got {val!r}") from exc
+                if not math.isfinite(vf):
+                    raise LeaderError(f"{name} must be finite, got {val!r}")
+            if float(j_min_raw) > float(j_max_raw):
+                raise LeaderError(f"joint {i + 1} limit min ({j_min_raw}) > max ({j_max_raw})")
+            parsed_limits.append((float(j_min_raw), float(j_max_raw)))
+        self.limits = parsed_limits
         self.follower_limits = self.limits
         self.gripper_joint = schema.gripper_joint
         self.closed_rad, self.open_rad = units.resolve_schema_gripper_bounds(
@@ -1106,22 +1123,51 @@ class LeaderTeleopBridge:
             caps.append(0.6)
         return caps
 
+    def _validate_limits(self) -> None:
+        if not self.limits:
+            raise LeaderError("limits cannot be empty")
+        for i, (j_min, j_max) in enumerate(self.limits):
+            for name, val in ((f"joint {i + 1} min_position", j_min), (f"joint {i + 1} max_position", j_max)):
+                if _is_bool(val):
+                    raise LeaderError(f"{name} must be numeric, got {val!r}")
+                try:
+                    vf = float(val)
+                except (ValueError, TypeError, OverflowError) as exc:
+                    raise LeaderError(f"{name} must be numeric, got {val!r}") from exc
+                if not math.isfinite(vf):
+                    raise LeaderError(f"{name} must be finite, got {val!r}")
+            if float(j_min) > float(j_max):
+                raise LeaderError(f"joint {i + 1} limit min ({j_min}) > max ({j_max})")
+
     def _clamp_gripper_step_and_range(self, target_val: float, prev_val: float) -> float:
         """Clamp gripper target against per-frame max step and follower limits/bounds."""
         for name, v in (("target_val", target_val), ("prev_val", prev_val)):
-            if isinstance(v, bool):
+            if _is_bool(v):
                 raise LeaderError(f"gripper {name} must be numeric, got {v!r}")
             try:
                 vf = float(v)
-            except (ValueError, TypeError) as exc:
+            except (ValueError, TypeError, OverflowError) as exc:
                 raise LeaderError(f"gripper {name} must be numeric, got {v!r}") from exc
             if not math.isfinite(vf):
                 raise LeaderError(f"gripper {name} must be finite, got {v!r}")
 
+        for name, v in (
+            ("follower_gripper_open", self.follower_gripper_open),
+            ("follower_gripper_closed", self.follower_gripper_closed),
+        ):
+            if _is_bool(v):
+                raise LeaderError(f"{name} must be numeric, got {v!r}")
+            try:
+                vf = float(v)
+            except (ValueError, TypeError, OverflowError) as exc:
+                raise LeaderError(f"{name} must be numeric, got {v!r}") from exc
+            if not math.isfinite(vf):
+                raise LeaderError(f"{name} must be finite, got {v!r}")
+
         max_gripper_step = max(
-            0.30, 0.25 * abs(self.follower_gripper_open - self.follower_gripper_closed)
+            0.30, 0.25 * abs(float(self.follower_gripper_open) - float(self.follower_gripper_closed))
         )
-        if isinstance(max_gripper_step, bool) or not math.isfinite(max_gripper_step) or max_gripper_step < 0:
+        if not math.isfinite(max_gripper_step) or max_gripper_step < 0:
             raise LeaderError(
                 f"max_gripper_step must be non-negative finite float, got {max_gripper_step!r}"
             )
@@ -1130,10 +1176,21 @@ class LeaderTeleopBridge:
         gj = self.gripper_joint if self.gripper_joint is not None else 5
         if follower_limits and len(follower_limits) > gj:
             fl_lo, fl_hi = follower_limits[gj]
-            g_lo, g_hi = (fl_lo, fl_hi) if fl_lo <= fl_hi else (fl_hi, fl_lo)
+            for name, val in (("gripper limit min", fl_lo), ("gripper limit max", fl_hi)):
+                if _is_bool(val):
+                    raise LeaderError(f"{name} must be numeric, got {val!r}")
+                try:
+                    vf = float(val)
+                except (ValueError, TypeError, OverflowError) as exc:
+                    raise LeaderError(f"{name} must be numeric, got {val!r}") from exc
+                if not math.isfinite(vf):
+                    raise LeaderError(f"{name} must be finite, got {val!r}")
+            if float(fl_lo) > float(fl_hi):
+                raise LeaderError(f"gripper limit min ({fl_lo}) > max ({fl_hi})")
+            g_lo, g_hi = float(fl_lo), float(fl_hi)
         else:
-            g_lo = min(self.follower_gripper_open, self.follower_gripper_closed)
-            g_hi = max(self.follower_gripper_open, self.follower_gripper_closed)
+            g_lo = min(float(self.follower_gripper_open), float(self.follower_gripper_closed))
+            g_hi = max(float(self.follower_gripper_open), float(self.follower_gripper_closed))
         g_lo = float(g_lo)
         g_hi = float(g_hi)
 
@@ -1155,6 +1212,8 @@ class LeaderTeleopBridge:
         """Verify alignment against the follower arm and perform a smooth quintic ramp-in."""
         if self._stop:
             return
+
+        self._validate_limits()
 
         if self.schema.dof != 6 or self.schema.arm_dof not in (5, None) or self.schema.gripper_joint != 5:
             raise LeaderError(

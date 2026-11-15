@@ -183,7 +183,9 @@ do not add them to `pyproject.toml`.
 - Unified ONNX policies (`rebot-onnx-policy/v1`, directory with `policy.json` + `model.onnx`) run on
   real hardware / RK and `armd --follower sim` via `rebot-policy --policy onnx:<dir>` (needs only
   `--extra onnx`, zero torch/lerobot) and inside the browser `WASM_SIM` sandbox via
-  `onnxruntime-web`.
+  `onnxruntime-web`. On SO-ARM101, `rebot-onnx-policy/v1` packages require `"unit_mode"` in
+  `policy.json` (while browser WASM defaults missing `unit_mode` to `"rad"`), or explicit
+  `--action-units`/`--state-units` with `--override-unit-mode`.
 
 ## Simulation & WASM Sandbox (`rebot-scene` / `/api/v1/sandbox/*`)
 

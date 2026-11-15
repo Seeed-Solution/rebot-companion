@@ -125,18 +125,67 @@ def _parse_safety_state(value: Any) -> tuple[str, str | None, Any]:
 ACTION_TERMINAL_STATES = ("done", "failed", "cancelled")
 
 
+def _is_bool(val: Any) -> bool:
+    return isinstance(val, bool) or (
+        type(val).__name__ in ("bool", "bool_")
+        and type(val).__module__.split(".")[0] == "numpy"
+    )
+
+
+def _checked_finite_float(
+    val: Any,
+    name: str,
+    *,
+    positive: bool = False,
+    exc_type: type[Exception] = ValueError,
+    type_desc: str = "numeric",
+) -> float:
+    if _is_bool(val):
+        raise exc_type(f"{name} must be {type_desc}, got {val!r}")
+    try:
+        vf = float(val)
+    except (ValueError, TypeError, OverflowError) as exc:
+        raise exc_type(f"{name} must be {type_desc}, got {val!r}") from exc
+    if not math.isfinite(vf):
+        raise exc_type(f"{name} must be finite, got {val!r}")
+    if positive and vf <= 0:
+        raise exc_type(f"{name} must be positive (> 0), got {val!r}")
+    return vf
+
+
+def _checked_float_seq(raw: Any, name: str) -> list[float]:
+    if raw is None:
+        return []
+    if not isinstance(raw, (list, tuple)):
+        raise ValueError(f"{name} must be a list or tuple, got {type(raw).__name__}")
+    return [_checked_finite_float(x, f"{name}[{idx}]") for idx, x in enumerate(raw)]
+
+
+def _loads_seq(raw: Any) -> list[float] | None:
+    if not isinstance(raw, list):
+        return None
+    res: list[float] = []
+    for idx, x in enumerate(raw):
+        if _is_bool(x):
+            raise ValueError(f"loads[{idx}] must be numeric, got {x!r}")
+        try:
+            res.append(float(x))
+        except (ValueError, TypeError, OverflowError) as exc:
+            raise ValueError(f"loads[{idx}] must be numeric, got {x!r}") from exc
+    return res
+
+
 def _opt_float(v: Any) -> float | None:
-    if v is None or isinstance(v, bool):
+    if v is None or _is_bool(v):
         return None
     try:
-        vf = float(v)
-        return vf if math.isfinite(vf) else None
+        return _checked_finite_float(v, "value")
     except (ValueError, TypeError, OverflowError):
         return None
 
 
 def _req_int(v: Any, name: str = "value") -> int:
-    if v is None or isinstance(v, bool):
+    if v is None or _is_bool(v):
         raise ValueError(f"{name} must be an integer, got {v!r}")
     try:
         if isinstance(v, float):
@@ -149,15 +198,7 @@ def _req_int(v: Any, name: str = "value") -> int:
 
 
 def _req_float(v: Any, name: str = "value") -> float:
-    if v is None or isinstance(v, bool):
-        raise ValueError(f"{name} must be a float, got {v!r}")
-    try:
-        vf = float(v)
-    except (ValueError, TypeError, OverflowError) as exc:
-        raise ValueError(f"{name} must be a float, got {v!r}") from exc
-    if not math.isfinite(vf):
-        raise ValueError(f"{name} must be finite, got {v!r}")
-    return vf
+    return _checked_finite_float(v, name, type_desc="a float")
 
 
 @dataclass
@@ -398,7 +439,10 @@ class ArmStatus:
     @classmethod
     def from_dict(cls, d: dict) -> ArmStatus:
         name, reason, detail = _parse_safety_state(d.get("safety_state"))
-        floats = lambda key: [float(x) for x in d.get(key) or []]  # noqa: E731
+        timestamp = _checked_finite_float(
+            d.get("timestamp") if d.get("timestamp") is not None else 0.0,
+            "timestamp",
+        )
         tcp = None
         if isinstance(d.get("tcp"), dict):
             try:
@@ -416,31 +460,35 @@ class ArmStatus:
                 gripper = None
 
         return cls(
-            timestamp=float(d.get("timestamp", 0.0)),
-            positions=floats("positions"),
-            velocities=floats("velocities"),
-            torques=floats("torques"),
-            temperatures=floats("temperatures"),
+            timestamp=timestamp,
+            positions=_checked_float_seq(d.get("positions"), "positions"),
+            velocities=_checked_float_seq(d.get("velocities"), "velocities"),
+            torques=_checked_float_seq(d.get("torques"), "torques"),
+            temperatures=_checked_float_seq(d.get("temperatures"), "temperatures"),
             is_torqued=bool(d.get("is_torqued", False)),
             safety_state=name,
             epoch_id=int(d.get("epoch_id", 0)),
             fault_reason=reason,
             fault_detail=detail,
             gravity_compensated=bool(d.get("gravity_compensated", False)),
-            gravity_torques=floats("gravity_torques"),
+            gravity_torques=_checked_float_seq(d.get("gravity_torques"), "gravity_torques"),
             driver_capabilities=dict(d.get("driver_capabilities") or {}),
             enable_state=str(d.get("enable_state", "Unknown")),
             feedback_age_ms=list(d.get("feedback_age_ms") or []),
             disable_pending=bool(d.get("disable_pending", False)),
             feedback_valid=bool(d.get("feedback_valid", False)),
-            commanded_positions=floats("commanded_positions"),
+            commanded_positions=_checked_float_seq(d.get("commanded_positions"), "commanded_positions"),
             action=ActionStatus.from_dict(d["action"]) if isinstance(d.get("action"), dict) else None,
             previous_action=(
                 ActionStatus.from_dict(d["previous_action"]) if isinstance(d.get("previous_action"), dict) else None
             ),
             fault=dict(d["fault"]) if isinstance(d.get("fault"), dict) else None,
-            residual_torques=floats("residual_torques") if isinstance(d.get("residual_torques"), list) else None,
-            loads=floats("loads") if isinstance(d.get("loads"), list) else None,
+            residual_torques=(
+                _checked_float_seq(d["residual_torques"], "residual_torques")
+                if isinstance(d.get("residual_torques"), list)
+                else None
+            ),
+            loads=_loads_seq(d.get("loads")),
             collision=dict(d["collision"]) if isinstance(d.get("collision"), dict) else None,
             motion_limit=dict(d["motion_limit"]) if isinstance(d.get("motion_limit"), dict) else None,
             gripper_zero=dict(d["gripper_zero"]) if isinstance(d.get("gripper_zero"), dict) else None,
@@ -753,17 +801,7 @@ def _vec(v: Sequence[float] | None, n: int, name: str) -> list[float]:
         items = list(v)
     except TypeError as exc:
         raise ValueError(f"{name} must be an iterable, got {type(v).__name__}") from exc
-    out = []
-    for idx, x in enumerate(items):
-        if isinstance(x, bool):
-            raise ValueError(f"{name}[{idx}] must be numeric, got bool: {x!r}")
-        try:
-            xf = float(x)
-        except (ValueError, TypeError) as exc:
-            raise ValueError(f"{name}[{idx}] must be numeric, got {x!r}") from exc
-        if not math.isfinite(xf):
-            raise ValueError(f"{name}[{idx}] must be finite, got {x!r}")
-        out.append(xf)
+    out = [_checked_finite_float(x, f"{name}[{idx}]") for idx, x in enumerate(items)]
     if len(out) != n:
         raise ValueError(f"{name} needs {n} values, got {len(out)}")
     return out
@@ -773,15 +811,7 @@ def _put_speed(body: dict, linear: float | None, angular: float | None) -> None:
     speed = {}
     for k, v in (("linear", linear), ("angular", angular)):
         if v is not None:
-            try:
-                vf = float(v)
-            except (ValueError, TypeError) as exc:
-                raise ValueError(f"speed {k} must be numeric, got {v!r}") from exc
-            if not math.isfinite(vf):
-                raise ValueError(f"speed {k} must be finite, got {v!r}")
-            if vf <= 0:
-                raise ValueError(f"speed {k} must be positive (> 0), got {vf}")
-            speed[k] = vf
+            speed[k] = _checked_finite_float(v, f"speed {k}", positive=True)
     if speed:
         body["speed"] = speed
 
@@ -1416,15 +1446,7 @@ class ArmSession:
             raise ValueError("target_positions cannot be empty")
         target = []
         for idx, x in enumerate(raw_target):
-            if isinstance(x, bool):
-                raise ValueError(f"target_positions[{idx}] must be numeric, got {x!r}")
-            try:
-                xf = float(x)
-            except (ValueError, TypeError) as exc:
-                raise ValueError(f"target_positions[{idx}] must be numeric, got {x!r}") from exc
-            if not math.isfinite(xf):
-                raise ValueError(f"target_positions[{idx}] must be finite, got {x!r}")
-            target.append(xf)
+            target.append(_checked_finite_float(x, f"target_positions[{idx}]"))
 
         if self._schema is not None and getattr(self._schema, "dof", None) is not None:
             expected_dof = int(self._schema.dof)
@@ -1432,13 +1454,7 @@ class ArmSession:
                 raise ValueError(f"target_positions length ({len(target)}) does not match schema DOF ({expected_dof})")
         body: dict = {"target_positions": target}
         if duration is not None:
-            try:
-                df = float(duration)
-            except (ValueError, TypeError) as exc:
-                raise ValueError(f"duration must be numeric, got {duration!r}") from exc
-            if not math.isfinite(df) or df <= 0:
-                raise ValueError(f"duration must be positive and finite, got {duration!r}")
-            body["duration_secs"] = df
+            body["duration_secs"] = _checked_finite_float(duration, "duration", positive=True)
         frames_at_ack = self._frames_after(lambda: self.command("/api/v1/motion/jog", body))
         if not wait:
             return None
@@ -1450,13 +1466,7 @@ class ArmSession:
         """Move to armd's configured home positions."""
         body = {}
         if duration is not None:
-            try:
-                df = float(duration)
-            except (ValueError, TypeError) as exc:
-                raise ValueError(f"duration must be numeric, got {duration!r}") from exc
-            if not math.isfinite(df) or df <= 0:
-                raise ValueError(f"duration must be positive and finite, got {duration!r}")
-            body["duration_secs"] = df
+            body["duration_secs"] = _checked_finite_float(duration, "duration", positive=True)
         frames_at_ack = self._frames_after(lambda: self.command("/api/v1/motion/home", body))
         if not wait:
             return None
@@ -1527,6 +1537,8 @@ class ArmSession:
         """
         if auto_yaw is not None and not isinstance(auto_yaw, bool):
             raise ValueError(f"auto_yaw must be bool or None, got {type(auto_yaw).__name__}: {auto_yaw!r}")
+        if auto_yaw is False:
+            auto_yaw = None
         if auto_yaw is not None and getattr(self, "_schema", None) is None:
             now = time.monotonic()
             last_att = getattr(self, "_last_schema_attempt", None)
@@ -1534,15 +1546,13 @@ class ArmSession:
                 if hasattr(self, "schema") and callable(self.schema):
                     try:
                         self.schema(timeout=1.0)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        log.debug("schema fetch failed: %s", exc)
         caps = getattr(getattr(self, "_schema", None), "capabilities", None) or {}
         has_auto_yaw_cap = bool(isinstance(caps, dict) and caps.get("auto_yaw") is True)
         if not has_auto_yaw_cap:
             if auto_yaw is True:
                 raise UnsupportedError("armd does not advertise auto_yaw capability", code="UNSUPPORTED")
-            if auto_yaw is False:
-                auto_yaw = None
         if rpy is not None and quat is not None:
             raise ValueError("give rpy or quat, not both")
         body: dict = {"position": _vec(position, 3, "position")}

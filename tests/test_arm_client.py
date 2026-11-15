@@ -669,3 +669,52 @@ def test_require_succeeds_immediately_after_open_prefetch_failure(armd):
         # require() must succeed immediately without waiting 5s cooldown
         s.require("poses", "Test poses")
         assert s._schema is not None
+
+
+def test_put_speed_and_durations_reject_bool_and_overflow():
+    from unittest.mock import MagicMock
+    from rebot.client import ArmSession, _put_speed
+
+    # 1. _put_speed rejects bool, 10**400, non-positive
+    body = {}
+    with pytest.raises(ValueError, match="speed linear must be numeric, got True"):
+        _put_speed(body, True, None)
+    with pytest.raises(ValueError, match="speed angular must be numeric"):
+        _put_speed(body, None, 10**400)
+    with pytest.raises(ValueError, match="speed linear must be positive"):
+        _put_speed(body, 0.0, None)
+
+    # 2. move_to(duration=...) and home(duration=...) reject bool and overflow before sending
+    mock_client = MagicMock()
+    s = ArmSession(mock_client)
+    s.command = MagicMock()
+
+    with pytest.raises(ValueError, match="duration must be numeric, got True"):
+        s.move_to([0.0] * 6, duration=True)
+    with pytest.raises(ValueError, match="duration must be numeric"):
+        s.move_to([0.0] * 6, duration=10**400)
+    s.command.assert_not_called()
+
+    with pytest.raises(ValueError, match="duration must be numeric, got False"):
+        s.home(duration=False)
+    with pytest.raises(ValueError, match="duration must be numeric"):
+        s.home(duration=10**400)
+    s.command.assert_not_called()
+
+
+def test_arm_status_from_dict_rejects_bool_and_nan_in_vectors():
+    # positions with bool or nan
+    with pytest.raises(ValueError, match="positions\\[0\\] must be numeric"):
+        ArmStatus.from_dict({"positions": [True, 0.0, 0.0, 0.0, 0.0, 0.0]})
+    with pytest.raises(ValueError, match="positions\\[2\\] must be finite"):
+        ArmStatus.from_dict({"positions": [0.0, 0.0, float("nan"), 0.0, 0.0, 0.0]})
+
+    # velocities with bool or inf
+    with pytest.raises(ValueError, match="velocities\\[1\\] must be numeric"):
+        ArmStatus.from_dict({"velocities": [0.0, False, 0.0, 0.0, 0.0, 0.0]})
+    with pytest.raises(ValueError, match="velocities\\[3\\] must be finite"):
+        ArmStatus.from_dict({"velocities": [0.0, 0.0, 0.0, float("inf"), 0.0, 0.0]})
+
+    # commanded_positions with overflow int
+    with pytest.raises(ValueError, match="commanded_positions\\[0\\] must be numeric"):
+        ArmStatus.from_dict({"commanded_positions": [10**400, 0.0, 0.0, 0.0, 0.0, 0.0]})

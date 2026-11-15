@@ -36,12 +36,38 @@ def _first_non_none(entry: Mapping[str, Any], *keys: str) -> Any:
     return None
 
 
+def _is_bool(val: Any) -> bool:
+    return isinstance(val, bool) or (
+        type(val).__name__ in ("bool", "bool_")
+        and type(val).__module__.split(".")[0] == "numpy"
+    )
+
+
+def _strict_bool(val: Any, name: str) -> bool:
+    if _is_bool(val):
+        return bool(val)
+    if isinstance(val, (int, float)):
+        if val == 0:
+            return False
+        if val == 1:
+            return True
+        raise ValueError(f"{name} must be boolean or 0/1, got {val!r}")
+    if isinstance(val, str):
+        s = val.strip().lower()
+        if s in ("true", "1", "yes", "on"):
+            return True
+        if s in ("false", "0", "no", "off"):
+            return False
+        raise ValueError(f"{name} must be a boolean string, got {val!r}")
+    raise ValueError(f"{name} must be boolean, got {type(val).__name__}: {val!r}")
+
+
 def _finite_float(val: Any, label: str) -> float:
-    if isinstance(val, bool):
+    if _is_bool(val):
         raise ValueError(f"{label} must be numeric, got {val!r}")
     try:
         f = float(val)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError(f"{label} must be numeric, got {val!r}") from exc
     if not math.isfinite(f):
         raise ValueError(f"{label} must be finite, got {val!r}")
@@ -452,9 +478,10 @@ def load_lerobot_norm_bounds(
             else None
         )
         if fj is not None:
-            armd_sign = -1.0 if fj.get("drive_mode_invert") else 1.0
+            drive_invert = _strict_bool(fj.get("drive_mode_invert", False), f"{name}.drive_mode_invert")
+            armd_sign = -1.0 if drive_invert else 1.0
             zero_step_fj = _finite_float(fj.get("zero_step", 2048.0), f"{name}.fj.zero_step")
-            homing_applied = bool(fj.get("homing_applied_in_hw", False))
+            homing_applied = _strict_bool(fj.get("homing_applied_in_hw", False), f"{name}.homing_applied_in_hw")
             homing_offset_steps = _finite_float(fj.get("homing_offset_steps", 0.0), f"{name}.fj.homing_offset_steps")
         else:
             armd_sign = 1.0
@@ -547,9 +574,10 @@ def load_lerobot_norm_bounds(
         else None
     )
     if fj_grip is not None:
-        g_armd_sign = -1.0 if fj_grip.get("drive_mode_invert") else 1.0
+        g_drive_invert = _strict_bool(fj_grip.get("drive_mode_invert", False), "gripper.drive_mode_invert")
+        g_armd_sign = -1.0 if g_drive_invert else 1.0
         g_zero_step_fj = _finite_float(fj_grip.get("zero_step", 2048.0), "gripper.fj.zero_step")
-        g_homing_applied = bool(fj_grip.get("homing_applied_in_hw", False))
+        g_homing_applied = _strict_bool(fj_grip.get("homing_applied_in_hw", False), "gripper.homing_applied_in_hw")
         g_homing_offset_steps = _finite_float(fj_grip.get("homing_offset_steps", 0.0), "gripper.fj.homing_offset_steps")
     else:
         g_armd_sign = 1.0

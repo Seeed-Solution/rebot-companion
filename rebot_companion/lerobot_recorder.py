@@ -58,6 +58,13 @@ from rebot.client import ArmStatus
 
 from . import units
 
+
+def _is_bool(val: Any) -> bool:
+    return isinstance(val, bool) or (
+        type(val).__name__ in ("bool", "bool_")
+        and type(val).__module__.split(".")[0] == "numpy"
+    )
+
 log = logging.getLogger(__name__)
 
 CODEBASE_VERSION = "v3.0"
@@ -723,6 +730,8 @@ class LeRobotRecorder:
             raise ValueError("image is required: the dataset has a camera feature")
         i = len(ep.state)
         if i == 0:
+            if self._dof is not None and len(state) != self._dof:
+                raise ValueError(f"state has {len(state)} values, expected dataset DOF {self._dof}")
             dof = len(state)
             arm_dof = 6 if (self.schema is None and dof == 7 and self.arm_dof is None) else self.arm_dof
             gripper_joint = 6 if (self.schema is None and dof == 7 and self.gripper_joint is None) else self.gripper_joint
@@ -736,11 +745,11 @@ class LeRobotRecorder:
 
         for vec_name, vec in (("state", state), ("action", action)):
             for idx, x in enumerate(vec):
-                if isinstance(x, bool):
+                if _is_bool(x):
                     raise ValueError(f"{vec_name}[{idx}] must be numeric, got {x!r}")
                 try:
                     xf = float(x)
-                except (ValueError, TypeError) as exc:
+                except (ValueError, TypeError, OverflowError) as exc:
                     raise ValueError(f"{vec_name}[{idx}] must be numeric, got {x!r}") from exc
                 if not math.isfinite(xf):
                     raise ValueError(f"{vec_name}[{idx}] must be finite, got {x!r}")
@@ -752,11 +761,11 @@ class LeRobotRecorder:
                     raise ValueError(f"{name} needs {dof} values")
                 row: list[float] = []
                 for idx, x in enumerate(values):
-                    if isinstance(x, bool):
+                    if _is_bool(x):
                         raise ValueError(f"{name}[{idx}] must be numeric, got {x!r}")
                     try:
                         xf = float(x)
-                    except (ValueError, TypeError) as exc:
+                    except (ValueError, TypeError, OverflowError) as exc:
                         raise ValueError(f"{name}[{idx}] must be numeric, got {x!r}") from exc
                     if not math.isfinite(xf):
                         raise ValueError(f"{name}[{idx}] must be finite, got {x!r}")
@@ -793,6 +802,30 @@ class LeRobotRecorder:
                 open_rad=self.open_rad,
             )
 
+        conv_state_list: list[float] = []
+        for idx, x in enumerate(converted_state):
+            if _is_bool(x):
+                raise ValueError(f"converted state[{idx}] must be numeric, got {x!r}")
+            try:
+                xf = float(x)
+            except (ValueError, TypeError, OverflowError) as exc:
+                raise ValueError(f"converted state[{idx}] must be numeric, got {x!r}") from exc
+            if not math.isfinite(xf):
+                raise ValueError(f"converted state[{idx}] must be finite, got {x!r}")
+            conv_state_list.append(xf)
+
+        conv_action_list: list[float] = []
+        for idx, x in enumerate(converted_action):
+            if _is_bool(x):
+                raise ValueError(f"converted action[{idx}] must be numeric, got {x!r}")
+            try:
+                xf = float(x)
+            except (ValueError, TypeError, OverflowError) as exc:
+                raise ValueError(f"converted action[{idx}] must be numeric, got {x!r}") from exc
+            if not math.isfinite(xf):
+                raise ValueError(f"converted action[{idx}] must be finite, got {x!r}")
+            conv_action_list.append(xf)
+
         stat_img = None
         if ep.video is not None:
             every = max(1, round(self.fps * STATS_IMAGE_EVERY_S))
@@ -803,8 +836,8 @@ class LeRobotRecorder:
         self._dof = dof
         self.arm_dof = arm_dof
         self.gripper_joint = gripper_joint
-        ep.state.append([float(x) for x in converted_state])
-        ep.action.append([float(x) for x in converted_action])
+        ep.state.append(conv_state_list)
+        ep.action.append(conv_action_list)
         for name, row in extra_rows.items():
             ep.extras[name].append(row)
         if stat_img is not None:

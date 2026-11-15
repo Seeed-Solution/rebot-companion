@@ -988,10 +988,18 @@ class PolicyRunner:
         self.state_units_requested = state_units
         self.override_unit_mode = bool(override_unit_mode)
         self.lerobot_calib = lerobot_calib
-        p_info = getattr(policy, "info", None)
-        info_dict = p_info if isinstance(p_info, dict) else None
-        preview_action_units = units.resolve_unit_mode(action_units, info_dict, require_metadata=False)
-        preview_state_units = units.resolve_unit_mode(state_units, info_dict, require_metadata=False)
+        p_name = getattr(policy, "name", None)
+        if p_name == "sine" or (isinstance(p_name, str) and p_name.startswith("sine:")):
+            preview_action_units = "rad"
+            preview_state_units = "rad"
+        else:
+            p_info = getattr(policy, "info", None)
+            info_dict = p_info if isinstance(p_info, dict) else None
+            try:
+                preview_action_units = units.resolve_unit_mode(action_units, info_dict, require_metadata=False)
+                preview_state_units = units.resolve_unit_mode(state_units, info_dict, require_metadata=False)
+            except ValueError as exc:
+                raise RunnerError(str(exc)) from exc
         _check_lerobot_calib_compatible(self.lerobot_calib, preview_action_units, preview_state_units)
 
         self._lerobot_limits: list[tuple[float, float]] | None = None
@@ -1241,12 +1249,15 @@ class PolicyRunner:
             self.action_units = "rad"
             self.state_units = "rad"
         else:
-            self.action_units = units.resolve_unit_mode(
-                self.action_units_requested, policy_info, require_metadata=require_meta
-            )
-            self.state_units = units.resolve_unit_mode(
-                self.state_units_requested, policy_info, require_metadata=require_meta
-            )
+            try:
+                self.action_units = units.resolve_unit_mode(
+                    self.action_units_requested, policy_info, require_metadata=require_meta
+                )
+                self.state_units = units.resolve_unit_mode(
+                    self.state_units_requested, policy_info, require_metadata=require_meta
+                )
+            except ValueError as exc:
+                raise RunnerError(str(exc)) from exc
 
         _check_lerobot_calib_compatible(self.lerobot_calib, self.action_units, self.state_units)
 
