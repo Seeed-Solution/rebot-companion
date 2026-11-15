@@ -1523,16 +1523,14 @@ class ArmSession:
         """
         if auto_yaw is not None and not isinstance(auto_yaw, bool):
             raise ValueError(f"auto_yaw must be bool or None, got {type(auto_yaw).__name__}: {auto_yaw!r}")
-        if auto_yaw is not None and getattr(self, "_schema", None) is None:
-            now = time.monotonic()
-            last_att = getattr(self, "_last_schema_attempt", None)
-            if last_att is None or (now - last_att >= _SCHEMA_RETRY_COOLDOWN_S):
-                if hasattr(self, "schema") and callable(self.schema):
-                    try:
-                        self.schema(timeout=1.0)
-                    except Exception:
-                        pass
-        caps = getattr(getattr(self, "_schema", None), "capabilities", None) or {}
+        if auto_yaw is not None and self._schema is None:
+            last_att = self._last_schema_attempt
+            if last_att is None or (time.monotonic() - last_att >= _SCHEMA_RETRY_COOLDOWN_S):
+                try:
+                    self.schema(timeout=1.0)
+                except Exception:
+                    pass
+        caps = getattr(self._schema, "capabilities", None) or {}
         has_auto_yaw_cap = bool(isinstance(caps, dict) and caps.get("auto_yaw") is True)
         if not has_auto_yaw_cap:
             if auto_yaw is True:
@@ -2011,19 +2009,7 @@ class ArmSession:
     def _tolerances(self, target: Sequence[float], tolerance: Any) -> list[float | None]:
         if tolerance is None:
             tol: list[float | None] = [0.03] * len(target)
-            if self._schema is not None:
-                gj = self._schema.gripper_joint
-            elif self._gripper_joint is not _GRIPPER_UNSET:
-                gj = self._gripper_joint  # type: ignore[assignment]
-            else:
-                now = time.monotonic()
-                if self._last_schema_attempt is None or (now - self._last_schema_attempt >= _SCHEMA_RETRY_COOLDOWN_S):
-                    try:
-                        gj = self.schema(timeout=0.5).gripper_joint
-                    except Exception:
-                        gj = self._cached_gripper_joint(len(target))
-                else:
-                    gj = self._cached_gripper_joint(len(target))
+            gj = self.gripper_joint
             if gj is not None and len(target) > gj:
                 tol[gj] = None
             elif self._schema is None and gj is None and len(target) >= 7:

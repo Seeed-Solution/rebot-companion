@@ -929,18 +929,12 @@ class LeaderTeleopBridge:
         self.limits: list[tuple[float, float]] = [
             (float(lim.min_position), float(lim.max_position)) for lim in schema.limits
         ]
-        self.follower_limits = self.limits
         self.gripper_joint = schema.gripper_joint
         self.closed_rad, self.open_rad = units.resolve_schema_gripper_bounds(
             schema.gripper_policy, self.limits, self.gripper_joint
         )
-        self.follower_gripper_open = self.open_rad
-        self.follower_gripper_closed = self.closed_rad
         if getattr(session, "_schema", None) is None:
-            if hasattr(session, "set_schema"):
-                session.set_schema(schema)
-            else:
-                session._schema = schema
+            session.set_schema(schema)
 
         self._stop = False
         self._activated = False
@@ -1093,21 +1087,20 @@ class LeaderTeleopBridge:
                 raise LeaderError(f"gripper {name} must be finite, got {v!r}")
 
         max_gripper_step = max(
-            0.30, 0.25 * abs(self.follower_gripper_open - self.follower_gripper_closed)
+            0.30, 0.25 * abs(self.open_rad - self.closed_rad)
         )
         if isinstance(max_gripper_step, bool) or not math.isfinite(max_gripper_step) or max_gripper_step < 0:
             raise LeaderError(
                 f"max_gripper_step must be non-negative finite float, got {max_gripper_step!r}"
             )
 
-        follower_limits = getattr(self, "follower_limits", None) or self.limits
         gj = self.gripper_joint if self.gripper_joint is not None else 5
-        if follower_limits and len(follower_limits) > gj:
-            fl_lo, fl_hi = follower_limits[gj]
+        if self.limits and len(self.limits) > gj:
+            fl_lo, fl_hi = self.limits[gj]
             g_lo, g_hi = (fl_lo, fl_hi) if fl_lo <= fl_hi else (fl_hi, fl_lo)
         else:
-            g_lo = min(self.follower_gripper_open, self.follower_gripper_closed)
-            g_hi = max(self.follower_gripper_open, self.follower_gripper_closed)
+            g_lo = min(self.open_rad, self.closed_rad)
+            g_hi = max(self.open_rad, self.closed_rad)
         g_lo = float(g_lo)
         g_hi = float(g_hi)
 
@@ -1590,10 +1583,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         session.open()
         if stop_requested.is_set():
             return 0
-        if hasattr(session, "set_schema"):
-            session.set_schema(schema)
-        else:
-            session._schema = schema
+        session.set_schema(schema)
         bridge = LeaderTeleopBridge(
             bus,
             session,
