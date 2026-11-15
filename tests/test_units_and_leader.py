@@ -1995,9 +1995,16 @@ def test_leader_bridge_quintic_ramp_step_limit_extended(monkeypatch):
     mock_session.wait_for_observation.return_value = armed_obs
     mock_session.latest_observation.return_value = armed_obs
 
+    cur_t = [100.0]
+
+    def fake_monotonic():
+        return cur_t[0]
+
     def fake_sleep(dur):
+        cur_t[0] += dur
         mock_session._frames += 1
 
+    monkeypatch.setattr(time, "monotonic", fake_monotonic)
     monkeypatch.setattr(time, "sleep", fake_sleep)
     initial_pos = list(armed_obs.positions)
     mock_session.servo.side_effect = lambda cmd: setattr(armed_obs, "positions", list(cmd))
@@ -3965,3 +3972,125 @@ def test_lerobot_recorder_toolless_7dof_and_custom_joint_names(tmp_path: Path):
     rec_custom._dof = 7
     feats = rec_custom._features()
     assert feats["observation.state"]["names"] == custom_names
+
+
+def test_load_lerobot_norm_bounds_homing_offset_custom_zero_step(tmp_path: Path):
+    """When calibration JSON has homing_offset without zero_step/center, use follower feetech_joints zero_step."""
+    calib_json = tmp_path / "calib_homing_no_zero_step.json"
+    calib_data = {
+        "shoulder_pan": {"range_min": 1024, "range_max": 3072, "homing_offset": 200},
+        "shoulder_lift": {"range_min": 1024, "range_max": 3072, "homing_offset": 200},
+        "elbow_flex": {"range_min": 1024, "range_max": 3072, "homing_offset": 200},
+        "wrist_flex": {"range_min": 1024, "range_max": 3072, "homing_offset": 200},
+        "wrist_roll": {"range_min": 1024, "range_max": 3072, "homing_offset": 200},
+        "gripper": {"range_min": 1500, "range_max": 2500, "homing_offset": 200},
+    }
+    calib_json.write_text(json.dumps(calib_data), encoding="utf-8")
+
+    for homing_applied in (False, True):
+        schema_feetech = ObservationSchema.from_dict({
+            "dof": 6,
+            "arm_dof": 5,
+            "gripper_joint": 5,
+            "limits": [
+                {"name": f"j{i}", "min_position": -3.0, "max_position": 3.0, "max_velocity": 1.0, "max_acceleration": 1.0}
+                for i in range(6)
+            ],
+            "feetech_joints": [
+                {"zero_step": 1850, "homing_applied_in_hw": homing_applied, "homing_offset_steps": 200, "drive_mode_invert": False}
+                for _ in range(5)
+            ] + [
+                {"zero_step": 1900, "homing_applied_in_hw": homing_applied, "homing_offset_steps": 200, "drive_mode_invert": False}
+            ],
+        })
+
+        limits, closed_rad, open_rad = units.load_lerobot_norm_bounds(calib_json, schema=schema_feetech)
+
+        # Arm joints: effective_zero must be 1850 (not 2048 and not 1850 + 200 = 2050)
+        expected_arm_neg = (1024 - 1850) * (2 * math.pi / 4096)
+        expected_arm_pos = (3072 - 1850) * (2 * math.pi / 4096)
+        assert math.isclose(limits[0][0], expected_arm_neg, rel_tol=1e-5)
+        assert math.isclose(limits[0][1], expected_arm_pos, rel_tol=1e-5)
+
+        # Gripper: effective_zero must be 1900 (not 2048 and not 1900 + 200 = 2100)
+        expected_g_closed = (1500 - 1900) * (2 * math.pi / 4096)
+        expected_g_open = (2500 - 1900) * (2 * math.pi / 4096)
+        assert math.isclose(closed_rad, expected_g_closed, rel_tol=1e-5)
+        assert math.isclose(open_rad, expected_g_open, rel_tol=1e-5)
+
+
+def test_non_finite_limits_and_calib_raise_value_error(tmp_path: Path):
+    bad_limits = [(-1.0, 1.0)] * 5 + [(0.0, float("inf"))]
+
+    # 1. resolve_schema_gripper_bounds with non-finite limit endpoint raises ValueError
+    with pytest.raises(ValueError, match="limit.*must be finite"):
+        units.resolve_schema_gripper_bounds(None, bad_limits, 5)
+
+    # 2. from_armd and to_armd raise ValueError
+    with pytest.raises(ValueError, match="limit.*must be finite"):
+        units.from_armd([0.0] * 6, "so101_norm", limits=bad_limits, gripper_joint=5)
+
+    with pytest.raises(ValueError, match="limit.*must be finite"):
+        units.to_armd([0.0] * 6, "so101_norm", limits=bad_limits, gripper_joint=5)
+
+    # 3. "center": "NaN" in load_lerobot_norm_bounds raises ValueError
+    nan_center_json = tmp_path / "nan_center.json"
+    nan_center_data = {
+        "shoulder_pan": {"range_min": 1024, "range_max": 3072, "center": "NaN"},
+        "shoulder_lift": {"range_min": 1024, "range_max": 3072},
+        "elbow_flex": {"range_min": 1024, "range_max": 3072},
+        "wrist_flex": {"range_min": 1024, "range_max": 3072},
+        "wrist_roll": {"range_min": 1024, "range_max": 3072},
+        "gripper": {"range_min": 1500, "range_max": 2500},
+    }
+    nan_center_json.write_text(json.dumps(nan_center_data), encoding="utf-8")
+    with pytest.raises(ValueError, match="must be finite"):
+        units.load_lerobot_norm_bounds(nan_center_json)
+
+    # 4. "homing_offset": "NaN" in load_lerobot_norm_bounds raises ValueError
+    nan_homing_json = tmp_path / "nan_homing.json"
+    nan_homing_data = {
+        "shoulder_pan": {"range_min": 1024, "range_max": 3072, "homing_offset": "NaN"},
+        "shoulder_lift": {"range_min": 1024, "range_max": 3072},
+        "elbow_flex": {"range_min": 1024, "range_max": 3072},
+        "wrist_flex": {"range_min": 1024, "range_max": 3072},
+        "wrist_roll": {"range_min": 1024, "range_max": 3072},
+        "gripper": {"range_min": 1500, "range_max": 2500},
+    }
+    nan_homing_json.write_text(json.dumps(nan_homing_data), encoding="utf-8")
+    with pytest.raises(ValueError, match="must be finite"):
+        units.load_lerobot_norm_bounds(nan_homing_json)
+
+
+def test_arm_session_move_pose_auto_yaw_false_normalization():
+    mock_client = MagicMock()
+    session = ArmSession(mock_client)
+    session._action = MagicMock()
+
+    # 1. When _schema lacks auto_yaw capability, auto_yaw=False omits "auto_yaw" from body
+    session._schema = ObservationSchema.from_dict({
+        "dof": 6, "arm_dof": 5, "gripper_joint": 5, "capabilities": {"auto_yaw": False}
+    })
+    session.move_pose([0.2, 0.0, 0.1], auto_yaw=False)
+    assert session._action.call_count == 1
+    call_body = session._action.call_args[0][1]
+    assert "auto_yaw" not in call_body
+
+    # 2. When _schema advertises auto_yaw: True, auto_yaw=False includes "auto_yaw": False
+    session._schema = ObservationSchema.from_dict({
+        "dof": 6, "arm_dof": 5, "gripper_joint": 5, "capabilities": {"auto_yaw": True}
+    })
+    session.move_pose([0.2, 0.0, 0.1], auto_yaw=False)
+    assert session._action.call_count == 2
+    call_body2 = session._action.call_args[0][1]
+    assert call_body2.get("auto_yaw") is False
+
+
+def test_clamp_lead_and_step_disjoint_diagnostic_message():
+    from rebot_companion.leader_teleop import _clamp_lead_and_step, LeaderTeleopError
+
+    with pytest.raises(LeaderTeleopError) as exc_info:
+        _clamp_lead_and_step(0.0, prev_val=0.0, ref_val=1.0, max_step=0.1, max_lead=0.1, joint_index=0)
+    msg = str(exc_info.value)
+    assert "disjoint lead and step intervals" in msg
+    assert "pushed/blocked" in msg

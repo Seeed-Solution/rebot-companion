@@ -29,15 +29,36 @@ log = logging.getLogger("rebot_companion.units")
 SUPPORTED_UNIT_MODES = ("rad", "so101_norm", "deg")
 
 
+def _finite_float(val: Any, label: str) -> float:
+    if isinstance(val, bool):
+        raise ValueError(f"{label} must be numeric, got {val!r}")
+    try:
+        f = float(val)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} must be numeric, got {val!r}") from exc
+    if not math.isfinite(f):
+        raise ValueError(f"{label} must be finite, got {val!r}")
+    return f
+
+
 def _extract_limit(lim: Any) -> tuple[float, float]:
     if lim is None:
         return (-math.pi, math.pi)
     if hasattr(lim, "min_position") and hasattr(lim, "max_position"):
-        return (float(lim.min_position), float(lim.max_position))
+        return (
+            _finite_float(lim.min_position, "limit.min_position"),
+            _finite_float(lim.max_position, "limit.max_position"),
+        )
     if isinstance(lim, dict):
-        return (float(lim.get("min_position", -math.pi)), float(lim.get("max_position", math.pi)))
+        return (
+            _finite_float(lim.get("min_position", -math.pi), "limit.min_position"),
+            _finite_float(lim.get("max_position", math.pi), "limit.max_position"),
+        )
     if isinstance(lim, (tuple, list)) and len(lim) >= 2:
-        return (float(lim[0]), float(lim[1]))
+        return (
+            _finite_float(lim[0], "limit[0]"),
+            _finite_float(lim[1], "limit[1]"),
+        )
     return (-math.pi, math.pi)
 
 
@@ -49,24 +70,12 @@ def _resolve_gripper_bounds(
 ) -> tuple[float, float]:
     # 1. Validate finiteness on any non-None endpoint
     if closed_rad is not None:
-        try:
-            c_val = float(closed_rad)
-        except (ValueError, TypeError) as exc:
-            raise ValueError(f"closed_rad must be numeric, got {closed_rad!r}") from exc
-        if not math.isfinite(c_val):
-            raise ValueError(f"closed_rad must be finite, got {closed_rad!r}")
-        c_explicit: float | None = c_val
+        c_explicit: float | None = _finite_float(closed_rad, "closed_rad")
     else:
         c_explicit = None
 
     if open_rad is not None:
-        try:
-            o_val = float(open_rad)
-        except (ValueError, TypeError) as exc:
-            raise ValueError(f"open_rad must be numeric, got {open_rad!r}") from exc
-        if not math.isfinite(o_val):
-            raise ValueError(f"open_rad must be finite, got {open_rad!r}")
-        o_explicit: float | None = o_val
+        o_explicit: float | None = _finite_float(open_rad, "open_rad")
     else:
         o_explicit = None
 
@@ -92,7 +101,6 @@ def _resolve_gripper_bounds(
     if o_explicit is not None:
         o = o_explicit
     else:
-        fallback = -5.7 if gripper_joint == 6 else 1.5
         if has_lim:
             assert lo is not None and hi is not None
             c_ref = 0.0 if c_explicit is None else c_explicit
@@ -104,8 +112,6 @@ def _resolve_gripper_bounds(
                     o = hi if abs(hi - c_ref) >= abs(lo - c_ref) else lo
             else:
                 o = hi if abs(hi - c_ref) >= abs(lo - c_ref) else lo
-            if o == (0.0 if c_explicit is None else c_explicit):
-                o = fallback
         else:
             if gripper_joint == 6:
                 o = -5.7 if (c_explicit is None or abs(c_explicit - (-5.7)) > 1e-6) else 1.5
@@ -129,18 +135,8 @@ def _resolve_gripper_bounds(
                 c = 0.0 if abs(o - 0.0) > 1e-6 else 1.5
 
     # Guarantee c != o
-    if abs(o - c) <= 1e-9:
-        if has_lim:
-            assert lo is not None and hi is not None
-            if gripper_joint == 6 and lo <= -5.7 <= hi and abs(c - (-5.7)) > 1e-6:
-                o = -5.7
-            else:
-                o = lo if abs(c - hi) <= 1e-9 else hi
-        else:
-            if gripper_joint == 6:
-                o = 1.5 if abs(c - (-5.7)) <= 1e-9 else -5.7
-            else:
-                o = 0.0 if abs(c - 1.5) <= 1e-9 else 1.5
+    if not (math.isfinite(c) and math.isfinite(o)) or abs(o - c) <= 1e-9:
+        raise ValueError(f"resolved invalid gripper bounds: closed_rad={c!r}, open_rad={o!r}")
     return c, o
 
 
@@ -169,23 +165,9 @@ def resolve_schema_gripper_bounds(
     open_rad: float | None = None
     if isinstance(gripper_policy, dict):
         if "closed_rad" in gripper_policy and gripper_policy["closed_rad"] is not None:
-            c_raw = gripper_policy["closed_rad"]
-            try:
-                c_f = float(c_raw)
-            except (ValueError, TypeError) as exc:
-                raise ValueError(f"gripper_policy.closed_rad must be numeric, got {c_raw!r}") from exc
-            if not math.isfinite(c_f):
-                raise ValueError(f"gripper_policy.closed_rad must be finite, got {c_raw!r}")
-            closed_rad = c_f
+            closed_rad = _finite_float(gripper_policy["closed_rad"], "gripper_policy.closed_rad")
         if "open_rad" in gripper_policy and gripper_policy["open_rad"] is not None:
-            o_raw = gripper_policy["open_rad"]
-            try:
-                o_f = float(o_raw)
-            except (ValueError, TypeError) as exc:
-                raise ValueError(f"gripper_policy.open_rad must be numeric, got {o_raw!r}") from exc
-            if not math.isfinite(o_f):
-                raise ValueError(f"gripper_policy.open_rad must be finite, got {o_raw!r}")
-            open_rad = o_f
+            open_rad = _finite_float(gripper_policy["open_rad"], "gripper_policy.open_rad")
     return _resolve_gripper_bounds(limits, gripper_joint, closed_rad, open_rad)
 
 
@@ -389,8 +371,13 @@ def load_lerobot_norm_bounds(
 ) -> tuple[list[tuple[float, float]], float | None, float | None]:
     """Parse LeRobot SO-100/SO-101 calibration JSON and convert motor tick ranges to armd radians.
 
-    When ``homing_applied_in_hw=False`` in follower ``feetech_joints``, ``zero_step + homing_offset_steps``
-    matches armd's ``FeetechJointCalib::steps_to_rad`` (``src/protocol/feetech.rs:483-487``).
+    Center resolution rules:
+    - If "zero_step" or "center" is explicitly in the calibration JSON entry, use that center.
+    - Else if "homing_offset" is in the calibration JSON entry (standard LeRobot post-EEPROM-homing
+      Present_Position), preserve follower feetech_joints[i].zero_step (default 2048) without re-adding
+      homing_offset_steps.
+    - Else (raw unhomed ticks without homing_offset or center), apply zero_step if homing_applied_in_hw
+      else zero_step + homing_offset_steps.
 
     Returns:
         (limits, closed_rad, open_rad) where limits has 6 elements [(lo_j1, hi_j1), ..., (closed_rad, open_rad)].
@@ -456,23 +443,35 @@ def load_lerobot_norm_bounds(
             if feetech_joints and i < len(feetech_joints) and isinstance(feetech_joints[i], dict)
             else None
         )
-        has_calib_center = "homing_offset" in entry or "center" in entry
+        if "homing_offset" in entry:
+            _finite_float(entry["homing_offset"], f"{name}.homing_offset")
+
         if fj is not None:
             armd_sign = -1.0 if fj.get("drive_mode_invert") else 1.0
-            if has_calib_center:
-                # JSON ticks are post-EEPROM-homing (Present_Position) centered around zero_step/center
-                effective_zero = float(entry.get("zero_step", entry.get("center", 2048.0)))
-            else:
-                zero_step = float(fj.get("zero_step", 2048.0))
-                homing_applied = bool(fj.get("homing_applied_in_hw", False))
-                homing_offset = float(fj.get("homing_offset_steps", 0.0))
-                effective_zero = zero_step if homing_applied else zero_step + homing_offset
+            zero_step_fj = _finite_float(fj.get("zero_step", 2048.0), f"{name}.fj.zero_step")
+            homing_applied = bool(fj.get("homing_applied_in_hw", False))
+            homing_offset_steps = _finite_float(fj.get("homing_offset_steps", 0.0), f"{name}.fj.homing_offset_steps")
         else:
-            effective_zero = float(entry.get("zero_step", entry.get("center", 2048.0)))
             armd_sign = 1.0
+            zero_step_fj = 2048.0
+            homing_applied = False
+            homing_offset_steps = 0.0
+
+        if "zero_step" in entry or "center" in entry:
+            raw_c = entry["zero_step"] if "zero_step" in entry else entry["center"]
+            effective_zero = _finite_float(raw_c, f"{name}.center")
+        elif "homing_offset" in entry:
+            effective_zero = zero_step_fj
+        else:
+            effective_zero = zero_step_fj if homing_applied else zero_step_fj + homing_offset_steps
 
         rad_neg100 = armd_sign * (tick_neg100 - effective_zero) * (2.0 * math.pi / 4096.0)
         rad_pos100 = armd_sign * (tick_pos100 - effective_zero) * (2.0 * math.pi / 4096.0)
+
+        if not (math.isfinite(rad_neg100) and math.isfinite(rad_pos100)) or abs(rad_pos100 - rad_neg100) <= 1e-9:
+            raise ValueError(
+                f"{name}: resolved invalid joint bounds: rad_neg100={rad_neg100!r}, rad_pos100={rad_pos100!r}"
+            )
 
         limits.append((float(rad_neg100), float(rad_pos100)))
 
@@ -500,9 +499,11 @@ def load_lerobot_norm_bounds(
     g_tick_closed = g_max if g_drive_mode else g_min
     g_tick_open = g_min if g_drive_mode else g_max
     if "closed_tick" in grip_entry or "closed" in grip_entry:
-        g_tick_closed = float(grip_entry.get("closed_tick", grip_entry.get("closed")))
+        raw_gc = grip_entry.get("closed_tick", grip_entry.get("closed"))
+        g_tick_closed = _finite_float(raw_gc, "gripper.closed_tick")
     if "open_tick" in grip_entry or "open" in grip_entry:
-        g_tick_open = float(grip_entry.get("open_tick", grip_entry.get("open")))
+        raw_go = grip_entry.get("open_tick", grip_entry.get("open"))
+        g_tick_open = _finite_float(raw_go, "gripper.open_tick")
 
     if not (
         math.isfinite(g_tick_closed)
@@ -521,22 +522,35 @@ def load_lerobot_norm_bounds(
         if feetech_joints and len(feetech_joints) > 5 and isinstance(feetech_joints[5], dict)
         else None
     )
-    has_grip_calib_center = "homing_offset" in grip_entry or "center" in grip_entry
+    if "homing_offset" in grip_entry:
+        _finite_float(grip_entry["homing_offset"], "gripper.homing_offset")
+
     if fj_grip is not None:
         g_armd_sign = -1.0 if fj_grip.get("drive_mode_invert") else 1.0
-        if has_grip_calib_center:
-            # JSON ticks are post-EEPROM-homing (Present_Position) centered around zero_step/center
-            g_effective_zero = float(grip_entry.get("zero_step", grip_entry.get("center", 2048.0)))
-        else:
-            g_zero_step = float(fj_grip.get("zero_step", 2048.0))
-            g_homing_applied = bool(fj_grip.get("homing_applied_in_hw", False))
-            g_homing_offset = float(fj_grip.get("homing_offset_steps", 0.0))
-            g_effective_zero = g_zero_step if g_homing_applied else g_zero_step + g_homing_offset
+        g_zero_step_fj = _finite_float(fj_grip.get("zero_step", 2048.0), "gripper.fj.zero_step")
+        g_homing_applied = bool(fj_grip.get("homing_applied_in_hw", False))
+        g_homing_offset_steps = _finite_float(fj_grip.get("homing_offset_steps", 0.0), "gripper.fj.homing_offset_steps")
     else:
-        g_effective_zero = float(grip_entry.get("zero_step", grip_entry.get("center", 2048.0)))
         g_armd_sign = 1.0
+        g_zero_step_fj = 2048.0
+        g_homing_applied = False
+        g_homing_offset_steps = 0.0
+
+    if "zero_step" in grip_entry or "center" in grip_entry:
+        raw_gc = grip_entry.get("zero_step", grip_entry.get("center"))
+        g_effective_zero = _finite_float(raw_gc, "gripper.center")
+    elif "homing_offset" in grip_entry:
+        g_effective_zero = g_zero_step_fj
+    else:
+        g_effective_zero = g_zero_step_fj if g_homing_applied else g_zero_step_fj + g_homing_offset_steps
 
     closed_rad = float(g_armd_sign * (g_tick_closed - g_effective_zero) * (2.0 * math.pi / 4096.0))
     open_rad = float(g_armd_sign * (g_tick_open - g_effective_zero) * (2.0 * math.pi / 4096.0))
+
+    if not (math.isfinite(closed_rad) and math.isfinite(open_rad)) or abs(open_rad - closed_rad) <= 1e-9:
+        raise ValueError(
+            f"gripper: resolved invalid bounds: closed_rad={closed_rad!r}, open_rad={open_rad!r}"
+        )
+
     limits.append((closed_rad, open_rad))
     return limits, closed_rad, open_rad

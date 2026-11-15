@@ -753,11 +753,22 @@ def _clamp_lead_and_step(
         raise LeaderTeleopError(
             f"{j_str}disjoint lead and step intervals (prev_val={prev_val:.4f}, "
             f"ref_val={ref_val:.4f}, max_step={max_step:.4f}, max_lead={max_lead:.4f}, "
-            f"lo={lo:.4f}, hi={hi:.4f})"
+            f"lo={lo:.4f}, hi={hi:.4f}); follower moved away from command (pushed/blocked or tracking lag)"
         )
     if lo > hi:
         return 0.5 * (lo + hi)
     return min(max(val, lo), hi)
+
+
+def _measured_ref(obs: Any) -> list[float]:
+    """Extract reference positions preferring measured positions over commanded positions."""
+    positions = getattr(obs, "positions", None)
+    if positions:
+        return list(positions)
+    commanded = getattr(obs, "commanded_positions", None)
+    if commanded:
+        return list(commanded)
+    return []
 
 
 # --------------------------------------------------------------------------- leader bridge
@@ -1115,11 +1126,7 @@ class LeaderTeleopBridge:
             due = t0 + step * period
             cur_obs = self.session.latest_observation() or obs
             self._check_follower_healthy(cur_obs, require_torqued=True)
-            ref = (
-                cur_obs.commanded_positions
-                if getattr(cur_obs, "commanded_positions", None)
-                else cur_obs.positions
-            )
+            ref = _measured_ref(cur_obs)
             s = step / ramp_steps
             # Quintic polynomial: 10s^3 - 15s^4 + 6s^5 (smooth acceleration & deceleration)
             alpha = 10.0 * (s**3) - 15.0 * (s**4) + 6.0 * (s**5)
@@ -1182,11 +1189,7 @@ class LeaderTeleopBridge:
                     cur_obs = self.session.latest_observation() or obs
                     self._check_follower_healthy(cur_obs, require_torqued=True)
                     cur_follower = cur_obs.positions
-                    ref = (
-                        cur_obs.commanded_positions
-                        if getattr(cur_obs, "commanded_positions", None)
-                        else cur_follower
-                    )
+                    ref = _measured_ref(cur_obs)
                     cur_leader = self.read_leader_target()
                     if self._stop:
                         break
@@ -1263,13 +1266,7 @@ class LeaderTeleopBridge:
             try:
                 obs = self.session.latest_observation()
                 self._check_follower_healthy(obs, require_torqued=True)
-                positions = getattr(obs, "positions", None)
-                if positions:
-                    ref = list(positions)
-                elif getattr(obs, "commanded_positions", None):
-                    ref = list(obs.commanded_positions)
-                else:
-                    ref = []
+                ref = _measured_ref(obs)
                 target = self.read_leader_target()
                 if self._stop:
                     break
