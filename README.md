@@ -146,6 +146,7 @@ uv sync --extra agent        # + MCP server: mcp 2.x, av, pillow
 uv sync --extra calib        # + OpenCV for tools/calibrate_intrinsics.py
 uv sync --extra record       # + PyAV, pyarrow for rebot-record
 uv sync --extra policy       # + PyAV, pyarrow for rebot-policy (learned policies: see Run a learned policy)
+uv sync --extra onnx         # + onnxruntime for ONNX policies without PyTorch/LeRobot
 uv sync --all-extras         # everything (development)
 ```
 
@@ -155,6 +156,7 @@ uv sync --all-extras         # everything (development)
 | `calib` | `opencv-python-headless>=4.8,<5` | camera intrinsics tool |
 | `record` | `av>=12`, `pyarrow>=14` | `rebot-record` (LeRobot dataset recorder) |
 | `policy` | `av>=12`, `pyarrow>=14` | `rebot-policy` (camera, scripted policies); torch and lerobot are installed separately |
+| `onnx` | `onnxruntime>=1.18` | `rebot-policy --policy onnx:<dir>` and `rebot-scene` ONNX validation |
 
 The test suite runs against the versions pinned in `uv.lock` (for example mcp 2.3.0).
 
@@ -820,7 +822,7 @@ The runner imports them only for a learned policy.
 
 | Option | Meaning |
 |---|---|
-| `--policy` | LeRobot pretrained directory or Hub repo id; `replay:<dataset root>:<episode>` (the episode's `action` column); `sine:<joint>:<amp rad>:<period s>` (joint 1..7 or a name, amp <= 0.5 rad); a `scripted:` prefix is accepted; any other `<word>:` prefix is refused (not looked up on the Hub). The run prints whether a learned policy came from a local directory or the Hub |
+| `--policy` | LeRobot pretrained directory or Hub repo id; `onnx:<policy_dir>` (or directory containing `policy.json` + `model.onnx`, using `rebot-onnx-policy/v1` with `--extra onnx`); `replay:<dataset root>:<episode>` (the episode's `action` column); `sine:<joint>:<amp rad>:<period s>` (joint 1..7 or a name, amp <= 0.5 rad); a `scripted:` prefix is accepted; any other `<word>:` prefix is refused (not looked up on the Hub). The run prints whether a learned policy came from a local directory or the Hub |
 | `--fps` | policy steps per second. Default: the dataset fps for `replay`; for a learned policy the fps in its `train_config.json` (`env.fps`, `dataset.fps`, else the training dataset's `meta/info.json` from `dataset.root` or `$HF_LEROBOT_HOME/<dataset.repo_id>`), and `--fps` is required when none is found; 30 for `sine`. A different `--fps` is logged as a warning |
 | `--servo-hz` | servo frame rate (default 50, armd's control rate) |
 | `--max-seconds` | run length (default 60) |
@@ -902,6 +904,36 @@ simulator, or with a trained policy.
 
 ---
 
+## Simulation scenes and custom tools (`rebot-scene`)
+
+Simulation worlds and custom end-effectors live in `rebot_companion/scenes/` and load on
+demand into `rebot-sim` without embedding scene meshes or sim dependencies into `rebot/` or the
+reCamera firmware package:
+
+- **Tier-0 / Tier-1 asset model**: built-in scenes (such as `coffee_kiosk`) work offline from
+  native MuJoCo primitives (`world.xml`). Optional Tier-1 meshes, textures, or datasets download on
+  demand into `$REBOT_SCENE_CACHE` (default `~/.cache/rebot/scenes/<scene_id>/`), following
+  `solution-assets` naming (`<stem>-<md5-first-8>.<ext>`) with atomic `.part` writes and SHA-256
+  verification.
+- **Custom end-effectors, ONNX policies & browser WASM sandbox**: pass local directories (`scene.json` + `world.xml`, `tool.json` + `tool.xml`) or raw MuJoCo XML files to `rebot-sim --scene ... --tool ...`, or hot-swap them at runtime via `rebot-scene load` (`POST /sim/scene`). For Agent-driven zero-backend prototyping and RK/arm pre-flight, upload scene/tool/`rebot-onnx-policy/v1` packages via `rebot-scene upload` and switch between `mode="wasm"` (`?sim=wasm`) and `mode="sim"` via `rebot-scene activate`. Virtual I/O tools (`suction` via `mjEQ_WELD`, `screwdriver`) expose `/sim/io` and `/api/v1/sandbox/io`. See [`docs/agent_sandbox_workflow.md`](docs/agent_sandbox_workflow.md).
+
+```bash
+rebot-scene list                                  # built-in scenes (coffee_kiosk, pcb_suction) & tools
+rebot-scene info pcb_suction                      # stages, suggested poses, keepout & assets
+rebot-scene init ./my_scene --kind scene          # starter scene.json + world.xml
+rebot-scene init ./my_gripper --kind tool         # starter tool.json + tool.xml
+rebot-scene init ./my_policy --kind policy        # starter rebot-onnx-policy/v1 (policy.json + model.onnx)
+rebot-scene validate ./my_policy
+rebot-scene upload ./my_policy --armd-url http://127.0.0.1:8080
+rebot-scene activate --mode wasm --scene pcb_suction --tool suction --policy my_policy
+rebot-scene status --armd-url http://127.0.0.1:8080
+rebot-scene load --scene coffee_kiosk --tool wide_cup_gripper
+rebot-scene io --set vacuum=true                  # drive virtual suction/IO on running rebot-sim
+rebot-scene asset-hash mesh.stl --prefix rebot/scenes
+```
+
+---
+
 ## Examples
 
 | Script | What it does | Moves the arm |
@@ -909,6 +941,9 @@ simulator, or with a trained policy.
 | `examples/01_atomic_api_demo.py` | reCamera trigger and armd state; `--move` runs torque on, home, J1 nudge, unload | only with `--move` |
 | `examples/02_hand_eye_calib.py` | interactive hand-eye calibration wizard (see above) | no (you pose the arm) |
 | `examples/03_agent_orchestrator.py` | Stage 1 tool-calling pattern: JSON-schema tool definitions and a dispatcher | `plan_and_execute_pick` only, with `--calib` |
+| `examples/scenes/coffee_kiosk/coffee_kiosk_fsm.py` | 4-stage mobile coffee kiosk workflow using `rebot.Arm` (`--no-vision` compares fixed rules vs. `detect`+`grasp`) | yes (run against `armd --follower sim` or real arm at `speed_scale <= 0.5`) |
+| `examples/scenes/coffee_kiosk/train_and_eval_demo.py` | multi-seed `coffee_kiosk` stage evaluator and optional LeRobot v3.0 episode recorder (`--record-dir`) | yes, unless `--dry-run` |
+| `examples/scenes/pcb_suction/pcb_suction_fsm.py` | 3-stage PCB suction pick/test/outfeed workflow over `divider_wall` using `rebot.Arm` and virtual vacuum I/O | yes (run against `armd --follower sim` or real arm at `speed_scale <= 0.5`) |
 | `examples/04_hardened_pick_place.py` | Stage 2 pick & place cycles through `B601IkAdapter` | yes, unless `--dry-run` |
 
 ```bash

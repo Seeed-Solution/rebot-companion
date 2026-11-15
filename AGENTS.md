@@ -179,6 +179,21 @@ do not add them to `pyproject.toml`.
   `unit_mode` and convert to/from armd radians.
 - `rebot-teleop-leader` streams USB Feetech STS3215 leader arm positions (USB serial) to armd's WebSocket
   servo stream with initial alignment guard and quintic ramp-in.
+- Unified ONNX policies (`rebot-onnx-policy/v1`, directory with `policy.json` + `model.onnx`) run on
+  real hardware / RK and `armd --follower sim` via `rebot-policy --policy onnx:<dir>` (needs only
+  `--extra onnx`, zero torch/lerobot) and inside the browser `WASM_SIM` sandbox via
+  `onnxruntime-web`.
+
+## Simulation & WASM Sandbox (`rebot-scene` / `/api/v1/sandbox/*`)
+
+See [`docs/agent_sandbox_workflow.md`](docs/agent_sandbox_workflow.md). Quick commands for
+non-realtime training (`SimEnv`), built-in `pcb_suction`, custom packs, and browser preview:
+
+- Scaffold/validate: `rebot-scene init <dir> --kind scene|tool|policy`, `rebot-scene validate <dir>`.
+- Upload & activate on `armd`: `rebot-scene upload <dir>` (`POST /api/v1/sandbox/{scenes,tools,policies}`),
+  `rebot-scene activate --mode wasm|sim|none [--scene pcb_suction --tool suction --policy <id>]`,
+  `rebot-scene status`. Browser sandbox runs on `?sim=wasm` (or active `mode="wasm"`) via
+  `mujoco_wasm.js` + `onnxruntime-web` without Cockpit UI upload forms.
 
 ## Checks before finishing
 
