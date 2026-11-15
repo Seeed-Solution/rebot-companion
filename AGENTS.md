@@ -177,13 +177,15 @@ do not add them to `pyproject.toml`.
   clears a fault. Read the stop reason and park result in its summary before running again.
 - `--unit-mode so101_norm` in `rebot-record` records normalized dataset values (`[-100, 100]` for arm joints,
   `[0, 100]` for gripper). In `rebot-policy`, `--action-units` and `--state-units` (default `auto`) read `info.json`
-  `unit_mode` and convert to/from armd radians.
+  `unit_mode` and convert to/from armd radians; pass `--override-unit-mode` to force explicit unit modes when they conflict with policy metadata.
 - `rebot-teleop-leader` streams USB Feetech STS3215 leader arm positions (USB serial) to armd's WebSocket
   servo stream with initial alignment guard and quintic ramp-in.
 - Unified ONNX policies (`rebot-onnx-policy/v1`, directory with `policy.json` + `model.onnx`) run on
   real hardware / RK and `armd --follower sim` via `rebot-policy --policy onnx:<dir>` (needs only
   `--extra onnx`, zero torch/lerobot) and inside the browser `WASM_SIM` sandbox via
-  `onnxruntime-web`.
+  `onnxruntime-web`. On SO-ARM101, `rebot-onnx-policy/v1` packages require `"unit_mode"` in
+  `policy.json` (while browser WASM defaults missing `unit_mode` to `"rad"`), or explicit
+  `--action-units`/`--state-units` with `--override-unit-mode`.
 
 ## Simulation & WASM Sandbox (`rebot-scene` / `/api/v1/sandbox/*`)
 

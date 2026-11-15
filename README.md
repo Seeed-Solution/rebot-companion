@@ -822,12 +822,13 @@ The runner imports them only for a learned policy.
 
 | Option | Meaning |
 |---|---|
-| `--policy` | LeRobot pretrained directory or Hub repo id; `onnx:<policy_dir>` (or directory containing `policy.json` + `model.onnx`, using `rebot-onnx-policy/v1` with `--extra onnx`); `replay:<dataset root>:<episode>` (the episode's `action` column); `sine:<joint>:<amp rad>:<period s>` (joint 1..7 or a name, amp <= 0.5 rad); a `scripted:` prefix is accepted; any other `<word>:` prefix is refused (not looked up on the Hub). The run prints whether a learned policy came from a local directory or the Hub |
+| `--policy` | LeRobot pretrained directory or Hub repo id; `onnx:<policy_dir>` (or directory containing `policy.json` + `model.onnx`, using `rebot-onnx-policy/v1` with `--extra onnx`; on SO-ARM101 `policy.json` must specify `"unit_mode"`, whereas browser WASM defaults missing `unit_mode` to `"rad"`, or pass explicit `--action-units`/`--state-units` with `--override-unit-mode`); `replay:<dataset root>:<episode>` (the episode's `action` column); `sine:<joint>:<amp rad>:<period s>` (joint 1..7 or a name, amp <= 0.5 rad); a `scripted:` prefix is accepted; any other `<word>:` prefix is refused (not looked up on the Hub). The run prints whether a learned policy came from a local directory or the Hub |
 | `--fps` | policy steps per second. Default: the dataset fps for `replay`; for a learned policy the fps in its `train_config.json` (`env.fps`, `dataset.fps`, else the training dataset's `meta/info.json` from `dataset.root` or `$HF_LEROBOT_HOME/<dataset.repo_id>`), and `--fps` is required when none is found; 30 for `sine`. A different `--fps` is logged as a warning |
 | `--servo-hz` | servo frame rate (default 50, armd's control rate) |
 | `--max-seconds` | run length (default 60) |
 | `--max-steps` | stop after this many policy steps (default: no limit) |
-| `--action-units`, `--state-units` | units for policy actions / observations: `auto` (default, reads `unit_mode` from dataset/policy `meta/info.json`, falls back to `rad`), `rad`, `so101_norm`, or `deg` |
+| `--action-units`, `--state-units` | units for policy actions / observations: `auto` (default, reads `unit_mode` from dataset/policy `meta/info.json` or `policy.json`, falls back to `rad`; on SO-ARM101, `policy.json` without `unit_mode` fails closed unless units are explicitly provided with `--override-unit-mode`), `rad`, `so101_norm`, or `deg` |
+| `--override-unit-mode` | allow explicit `--action-units` or `--state-units` to override conflicting policy metadata `unit_mode` |
 | `--task` | task text passed to the policy (language-conditioned policies) |
 | `--device` | torch device (default `cuda` when available, else `cpu`) |
 | `--no-park` | hold position at the end instead of parking |

@@ -1406,7 +1406,7 @@ def test_policy_runner_fails_closed_on_so_arm_when_metadata_missing():
             return {"device": {"follower": "mock"}}
 
     runner = PolicyRunner(FakeClient(), MockReplay())
-    with pytest.raises(ValueError, match="cannot infer unit mode 'auto' without explicit 'unit_mode' in metadata"):
+    with pytest.raises((ValueError, RunnerError), match="cannot infer unit mode 'auto' without explicit 'unit_mode' in metadata"):
         runner._read_arm()
 
 
@@ -3419,7 +3419,15 @@ def test_policy_runner_post_conversion_nan_guard():
     policy._inference_thread = None
     policy.async_infer = False
 
-    runner = PolicyRunner(mock_client, policy, action_units="so101_norm", state_units="so101_norm", fps=10, max_seconds=1.0)
+    runner = PolicyRunner(
+        mock_client,
+        policy,
+        action_units="so101_norm",
+        state_units="so101_norm",
+        override_unit_mode=True,
+        fps=10,
+        max_seconds=1.0,
+    )
     runner.dof = 6
     runner.action_units = "so101_norm"
     runner.limits = [(-2.0, 2.0)] * 6
@@ -3482,7 +3490,7 @@ def test_clamp_lead_and_step_overlapping_and_disjoint():
     assert "ref_val=1.0000" in err_msg
     assert "max_step=0.1000" in err_msg
     assert "max_lead=0.1000" in err_msg
-    assert "disjoint lead and step intervals" in err_msg
+    assert "disjoint lead, step, or joint-limit intervals" in err_msg
 
 
 def test_leader_teleop_low_max_velocity_ramp_limit():
@@ -4094,14 +4102,14 @@ def test_arm_session_move_pose_auto_yaw_false_normalization():
     call_body = session._action.call_args[0][1]
     assert "auto_yaw" not in call_body
 
-    # 2. When _schema advertises auto_yaw: True, auto_yaw=False includes "auto_yaw": False
+    # 2. When _schema advertises auto_yaw: True, auto_yaw=False normalizes to None (no "auto_yaw" in body)
     session._schema = ObservationSchema.from_dict({
         "dof": 6, "arm_dof": 5, "gripper_joint": 5, "capabilities": {"auto_yaw": True}
     })
     session.move_pose([0.2, 0.0, 0.1], auto_yaw=False)
     assert session._action.call_count == 2
     call_body2 = session._action.call_args[0][1]
-    assert call_body2.get("auto_yaw") is False
+    assert "auto_yaw" not in call_body2
 
 
 def test_clamp_lead_and_step_disjoint_diagnostic_message():
@@ -4110,8 +4118,7 @@ def test_clamp_lead_and_step_disjoint_diagnostic_message():
     with pytest.raises(LeaderTeleopError) as exc_info:
         _clamp_lead_and_step(0.0, prev_val=0.0, ref_val=1.0, max_step=0.1, max_lead=0.1, joint_index=0)
     msg = str(exc_info.value)
-    assert "disjoint lead and step intervals" in msg
-    assert "pushed/blocked" in msg
+    assert "disjoint lead, step, or joint-limit intervals" in msg
 
 
 def test_onnx_policy_unit_mode_omitted_so_arm_vs_7dof(tmp_path: Path):
@@ -4193,9 +4200,17 @@ def test_policy_runner_warns_on_unit_mode_metadata_mismatch(caplog):
     mock_policy.name = "mock_policy"
     mock_policy.info = {"unit_mode": "rad"}
 
-    with caplog.at_level(logging.WARNING):
+    # Default override_unit_mode=False raises RunnerError on conflict
+    with pytest.raises(RunnerError, match="conflicts with policy metadata unit_mode 'rad'"):
         runner = PolicyRunner(mock_client, mock_policy, action_units="deg", state_units="so101_norm")
         runner._read_arm()
+
+    # override_unit_mode=True logs warning cleanly and proceeds
+    with caplog.at_level(logging.WARNING):
+        runner_override = PolicyRunner(
+            mock_client, mock_policy, action_units="deg", state_units="so101_norm", override_unit_mode=True
+        )
+        runner_override._read_arm()
     assert "differs from policy metadata unit_mode" in caplog.text
 
 
@@ -4278,8 +4293,9 @@ def test_leader_teleop_gripper_clamp_across_phases():
     mock_obs.is_torqued = True
     mock_obs.is_operational = True
     follower_positions = [0.0, 0.0, 0.0, 0.0, 0.0, 0.1]
-    mock_obs.positions = list(follower_positions)
-    mock_obs.commanded_positions = list(follower_positions)
+    cur_pos = list(follower_positions)
+    mock_obs.positions = cur_pos
+    mock_obs.commanded_positions = cur_pos
     session.wait_for_observation.return_value = mock_obs
     session.latest_observation.return_value = mock_obs
 
@@ -4288,29 +4304,58 @@ def test_leader_teleop_gripper_clamp_across_phases():
     bridge.read_leader_target = MagicMock(return_value=leader_target)
 
     def mock_servo(cmd):
-        mock_obs.positions = list(cmd)
-        mock_obs.commanded_positions = list(cmd)
+        # Follower tracks with a slight delay per tick so settle phase runs
+        for idx in range(6):
+            diff = cmd[idx] - cur_pos[idx]
+            step = max(-0.012, min(0.012, diff))
+            cur_pos[idx] += step
+        mock_obs.positions = list(cur_pos)
+        mock_obs.commanded_positions = list(cur_pos)
 
     session.servo.side_effect = mock_servo
 
     bridge.align_and_ramp()
-    assert bridge.frames_sent > 0
-    # Every servo command sent must have gripper in [0.0, 1.5]
+    assert bridge.frames_sent > 17  # More than initial ramp steps (settle phase ran)
+    # Assert numerical step and range bounds on every transmitted frame
+    prev_cmd = None
+    max_g_step = max(0.30, 0.25 * 1.5)
     for call in session.servo.call_args_list:
         cmd = call[0][0]
-        assert 0.0 <= cmd[5] <= 1.5 + 1e-4
+        assert len(cmd) == 6
+        for j in range(5):
+            assert -3.0 - 1e-4 <= cmd[j] <= 3.0 + 1e-4
+        assert 0.0 - 1e-4 <= cmd[5] <= 1.5 + 1e-4
+        if prev_cmd is not None:
+            for j in range(5):
+                assert abs(cmd[j] - prev_cmd[j]) <= 0.6 * (1.0 / 50.0) * 3.0 + 1e-3
+            assert abs(cmd[5] - prev_cmd[5]) <= max_g_step + 1e-3
+        prev_cmd = cmd
 
 
 def test_client_finite_float_validation_and_null_handling():
-    from rebot.client import _vec, _put_speed, _safe_int, _safe_float, TcpPose, GripperStatus, ArmSession, UnsupportedError
+    from rebot.client import _vec, _put_speed, _req_int, _req_float, TcpPose, GripperStatus, ArmSession, UnsupportedError
 
-    # 1. _safe_int and _safe_float reject bool and non-finite floats
-    assert _safe_int(True, 42) == 42
-    assert _safe_int(False, 42) == 42
-    assert _safe_int(float("nan"), 42) == 42
-    assert _safe_int(float("inf"), 42) == 42
-    assert _safe_float(True, 3.14) == 3.14
-    assert _safe_float(float("nan"), 3.14) == 3.14
+    # 1. _req_int rejects bool, non-integer floats like 5.7, and non-finite floats
+    assert _req_int(5) == 5
+    assert _req_int(5.0) == 5
+    assert _req_int("5") == 5
+    with pytest.raises(ValueError, match="must be an integer"):
+        _req_int(5.7)
+    with pytest.raises(ValueError, match="must be an integer"):
+        _req_int("5.7")
+    with pytest.raises(ValueError, match="must be an integer"):
+        _req_int(True)
+    with pytest.raises(ValueError, match="must be an integer"):
+        _req_int(False)
+    with pytest.raises(ValueError, match="must be an integer"):
+        _req_int(float("nan"))
+    with pytest.raises(ValueError, match="must be an integer"):
+        _req_int(float("inf"))
+    assert _req_float(3.14) == 3.14
+    with pytest.raises(ValueError, match="must be a float"):
+        _req_float(True)
+    with pytest.raises(ValueError, match="must be finite"):
+        _req_float(float("nan"))
 
     # 2. _vec rejects NaN, Inf, and wrong length
     with pytest.raises(ValueError, match="must be finite"):
@@ -4560,3 +4605,666 @@ def test_arm_session_move_pose_auto_yaw_none_no_schema_fetch():
     s._last_schema_attempt = None
     s.move_pose([0.2, 0.0, 0.1], auto_yaw=None)
     mock_client.get_schema.assert_not_called()
+    assert s._action.call_count == 1
+    call_body = s._action.call_args[0][1]
+    assert "auto_yaw" not in call_body
+
+    # auto_yaw=False also skips schema fetch and omits auto_yaw from body
+    s.move_pose([0.2, 0.0, 0.1], auto_yaw=False)
+    mock_client.get_schema.assert_not_called()
+    assert s._action.call_count == 2
+    call_body2 = s._action.call_args[0][1]
+    assert "auto_yaw" not in call_body2
+
+
+def test_clamp_lead_and_step_rejects_bool_and_accepts_converts():
+    from rebot_companion.leader_teleop import _clamp_lead_and_step, LeaderTeleopError
+
+    # Reject bool for all parameters
+    with pytest.raises(LeaderTeleopError, match="val must be numeric"):
+        _clamp_lead_and_step(True, 0.0, 0.0, 0.1, 0.1)
+    with pytest.raises(LeaderTeleopError, match="prev_val must be numeric"):
+        _clamp_lead_and_step(0.0, False, 0.0, 0.1, 0.1)
+    with pytest.raises(LeaderTeleopError, match="ref_val must be numeric"):
+        _clamp_lead_and_step(0.0, 0.0, True, 0.1, 0.1)
+    with pytest.raises(LeaderTeleopError, match="max_step must be numeric"):
+        _clamp_lead_and_step(0.0, 0.0, 0.0, True, 0.1)
+    with pytest.raises(LeaderTeleopError, match="max_lead must be numeric"):
+        _clamp_lead_and_step(0.0, 0.0, 0.0, 0.1, False)
+    with pytest.raises(LeaderTeleopError, match="j_min must be numeric"):
+        _clamp_lead_and_step(0.0, 0.0, 0.0, 0.1, 0.1, j_min=True)
+    with pytest.raises(LeaderTeleopError, match="j_max must be numeric"):
+        _clamp_lead_and_step(0.0, 0.0, 0.0, 0.1, 0.1, j_max=False)
+
+    # Valid string and int conversions return float
+    res = _clamp_lead_and_step("0.05", "0.0", 0, "0.1", "0.1", j_min="-0.5", j_max="0.5")
+    assert isinstance(res, float)
+    assert res == pytest.approx(0.05)
+
+
+def test_measured_ref_numpy_arrays_and_commanded():
+    import numpy as np
+    from rebot_companion.leader_teleop import _measured_ref
+
+    obs = MagicMock()
+    # 1. NumPy array in positions does not trigger ambiguous boolean evaluation
+    obs.positions = np.zeros(6)
+    obs.commanded_positions = np.ones(6)
+    assert _measured_ref(obs) == [0.0] * 6
+
+    # 2. When positions is None, prefers commanded_positions
+    obs.positions = None
+    assert _measured_ref(obs) == [1.0] * 6
+
+    # 3. When both are None or empty
+    obs.positions = None
+    obs.commanded_positions = []
+    assert _measured_ref(obs) == []
+    obs.commanded_positions = None
+    assert _measured_ref(obs) == []
+
+
+def test_measured_ref_none_commanded_positions_and_telemetry_validation():
+    from types import SimpleNamespace
+    from rebot_companion.leader_teleop import _measured_ref, _validate_telemetry_ref, LeaderError
+
+    obs_none = SimpleNamespace(positions=None, commanded_positions=None)
+    assert _measured_ref(obs_none) == []
+    with pytest.raises(LeaderError, match="follower reference positions must have length 6"):
+        _validate_telemetry_ref(_measured_ref(obs_none))
+
+    obs_commanded = SimpleNamespace(positions=[], commanded_positions=[0.1] * 6)
+    assert _measured_ref(obs_commanded) == [0.1] * 6
+    assert _validate_telemetry_ref(_measured_ref(obs_commanded)) == [0.1] * 6
+
+
+def test_leader_teleop_disjoint_intervals_fail_closed():
+    from rebot_companion.leader_teleop import (
+        LeaderTeleopBridge,
+        LeaderTeleopError,
+        LeaderCalibration,
+        _clamp_lead_and_step,
+    )
+
+    # 1. Direct _clamp_lead_and_step: immediately fails closed on disjoint intervals
+    # prev = 0.0, max_step = 0.05 -> step window [-0.05, 0.05]
+    # ref = 0.28, max_lead = 0.15 -> lead window [0.13, 0.43]
+    # Intervals are disjoint -> raises LeaderTeleopError immediately!
+    with pytest.raises(LeaderTeleopError, match="disjoint lead, step, or joint-limit intervals"):
+        _clamp_lead_and_step(
+            0.0, prev_val=0.0, ref_val=0.28, max_step=0.05, max_lead=0.15,
+            j_min=-2.0, j_max=2.0, joint_index=0
+        )
+
+    # When intervals intersect, output strictly satisfies:
+    # |out - prev| <= max_step, |out - ref| <= max_lead, and j_min <= out <= j_max
+    for val in (-1.0, 0.0, 0.05, 0.10, 0.20, 1.0):
+        out = _clamp_lead_and_step(
+            val, prev_val=0.05, ref_val=0.10, max_step=0.05, max_lead=0.15,
+            j_min=-1.0, j_max=1.0, joint_index=0
+        )
+        assert abs(out - 0.05) <= 0.05 + 1e-9
+        assert abs(out - 0.10) <= 0.15 + 1e-9
+        assert -1.0 <= out <= 1.0
+
+    # 2. LeaderTeleopBridge.run(): when disjoint interval occurs during streaming:
+    # fails closed immediately, calls session.unload once, bridge.close does not double-park.
+    mock_bus = MagicMock()
+    mock_session = MagicMock()
+    mock_session.client = MagicMock()
+    mock_schema = ObservationSchema.from_dict({
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "limits": [
+            {"name": f"j{i}", "min_position": -2.0, "max_position": 2.0, "max_velocity": 1.0, "max_acceleration": 1.0}
+            for i in range(6)
+        ],
+        "gripper_policy": {"closed_rad": 0.0, "open_rad": 1.5},
+        "servo_max_lead_rad": 0.15,
+    })
+    calib = LeaderCalibration()
+    bridge = LeaderTeleopBridge(mock_bus, mock_session, mock_schema, calib=calib, follower="mock", fps=50)
+
+    bridge.align_and_ramp = MagicMock()
+    bridge._activated = True
+    bridge._last_servo_cmd = [0.0] * 6
+
+    # Observation where follower reference moved far away (disjoint from step)
+    obs_disjoint = MagicMock()
+    obs_disjoint.is_stopped = False
+    obs_disjoint.safety_state = "Armed"
+    obs_disjoint.is_torqued = True
+    obs_disjoint.is_operational = True
+    obs_disjoint.fault = None
+    obs_disjoint.collision = None
+    obs_disjoint.motion_limit = None
+    obs_disjoint.positions = [0.50, 0.0, 0.0, 0.0, 0.0, 0.5]
+    obs_disjoint.commanded_positions = [0.50, 0.0, 0.0, 0.0, 0.0, 0.5]
+    mock_session.latest_observation.return_value = obs_disjoint
+    bridge.read_leader_target = MagicMock(return_value=[0.0] * 6)
+
+    bridge.run()
+
+    # Teleop failed closed
+    assert bridge._error is not None
+    assert isinstance(bridge._error, LeaderTeleopError)
+    assert "disjoint" in str(bridge._error)
+
+    # Session.unload was called once for fail-closed park
+    assert mock_session.unload.call_count == 1
+    assert bridge._parked is True
+
+    # Closing bridge does not park again
+    bridge.close()
+    assert mock_session.unload.call_count == 1
+
+    # Verify no frame was emitted with joint limits or step violations
+    for call in mock_session.servo.call_args_list:
+        frame = call[0][0]
+        for j, val in enumerate(frame):
+            if j < 5:
+                assert abs(val - 0.0) <= 0.15 + 1e-9
+
+
+def test_validate_telemetry_ref_rejects_bool_and_warns_on_commanded_fallback(caplog):
+    import logging
+    from rebot_companion.leader_teleop import _validate_telemetry_ref, _measured_ref, LeaderError
+
+    # Reject bool in telemetry ref
+    with pytest.raises(LeaderError, match="follower reference position\\[0\\] must be numeric, got True"):
+        _validate_telemetry_ref([True, 0.0, 0.0, 0.0, 0.0, 0.0])
+
+    with pytest.raises(LeaderError, match="follower reference position\\[3\\] must be numeric, got False"):
+        _validate_telemetry_ref([0.0, 0.0, 0.0, False, 0.0, 0.0])
+
+    # Fallback to commanded_positions logs warning
+    obs = MagicMock()
+    obs.positions = []
+    obs.commanded_positions = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
+    with caplog.at_level(logging.WARNING):
+        res = _measured_ref(obs)
+        assert res == [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
+        assert "obs.positions missing; falling back to commanded_positions" in caplog.text
+
+
+def test_align_and_ramp_rejects_nan_before_torque_enabled():
+    from rebot_companion.leader_teleop import LeaderTeleopBridge, LeaderError, LeaderCalibration
+
+    mock_bus = MagicMock()
+    mock_session = MagicMock()
+    mock_session.client = MagicMock()
+    mock_schema = ObservationSchema.from_dict({
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "limits": [
+            {"name": f"j{i}", "min_position": -2.0, "max_position": 2.0, "max_velocity": 1.0, "max_acceleration": 1.0}
+            for i in range(6)
+        ],
+        "gripper_policy": {"closed_rad": 0.0, "open_rad": 1.5},
+        "servo_max_lead_rad": 0.15,
+    })
+    calib = LeaderCalibration()
+    bridge = LeaderTeleopBridge(mock_bus, mock_session, mock_schema, calib=calib, follower="mock")
+
+    # Initial observation has NaN position and is NOT torqued
+    bad_obs = MagicMock()
+    bad_obs.is_stopped = False
+    bad_obs.safety_state = "Armed"
+    bad_obs.is_torqued = False
+    bad_obs.is_operational = False
+    bad_obs.fault = None
+    bad_obs.collision = None
+    bad_obs.motion_limit = None
+    bad_obs.positions = [float("nan"), 0.0, 0.0, 0.0, 0.0, 0.0]
+    mock_session.wait_for_observation.return_value = bad_obs
+
+    with pytest.raises(LeaderError, match="follower reference position\\[0\\] must be finite"):
+        bridge.align_and_ramp()
+
+    # Crucial: session.torque(True) must NOT have been called!
+    mock_session.torque.assert_not_called()
+
+
+def test_arm_session_move_to_validations():
+    mock_client = MagicMock()
+    session = ArmSession(mock_client, "http://localhost:8765/ws")
+
+    # None target_positions
+    with pytest.raises(ValueError, match="target_positions cannot be None"):
+        session.move_to(None)
+
+    # Non-iterable
+    with pytest.raises(ValueError, match="target_positions must be an iterable"):
+        session.move_to(12345)
+
+    # Empty iterable
+    with pytest.raises(ValueError, match="target_positions cannot be empty"):
+        session.move_to([])
+
+    # Boolean element rejected
+    with pytest.raises(ValueError, match="target_positions\\[0\\] must be numeric, got True"):
+        session.move_to([True, 0.0, 0.0, 0.0, 0.0, 0.0])
+
+    # Non-numeric element rejected
+    with pytest.raises(ValueError, match="target_positions\\[1\\] must be numeric, got 'abc'"):
+        session.move_to([0.0, "abc", 0.0, 0.0, 0.0, 0.0])
+
+    # Non-finite element rejected
+    with pytest.raises(ValueError, match="target_positions\\[2\\] must be finite"):
+        session.move_to([0.0, 0.0, float("nan"), 0.0, 0.0, 0.0])
+
+    # Schema DOF mismatch when schema is set
+    schema = ObservationSchema.from_dict({
+        "dof": 6,
+        "limits": [
+            {"name": f"j{i}", "min_position": -2.0, "max_position": 2.0, "max_velocity": 1.0, "max_acceleration": 1.0}
+            for i in range(6)
+        ],
+    })
+    session.set_schema(schema)
+    with pytest.raises(ValueError, match="target_positions length \\(2\\) does not match schema DOF \\(6\\)"):
+        session.move_to([0.0, 0.0])
+
+    # Schema-less session does not require 6 DOF
+    session_no_schema = ArmSession(mock_client, "http://localhost:8765/ws")
+    session_no_schema.command = MagicMock(return_value={"type": "command_ack"})
+    # wait=False returns None immediately without waiting
+    res = session_no_schema.move_to([0.1, 0.2], wait=False)
+    assert res is None
+    session_no_schema.command.assert_called_once_with(
+        "/api/v1/motion/jog", {"target_positions": [0.1, 0.2]}
+    )
+
+
+def test_units_load_lerobot_norm_bounds_null_fallback(tmp_path):
+    calib_json = tmp_path / "calib_nulls.json"
+    content = {
+        "shoulder_pan": {"range_min": 100, "range_max": 3900, "zero_step": None, "center": 2048},
+        "shoulder_lift": {"range_min": 200, "range_max": 3800, "zero_step": None, "center": 2048},
+        "elbow_flex": {"range_min": 300, "range_max": 3700, "zero_step": None, "center": 2048},
+        "wrist_flex": {"range_min": 400, "range_max": 3600, "zero_step": None, "center": 2048},
+        "wrist_roll": {"range_min": 500, "range_max": 3500, "zero_step": None, "center": 2048},
+        "gripper": {
+            "range_min": 100,
+            "range_max": 3900,
+            "zero_step": None,
+            "center": 2048,
+            "closed_tick": None,
+            "closed": 1500,
+            "open_tick": None,
+            "open": 2500,
+        },
+    }
+    calib_json.write_text(json.dumps(content), encoding="utf-8")
+
+    limits, closed_rad, open_rad = units.load_lerobot_norm_bounds(calib_json)
+    assert len(limits) == 6
+    assert closed_rad is not None
+    assert open_rad is not None
+    assert math.isfinite(closed_rad)
+    assert math.isfinite(open_rad)
+    expected_closed = (1500 - 2048) * (2 * math.pi / 4096)
+    expected_open = (2500 - 2048) * (2 * math.pi / 4096)
+    assert closed_rad == pytest.approx(expected_closed, rel=1e-5)
+    assert open_rad == pytest.approx(expected_open, rel=1e-5)
+    assert limits[5][0] == closed_rad
+    assert limits[5][1] == open_rad
+    assert limits[0][0] == pytest.approx((100 - 2048) * (2 * math.pi / 4096), rel=1e-5)
+    assert limits[0][1] == pytest.approx((3900 - 2048) * (2 * math.pi / 4096), rel=1e-5)
+
+
+def test_policy_runner_init_unit_override_with_deg_policy_and_calib(tmp_path):
+    from rebot_companion.policy_runner import PolicyRunner, RunnerError, SinePolicy
+
+    mock_client = MagicMock()
+    calib_file = tmp_path / "calib.json"
+    calib_file.write_text("{}", encoding="utf-8")
+
+    mock_policy_deg = MagicMock()
+    mock_policy_deg.fps = 10
+    mock_policy_deg.image_key = None
+    mock_policy_deg.name = "deg_policy"
+    mock_policy_deg.info = {"unit_mode": "deg"}
+
+    # When explicit action_units="so101_norm" and state_units="rad", preview does NOT resolve to "deg",
+    # so __init__ succeeds without spuriously raising RunnerError!
+    runner = PolicyRunner(
+        mock_client,
+        mock_policy_deg,
+        lerobot_calib=calib_file,
+        action_units="so101_norm",
+        state_units="rad",
+    )
+    assert runner.action_units_requested == "so101_norm"
+    assert runner.state_units_requested == "rad"
+
+    # Strengthened unit validation (Opus L8):
+    # Sine policy previews as ("rad", "rad") consistently with run(), so lerobot_calib succeeds without deg conflict
+    sine_pol = SinePolicy("joint1", 0.05, 4.0)
+    runner_sine = PolicyRunner(mock_client, sine_pol, lerobot_calib=calib_file)
+    assert runner_sine.policy.name.startswith("sine:")
+
+    # Invalid unit_mode wraps ValueError into RunnerError
+    with pytest.raises(RunnerError, match="unsupported unit mode"):
+        PolicyRunner(mock_client, mock_policy_deg, action_units="invalid_mode")
+
+    # But when action_units="auto" with metadata unit_mode="deg", preview resolves to "deg",
+    # so __init__ DOES raise RunnerError!
+    with pytest.raises(RunnerError, match="incompatible with 'deg' unit mode"):
+        PolicyRunner(
+            mock_client,
+            mock_policy_deg,
+            lerobot_calib=calib_file,
+            action_units="auto",
+            state_units="auto",
+        )
+
+
+def test_arm_status_older_armd_omitting_gripper_fields():
+    # Older armd omitting gripper.rad / gripper.fraction sets obs.gripper = None without raising
+    d = {
+        "timestamp": 1.0,
+        "positions": [0.0] * 6,
+        "safety_state": "Armed",
+        "gripper": {"joint": 5},
+    }
+    obs = ArmStatus.from_dict(d)
+    assert obs.gripper is None
+
+    d_empty = {
+        "timestamp": 1.0,
+        "positions": [0.0] * 6,
+        "safety_state": "Armed",
+        "gripper": {},
+    }
+    obs_empty = ArmStatus.from_dict(d_empty)
+    assert obs_empty.gripper is None
+
+
+def test_vec_rejects_non_iterable_and_bool():
+    from rebot.client import _vec
+    with pytest.raises(ValueError, match="pos must be an iterable"):
+        _vec(5, 3, "pos")
+    with pytest.raises(ValueError, match="pos\\[0\\] must be numeric, got True"):
+        _vec([True, 0, 0], 3, "pos")
+    with pytest.raises(ValueError, match="pos\\[1\\] must be numeric, got False"):
+        _vec([0.0, False, 0.0], 3, "pos")
+
+
+def test_leader_teleop_run_align_torque_fail_triggers_unload_once():
+    from rebot_companion.leader_teleop import LeaderTeleopBridge
+    bus = MagicMock()
+    session = MagicMock()
+    session.client.get_safety_describe.return_value = {"device": {"follower": "mock"}}
+    schema = ObservationSchema.from_dict({
+        "dof": 6, "arm_dof": 5, "gripper_joint": 5,
+        "limits": [{"name": f"j{i}", "min_position": -3.0, "max_position": 3.0, "max_velocity": 1.0, "max_acceleration": 1.0} for i in range(6)],
+    })
+    bridge = LeaderTeleopBridge(bus, session, schema, fps=50, follower="mock", park_on_exit=True)
+
+    obs = MagicMock()
+    obs.is_stopped = False
+    obs.safety_state = "Idle"
+    obs.is_torqued = False
+    obs.is_operational = False
+    obs.positions = [0.0] * 6
+    obs.commanded_positions = [0.0] * 6
+    obs.fault = None
+    obs.collision = None
+    obs.motion_limit = None
+    session.wait_for_observation.return_value = obs
+    session.latest_observation.return_value = obs
+    bridge.read_leader_target = MagicMock(return_value=[0.0] * 6)
+
+    # When enable(True) / torque(True) fails mid-ramp
+    session.torque.side_effect = RuntimeError("follower torque enable failed mid-ramp")
+
+    bridge.run()
+
+    assert bridge._error is not None
+    assert bridge._parked is True
+    session.unload.assert_called_once_with(wait=True, timeout=15.0)
+
+    # Calling close() must not double-park
+    bridge.close()
+    assert session.unload.call_count == 1
+
+
+def test_units_homing_offset_warning_when_unverified(tmp_path: Path, caplog):
+    import logging
+    calib_json = tmp_path / "calib_unverified.json"
+    calib_data = {
+        "shoulder_pan": {"range_min": 1024, "range_max": 3072, "homing_offset": 200},
+        "shoulder_lift": {"range_min": 1024, "range_max": 3072, "homing_offset": 200},
+        "elbow_flex": {"range_min": 1024, "range_max": 3072, "homing_offset": 200},
+        "wrist_flex": {"range_min": 1024, "range_max": 3072, "homing_offset": 200},
+        "wrist_roll": {"range_min": 1024, "range_max": 3072, "homing_offset": 200},
+        "gripper": {"range_min": 1500, "range_max": 2500, "homing_offset": 200},
+    }
+    calib_json.write_text(json.dumps(calib_data), encoding="utf-8")
+    schema = ObservationSchema.from_dict({
+        "dof": 6, "arm_dof": 5, "gripper_joint": 5,
+        "limits": [{"name": f"j{i}", "min_position": -3.0, "max_position": 3.0, "max_velocity": 1.0, "max_acceleration": 1.0} for i in range(6)],
+    })
+    with caplog.at_level(logging.WARNING):
+        units.load_lerobot_norm_bounds(calib_json, schema=schema)
+    assert "homing_offset in calibration JSON cannot be cross-verified" in caplog.text
+
+
+def test_arm_session_servo_non_finite_ref_telemetry_jump_protection():
+    import threading
+    from rebot.errors import ServoJumpError
+
+    mock_client = MagicMock()
+    s = ArmSession(mock_client)
+    s._state = threading.Condition()
+    s._servo_error = None
+    s._last_servo = None
+    s._schema = ObservationSchema.from_dict({
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "limits": [
+            {"name": f"j{i}", "min_position": -2.0, "max_position": 2.0, "max_velocity": 1.0, "max_acceleration": 1.0}
+            for i in range(6)
+        ],
+    })
+    s._gripper_joint = 5
+    s._check_lease = MagicMock(return_value=1)
+    s._send = MagicMock()
+    s._epoch = 1
+    s.client_id = "test"
+
+    # 1. Target length does not match schema DOF
+    with pytest.raises(ValueError, match="does not match schema DOF"):
+        s.servo([0.0] * 5)
+
+    # 2. Non-finite telemetry reference does NOT bypass ServoJumpError
+    mock_obs = MagicMock()
+    mock_obs.positions = [0.0, float("nan"), 0.0, 0.0, 0.0, 0.0]
+    s.latest_observation = MagicMock(return_value=mock_obs)
+
+    with pytest.raises(ServoJumpError, match="is not finite"):
+        s.servo([0.0] * 6)
+
+
+def test_arm_move_to_schema_fallback_and_move_pose_schema_fetch_cooldown():
+    from rebot.arm import Arm
+    from rebot.client import ActionResult, ArmSession, UnsupportedError
+
+    # 1. Arm.move_to capability check fallback via session._schema
+    mock_session = MagicMock()
+    mock_session.is_open = True
+    mock_session._schema = ObservationSchema.from_dict({
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "capabilities": {"auto_yaw": True},
+        "limits": [
+            {"name": f"j{i}", "min_position": -2.0, "max_position": 2.0, "max_velocity": 1.0, "max_acceleration": 1.0}
+            for i in range(6)
+        ],
+    })
+    mock_session.move_pose.return_value = MagicMock(ok=True)
+    mock_arm = Arm.__new__(Arm)
+    mock_arm.session = mock_session
+    mock_arm.schema = None  # schema on Arm is None, should fall back to session._schema
+    mock_arm._motion = lambda fn, label, to=None: fn()
+    res = mock_arm.move_to([0.2, 0.0, 0.1], auto_yaw=True)
+    assert res.ok
+    mock_session.move_pose.assert_called_once()
+    assert mock_session.move_pose.call_args[1].get("auto_yaw") is True
+
+    # When fallback session._schema lacks auto_yaw, auto_yaw=True raises UnsupportedError
+    mock_session._schema = ObservationSchema.from_dict({
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "capabilities": {"auto_yaw": False},
+        "limits": [
+            {"name": f"j{i}", "min_position": -2.0, "max_position": 2.0, "max_velocity": 1.0, "max_acceleration": 1.0}
+            for i in range(6)
+        ],
+    })
+    with pytest.raises(UnsupportedError, match="does not advertise auto_yaw capability"):
+        mock_arm.move_to([0.2, 0.0, 0.1], auto_yaw=True)
+
+    # 2. ArmSession.move_pose with _schema=None triggers schema() obeying cooldown
+    session = ArmSession.__new__(ArmSession)
+    session._action = MagicMock()
+    session._schema = None
+    session._last_schema_attempt = None
+
+    def fake_schema(timeout=1.0):
+        session._schema = ObservationSchema.from_dict({
+            "dof": 6,
+            "arm_dof": 5,
+            "gripper_joint": 5,
+            "capabilities": {"auto_yaw": True},
+            "limits": [
+                {"name": f"j{i}", "min_position": -2.0, "max_position": 2.0, "max_velocity": 1.0, "max_acceleration": 1.0}
+                for i in range(6)
+            ],
+        })
+        session._last_schema_attempt = time.monotonic()
+        return session._schema
+
+    session.schema = MagicMock(side_effect=fake_schema)
+
+    session.move_pose([0.2, 0.0, 0.1], auto_yaw=True)
+    assert session.schema.call_count == 1
+    assert session._schema is not None
+
+    # Calling again immediately obeys cooldown
+    session._schema = None
+    session.move_pose([0.2, 0.0, 0.1], auto_yaw=False)
+    assert session.schema.call_count == 1
+
+
+def test_arm_status_from_dict_malformed_debug_log(caplog, monkeypatch):
+    import logging
+
+    monkeypatch.setenv("REBOT_DEBUG", "1")
+    with caplog.at_level(logging.DEBUG, logger="rebot"):
+        status_bad_tcp = ArmStatus.from_dict({"tcp": {"position": "invalid"}})
+        assert status_bad_tcp.tcp is None
+        assert "ignoring malformed tcp payload" in caplog.text
+
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG, logger="rebot"):
+        status_bad_grip = ArmStatus.from_dict({"gripper": {"joint": "not_an_int"}})
+        assert status_bad_grip.gripper is None
+        assert "ignoring malformed gripper payload" in caplog.text
+
+
+def test_units_homing_applied_in_hw_warning_and_gripper_center_branches(tmp_path: Path, caplog):
+    import json
+    import logging
+    from rebot_companion import units
+
+    joint_names = ("shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll")
+    calib_data = {
+        name: {"range_min": 1024, "range_max": 3072, "homing_offset": 0}
+        for name in joint_names
+    }
+    calib_data["gripper"] = {"range_min": 1500, "range_max": 2500, "homing_offset": 0}
+    calib_file = tmp_path / "calib_homing.json"
+    calib_file.write_text(json.dumps(calib_data), encoding="utf-8")
+
+    mock_schema = ObservationSchema.from_dict({
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "limits": [
+            {"name": f"j{i}", "min_position": -2.0, "max_position": 2.0, "max_velocity": 1.0, "max_acceleration": 1.0}
+            for i in range(6)
+        ],
+        "feetech_joints": [
+            {"zero_step": 2048, "homing_applied_in_hw": True, "homing_offset_steps": 100}
+            for _ in range(6)
+        ],
+    })
+
+    with caplog.at_level(logging.WARNING):
+        limits, closed, open_ = units.load_lerobot_norm_bounds(calib_file, schema=mock_schema)
+    assert "homing_applied_in_hw=True means EEPROM homing_offset cannot be cross-verified" in caplog.text
+
+    # Test gripper center and zero_step branches
+    calib_zero_step = {
+        name: {"range_min": 1024, "range_max": 3072, "center": 2048}
+        for name in joint_names
+    }
+    calib_zero_step["gripper"] = {"range_min": 1500, "range_max": 2500, "zero_step": 2048}
+    calib_file_zs = tmp_path / "calib_zs.json"
+    calib_file_zs.write_text(json.dumps(calib_zero_step), encoding="utf-8")
+    limits_zs, _, _ = units.load_lerobot_norm_bounds(calib_file_zs, schema=mock_schema)
+    assert len(limits_zs) == 6
+
+    calib_center = dict(calib_zero_step)
+    calib_center["gripper"] = {"range_min": 1500, "range_max": 2500, "center": 2048}
+    calib_file_c = tmp_path / "calib_c.json"
+    calib_file_c.write_text(json.dumps(calib_center), encoding="utf-8")
+    limits_c, _, _ = units.load_lerobot_norm_bounds(calib_file_c, schema=mock_schema)
+    assert len(limits_c) == 6
+
+
+def test_leader_teleop_rejects_nan_limits_before_torque():
+    from rebot_companion.leader_teleop import LeaderTeleopBridge, LeaderError
+    bus = MagicMock()
+    session = MagicMock()
+    schema = ObservationSchema.from_dict({
+        "dof": 6, "arm_dof": 5, "gripper_joint": 5,
+        "limits": [{"name": f"j{i}", "min_position": float("nan"), "max_position": 1.0, "max_velocity": 1.0, "max_acceleration": 1.0} for i in range(6)],
+    })
+    with pytest.raises(LeaderError, match="must be finite"):
+        LeaderTeleopBridge(bus, session, schema, follower="mock")
+    session.torque.assert_not_called()
+
+
+def test_units_load_lerobot_norm_bounds_strict_bool_string(tmp_path: Path):
+    calib_json = tmp_path / "calib_str_bool.json"
+    calib_data = {
+        "shoulder_pan": {"range_min": 1024, "range_max": 3072, "homing_offset": 200},
+        "shoulder_lift": {"range_min": 1024, "range_max": 3072, "homing_offset": 200},
+        "elbow_flex": {"range_min": 1024, "range_max": 3072, "homing_offset": 200},
+        "wrist_flex": {"range_min": 1024, "range_max": 3072, "homing_offset": 200},
+        "wrist_roll": {"range_min": 1024, "range_max": 3072, "homing_offset": 200},
+        "gripper": {"range_min": 1500, "range_max": 2500, "homing_offset": 200},
+    }
+    calib_json.write_text(json.dumps(calib_data), encoding="utf-8")
+
+    # When homing_applied_in_hw is string "false", strict_bool parses as False.
+    # If armd schema has mismatching homing_offset_steps (e.g. 100 vs calib 200),
+    # it must raise ValueError (if it had parsed "false" as True, it would have skipped verification!).
+    schema_feetech = ObservationSchema.from_dict({
+        "dof": 6, "arm_dof": 5, "gripper_joint": 5,
+        "limits": [{"name": f"j{i}", "min_position": -3.0, "max_position": 3.0, "max_velocity": 1.0, "max_acceleration": 1.0} for i in range(6)],
+        "feetech_joints": [
+            {"zero_step": 2048, "homing_applied_in_hw": "false", "homing_offset_steps": 100, "drive_mode_invert": "false"}
+            for _ in range(6)
+        ],
+    })
+    with pytest.raises(ValueError, match="homing_offset mismatch"):
+        units.load_lerobot_norm_bounds(calib_json, schema=schema_feetech)

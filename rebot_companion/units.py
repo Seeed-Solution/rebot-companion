@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -29,12 +29,45 @@ log = logging.getLogger("rebot_companion.units")
 SUPPORTED_UNIT_MODES = ("rad", "so101_norm", "deg")
 
 
+def _first_non_none(entry: Mapping[str, Any], *keys: str) -> Any:
+    for k in keys:
+        if k in entry and entry[k] is not None:
+            return entry[k]
+    return None
+
+
+def _is_bool(val: Any) -> bool:
+    return isinstance(val, bool) or (
+        type(val).__name__ in ("bool", "bool_")
+        and type(val).__module__.split(".")[0] == "numpy"
+    )
+
+
+def _strict_bool(val: Any, name: str) -> bool:
+    if _is_bool(val):
+        return bool(val)
+    if isinstance(val, (int, float)):
+        if val == 0:
+            return False
+        if val == 1:
+            return True
+        raise ValueError(f"{name} must be boolean or 0/1, got {val!r}")
+    if isinstance(val, str):
+        s = val.strip().lower()
+        if s in ("true", "1", "yes", "on"):
+            return True
+        if s in ("false", "0", "no", "off"):
+            return False
+        raise ValueError(f"{name} must be a boolean string, got {val!r}")
+    raise ValueError(f"{name} must be boolean, got {type(val).__name__}: {val!r}")
+
+
 def _finite_float(val: Any, label: str) -> float:
-    if isinstance(val, bool):
+    if _is_bool(val):
         raise ValueError(f"{label} must be numeric, got {val!r}")
     try:
         f = float(val)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError(f"{label} must be numeric, got {val!r}") from exc
     if not math.isfinite(f):
         raise ValueError(f"{label} must be finite, got {val!r}")
@@ -445,9 +478,10 @@ def load_lerobot_norm_bounds(
             else None
         )
         if fj is not None:
-            armd_sign = -1.0 if fj.get("drive_mode_invert") else 1.0
+            drive_invert = _strict_bool(fj.get("drive_mode_invert", False), f"{name}.drive_mode_invert")
+            armd_sign = -1.0 if drive_invert else 1.0
             zero_step_fj = _finite_float(fj.get("zero_step", 2048.0), f"{name}.fj.zero_step")
-            homing_applied = bool(fj.get("homing_applied_in_hw", False))
+            homing_applied = _strict_bool(fj.get("homing_applied_in_hw", False), f"{name}.homing_applied_in_hw")
             homing_offset_steps = _finite_float(fj.get("homing_offset_steps", 0.0), f"{name}.fj.homing_offset_steps")
         else:
             armd_sign = 1.0
@@ -463,9 +497,19 @@ def load_lerobot_norm_bounds(
                         f"{name}: homing_offset mismatch between calibration JSON ({calib_ho}) and "
                         f"armd schema feetech_joints ({homing_offset_steps}) when homing_applied_in_hw=False"
                     )
+            elif homing_applied:
+                log.warning(
+                    "%s: homing_applied_in_hw=True means EEPROM homing_offset cannot be cross-verified against homing_offset_steps",
+                    name,
+                )
+            else:
+                log.warning(
+                    "%s: homing_offset in calibration JSON cannot be cross-verified against schema homing_offset_steps",
+                    name,
+                )
 
-        if "zero_step" in entry or "center" in entry:
-            raw_c = entry["zero_step"] if "zero_step" in entry else entry["center"]
+        raw_c = _first_non_none(entry, "zero_step", "center")
+        if raw_c is not None:
             effective_zero = _finite_float(raw_c, f"{name}.center")
         elif "homing_offset" in entry:
             effective_zero = zero_step_fj
@@ -505,11 +549,11 @@ def load_lerobot_norm_bounds(
 
     g_tick_closed = g_max if g_drive_mode else g_min
     g_tick_open = g_min if g_drive_mode else g_max
-    if "closed_tick" in grip_entry or "closed" in grip_entry:
-        raw_gc = grip_entry.get("closed_tick", grip_entry.get("closed"))
+    raw_gc = _first_non_none(grip_entry, "closed_tick", "closed")
+    if raw_gc is not None:
         g_tick_closed = _finite_float(raw_gc, "gripper.closed_tick")
-    if "open_tick" in grip_entry or "open" in grip_entry:
-        raw_go = grip_entry.get("open_tick", grip_entry.get("open"))
+    raw_go = _first_non_none(grip_entry, "open_tick", "open")
+    if raw_go is not None:
         g_tick_open = _finite_float(raw_go, "gripper.open_tick")
 
     if not (
@@ -530,9 +574,10 @@ def load_lerobot_norm_bounds(
         else None
     )
     if fj_grip is not None:
-        g_armd_sign = -1.0 if fj_grip.get("drive_mode_invert") else 1.0
+        g_drive_invert = _strict_bool(fj_grip.get("drive_mode_invert", False), "gripper.drive_mode_invert")
+        g_armd_sign = -1.0 if g_drive_invert else 1.0
         g_zero_step_fj = _finite_float(fj_grip.get("zero_step", 2048.0), "gripper.fj.zero_step")
-        g_homing_applied = bool(fj_grip.get("homing_applied_in_hw", False))
+        g_homing_applied = _strict_bool(fj_grip.get("homing_applied_in_hw", False), "gripper.homing_applied_in_hw")
         g_homing_offset_steps = _finite_float(fj_grip.get("homing_offset_steps", 0.0), "gripper.fj.homing_offset_steps")
     else:
         g_armd_sign = 1.0
@@ -548,10 +593,18 @@ def load_lerobot_norm_bounds(
                     f"gripper: homing_offset mismatch between calibration JSON ({g_calib_ho}) and "
                     f"armd schema feetech_joints ({g_homing_offset_steps}) when homing_applied_in_hw=False"
                 )
+        elif g_homing_applied:
+            log.warning(
+                "gripper: homing_applied_in_hw=True means EEPROM homing_offset cannot be cross-verified against homing_offset_steps"
+            )
+        else:
+            log.warning(
+                "gripper: homing_offset in calibration JSON cannot be cross-verified against schema homing_offset_steps"
+            )
 
-    if "zero_step" in grip_entry or "center" in grip_entry:
-        raw_gc = grip_entry.get("zero_step", grip_entry.get("center"))
-        g_effective_zero = _finite_float(raw_gc, "gripper.center")
+    raw_gz = _first_non_none(grip_entry, "zero_step", "center")
+    if raw_gz is not None:
+        g_effective_zero = _finite_float(raw_gz, "gripper.center")
     elif "homing_offset" in grip_entry:
         g_effective_zero = g_zero_step_fj
     else:

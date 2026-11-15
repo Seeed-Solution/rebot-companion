@@ -912,6 +912,17 @@ class _Segment:
         return self.start + (self.end - self.start) * a
 
 
+def _check_lerobot_calib_compatible(
+    lerobot_calib: str | Path | None,
+    action_units: str,
+    state_units: str,
+) -> None:
+    if lerobot_calib is not None and ("deg" in (action_units, state_units)):
+        raise RunnerError(
+            "--lerobot-calib is incompatible with 'deg' unit mode; it calibrates 'so101_norm' [-100, 100] ranges"
+        )
+
+
 class PolicyRunner:
     """One policy run on one armd. ``client`` is a :class:`rebot.client.ArmdClient`; ``camera`` is any
     source with ``latest() -> (host_monotonic_s, frame) | None`` (optional ``start()``,
@@ -940,6 +951,7 @@ class PolicyRunner:
         sender_join_s: float = 2 * SEND_TIMEOUT_S,
         action_units: str = "auto",
         state_units: str = "auto",
+        override_unit_mode: bool = False,
         lerobot_calib: str | Path | None = None,
         io_sender: Any = None,
     ) -> None:
@@ -975,19 +987,21 @@ class PolicyRunner:
         self.connect_timeout = connect_timeout
         self.action_units_requested = action_units
         self.state_units_requested = state_units
+        self.override_unit_mode = bool(override_unit_mode)
         self.lerobot_calib = lerobot_calib
-        if self.lerobot_calib is not None:
-            if "deg" in (action_units, state_units):
-                raise RunnerError(
-                    "--lerobot-calib is incompatible with 'deg' unit mode; it calibrates 'so101_norm' [-100, 100] ranges"
-                )
+        p_name = getattr(policy, "name", None)
+        if p_name == "sine" or (isinstance(p_name, str) and p_name.startswith("sine:")):
+            preview_action_units = "rad"
+            preview_state_units = "rad"
+        else:
             p_info = getattr(policy, "info", None)
-            if isinstance(p_info, dict):
-                p_unit = p_info.get("unit_mode") or p_info.get("rebot_unit_mode")
-                if p_unit == "deg" and (action_units == "auto" or state_units == "auto"):
-                    raise RunnerError(
-                        "--lerobot-calib is incompatible with 'deg' unit mode; it calibrates 'so101_norm' [-100, 100] ranges"
-                    )
+            info_dict = p_info if isinstance(p_info, dict) else None
+            try:
+                preview_action_units = units.resolve_unit_mode(action_units, info_dict, require_metadata=False)
+                preview_state_units = units.resolve_unit_mode(state_units, info_dict, require_metadata=False)
+            except ValueError as exc:
+                raise RunnerError(str(exc)) from exc
+        _check_lerobot_calib_compatible(self.lerobot_calib, preview_action_units, preview_state_units)
 
         self._lerobot_limits: list[tuple[float, float]] | None = None
         self._lerobot_closed_rad: float | None = None
@@ -1236,17 +1250,17 @@ class PolicyRunner:
             self.action_units = "rad"
             self.state_units = "rad"
         else:
-            self.action_units = units.resolve_unit_mode(
-                self.action_units_requested, policy_info, require_metadata=require_meta
-            )
-            self.state_units = units.resolve_unit_mode(
-                self.state_units_requested, policy_info, require_metadata=require_meta
-            )
+            try:
+                self.action_units = units.resolve_unit_mode(
+                    self.action_units_requested, policy_info, require_metadata=require_meta
+                )
+                self.state_units = units.resolve_unit_mode(
+                    self.state_units_requested, policy_info, require_metadata=require_meta
+                )
+            except ValueError as exc:
+                raise RunnerError(str(exc)) from exc
 
-        if self.lerobot_calib is not None and ("deg" in (self.action_units, self.state_units)):
-            raise RunnerError(
-                "--lerobot-calib is incompatible with 'deg' unit mode; it calibrates 'so101_norm' [-100, 100] ranges"
-            )
+        _check_lerobot_calib_compatible(self.lerobot_calib, self.action_units, self.state_units)
 
         if isinstance(policy_info, dict):
             meta_unit = policy_info.get("unit_mode") or policy_info.get("rebot_unit_mode")
@@ -1254,12 +1268,20 @@ class PolicyRunner:
                 meta_unit_str = str(meta_unit).strip()
                 if meta_unit_str:
                     if self.action_units_requested != "auto" and self.action_units_requested != meta_unit_str:
+                        if not self.override_unit_mode:
+                            raise RunnerError(
+                                f"explicit action_units {self.action_units_requested!r} conflicts with policy metadata unit_mode {meta_unit_str!r}; pass --override-unit-mode to force"
+                            )
                         log.warning(
                             "explicit action_units %r differs from policy metadata unit_mode %r",
                             self.action_units_requested,
                             meta_unit_str,
                         )
                     if self.state_units_requested != "auto" and self.state_units_requested != meta_unit_str:
+                        if not self.override_unit_mode:
+                            raise RunnerError(
+                                f"explicit state_units {self.state_units_requested!r} conflicts with policy metadata unit_mode {meta_unit_str!r}; pass --override-unit-mode to force"
+                            )
                         log.warning(
                             "explicit state_units %r differs from policy metadata unit_mode %r",
                             self.state_units_requested,
@@ -2007,6 +2029,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--lerobot-calib",
         help="path to LeRobot SO-100/SO-101 calibration JSON to align motor tick bounds for so101_norm",
     )
+    p.add_argument(
+        "--override-unit-mode",
+        action="store_true",
+        default=False,
+        help="allow explicit action_units / state_units to override policy metadata unit_mode",
+    )
     p.add_argument("--stall-s", type=float, default=1.0, help="stop when the policy gives no target for this long")
     p.add_argument("--max-frame-age", type=float, default=0.5, help="stop when the newest camera frame is older (s)")
     p.add_argument(
@@ -2069,6 +2097,7 @@ def _main(args: argparse.Namespace, handle: Any) -> int:
             log_path=args.log,
             action_units=args.action_units,
             state_units=args.state_units,
+            override_unit_mode=args.override_unit_mode,
             lerobot_calib=args.lerobot_calib,
         )
         print(

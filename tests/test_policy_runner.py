@@ -745,13 +745,15 @@ def test_act_policy_runs_10_steps(http_armd, camera_server, tmp_path):
 
 
 def obs_status(positions=None, state="Moving"):
-    return ArmStatus.from_dict(
-        {
-            "positions": list(HOME if positions is None else positions),
-            "safety_state": state,
-            "is_torqued": True,
-            "epoch_id": 1,
-        }
+    return ArmStatus(
+        timestamp=0.0,
+        positions=list(HOME if positions is None else positions),
+        velocities=[0.0] * 7,
+        torques=[0.0] * 7,
+        temperatures=[0.0] * 7,
+        is_torqued=True,
+        safety_state=state,
+        epoch_id=1,
     )
 
 

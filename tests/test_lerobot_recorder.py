@@ -537,3 +537,83 @@ def test_recorder_7dof_toolless_deg_mode(tmp_path: Path):
     expected_deg = math.degrees(1.0)  # ~57.2957795 deg
     assert rec_state[6] == pytest.approx(expected_deg, rel=1e-5)
     assert rec_state[6] != pytest.approx(50.0, rel=1e-2)
+
+
+def test_recorder_add_frame_rejected_frame_preserves_state(tmp_path: Path):
+    rec = LeRobotRecorder(tmp_path / "rec_reject", "test/reject", fps=10, armd_host=None, camera_url=None)
+    assert rec._dof is None
+    assert rec.arm_dof is None
+    assert rec.gripper_joint is None
+
+    rec.start_episode(sample=False)
+
+    # 1. 7-element frame containing NaN is rejected
+    with pytest.raises(ValueError, match="state\\[0\\] must be finite"):
+        rec.add_frame(state=[float("nan")] * 7, action=[0.0] * 7)
+
+    # State must be completely unmutated!
+    assert rec._dof is None
+    assert rec.arm_dof is None
+    assert rec.gripper_joint is None
+    assert len(rec._ep.state) == 0
+
+    # 2. 7-element frame containing bool is rejected
+    with pytest.raises(ValueError, match="state\\[0\\] must be numeric, got True"):
+        rec.add_frame(state=[True] * 7, action=[0.0] * 7)
+
+    assert rec._dof is None
+    assert rec.arm_dof is None
+    assert rec.gripper_joint is None
+    assert len(rec._ep.state) == 0
+
+    # 3. Subsequent valid 6-element frame succeeds and sets _dof=6
+    rec.add_frame(state=[0.1] * 6, action=[0.2] * 6)
+    assert rec._dof == 6
+    assert len(rec._ep.state) == 1
+    assert rec._ep.state[0] == [0.1] * 6
+    assert rec._ep.action[0] == [0.2] * 6
+
+    rec.stop_episode()
+    rec.save()
+
+    info = json.loads((tmp_path / "rec_reject/meta/info.json").read_text())
+    assert info["features"]["observation.state"]["shape"] == [6]
+    assert info["features"]["action"]["shape"] == [6]
+
+
+def test_lerobot_recorder_rejects_np_bool_overflow_and_cross_episode_dof(tmp_path: Path):
+    import numpy as np
+
+    from rebot.client import JointLimit
+
+    rec = LeRobotRecorder(tmp_path / "rec_hardened", "test/hardened", fps=10, camera_url=None, armd_host=None, unit_mode="deg")
+    rec.limits = [JointLimit(f"j{i}", -3.14, 3.14, 1.0, 1.0) for i in range(6)]
+    rec.start_episode()
+
+    # 1. numpy.bool_ elements rejected
+    np_bools = np.array([True, False, True, False, True, False], dtype=bool)
+    with pytest.raises(ValueError, match="state\\[0\\] must be numeric"):
+        rec.add_frame(state=np_bools, action=[0.0] * 6)
+    assert rec._dof is None
+    assert len(rec._ep.state) == 0
+
+    # 2. Degree conversion overflow (1e308 deg * pi/180 -> math.isfinite / OverflowError)
+    with pytest.raises(ValueError, match="must be finite"):
+        rec.add_frame(state=[1e308] * 6, action=[0.0] * 6)
+    assert rec._dof is None
+    assert len(rec._ep.state) == 0
+
+    # 3. Valid episode 0 with 6 DOF
+    rec.add_frame(state=[0.0] * 6, action=[0.0] * 6)
+    assert rec._dof == 6
+    rec.stop_episode()
+    rec.save()
+
+    # 4. Episode 1 attempting 7 DOF must fail closed without mutating _dof or adding rows
+    rec.start_episode()
+    with pytest.raises(ValueError, match="state has 7 values, expected dataset DOF 6"):
+        rec.add_frame(state=[0.0] * 7, action=[0.0] * 7)
+    assert rec._dof == 6
+    assert len(rec._ep.state) == 0
+    rec.stop_episode()
+    rec.discard()
