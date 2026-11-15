@@ -201,7 +201,8 @@ def test_closed_loop_onnx_policy_nhwc(tmp_path: Path):
 
 def test_compose_mjcf_via_live_wasm():
     wasm_path = resolve_armd_wasm()
-    assert wasm_path is not None and wasm_path.is_file(), f"armd.wasm not found at {wasm_path}"
+    if wasm_path is None:
+        pytest.skip("armd.wasm not found; set REBOT_ARMD_DIR (or REBOT_ARMD_WASM) to an armd build")
 
     xml = compose_mjcf_via_wasm(
         wasm_path=wasm_path,

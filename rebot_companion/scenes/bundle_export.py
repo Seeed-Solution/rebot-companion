@@ -23,8 +23,19 @@ from .spec import (
     validate_tool_dir,
 )
 
-DEFAULT_ARMD_WASM = Path("/home/harvest/project/rebot-armd-public/target/wasm32-unknown-unknown/release/armd.wasm")
-DEFAULT_BASE_XML_DIR = Path("/home/harvest/project/rebot-armd-public/sim/mujoco/models")
+# armd checkout (rebot-armd) used to find armd.wasm and the base MuJoCo scenes; unset = none.
+ARMD_DIR_ENV = "REBOT_ARMD_DIR"
+ARMD_WASM_CANDIDATES = (
+    "target/wasm32-unknown-unknown/release/armd.wasm",
+    "dist/armd.wasm",
+    "target/wasm32-unknown-unknown/debug/armd.wasm",
+)
+BASE_XML_SUBDIR = "sim/mujoco/models"
+
+
+def _armd_dir() -> Path | None:
+    raw = os.environ.get(ARMD_DIR_ENV)
+    return Path(raw).expanduser() if raw else None
 
 NODE_WASM_RUNNER = r"""
 const fs = require('fs');
@@ -90,12 +101,11 @@ def resolve_armd_wasm(explicit_path: str | Path | None = None) -> Path | None:
         if p.is_file():
             return p
 
-    candidates = [
-        DEFAULT_ARMD_WASM,
-        Path("/home/harvest/project/rebot-armd-public/dist/armd.wasm"),
-        Path("/home/harvest/project/rebot-armd-public/target/wasm32-unknown-unknown/debug/armd.wasm"),
-    ]
-    for c in candidates:
+    armd_dir = _armd_dir()
+    if armd_dir is None:
+        return None
+    for rel in ARMD_WASM_CANDIDATES:
+        c = armd_dir / rel
         if c.is_file():
             return c
     return None
@@ -208,7 +218,8 @@ def compose_mjcf_via_wasm(
                 tool_xml=tool_xml,
                 tool_preset=tool_preset,
             )
-        raise FileNotFoundError(f"armd.wasm not found at {wasm_path or DEFAULT_ARMD_WASM}")
+        where = wasm_path or f"${ARMD_DIR_ENV} ({os.environ.get(ARMD_DIR_ENV) or 'unset'})"
+        raise FileNotFoundError(f"armd.wasm not found at {where}")
 
     node_bin = shutil.which("node")
     if not node_bin:
@@ -321,8 +332,9 @@ def export_static_bundle(
     base_xml_content = base_xml
     if base_xml_content is None:
         robot_model_file = "so_arm101_scene.xml" if robot == "so-arm101" else "rebot_b601dm_scene.xml"
-        candidate = DEFAULT_BASE_XML_DIR / robot_model_file
-        if candidate.is_file():
+        armd_dir = _armd_dir()
+        candidate = armd_dir / BASE_XML_SUBDIR / robot_model_file if armd_dir is not None else None
+        if candidate is not None and candidate.is_file():
             base_xml_content = candidate.read_text(encoding="utf-8")
         else:
             # Fallback bare minimal XML
