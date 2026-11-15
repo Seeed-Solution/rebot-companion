@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import xml.etree.ElementTree as ET
@@ -344,6 +345,9 @@ def export_static_bundle(
                 "</worldbody></mujoco>"
             )
 
+    if robot == "so-arm101":
+        base_xml_content = base_xml_content.replace('meshdir="../../../assets/so101"', 'meshdir="so101"')
+
     # 4. Compose MJCF via armd.wasm (or fallback)
     mjcf_xml = compose_mjcf_via_wasm(
         wasm_path=wasm_path,
@@ -355,7 +359,42 @@ def export_static_bundle(
         allow_fallback=allow_fallback,
     )
 
-    # 5. Handle optional policy
+    if robot == "so-arm101":
+        mjcf_xml = mjcf_xml.replace('meshdir="../../../assets/so101"', 'meshdir="so101"')
+
+    mesh_files: list[str] = sorted(set(re.findall(r'<mesh\s+[^>]*file="([^"]+)"', base_xml_content)))
+
+    # 5. Build tool packs dictionary for runtime browser hot-swapping
+    tool_packs: dict[str, Any] = {"default": {"tool_preset": "default"}}
+    candidate_tools: set[str] = set()
+    if scene_manifest and scene_manifest.recommended_tools:
+        candidate_tools.update(scene_manifest.recommended_tools)
+    if robot == "b601dm":
+        candidate_tools.update(["wide_cup_gripper", "suction", "screwdriver"])
+    if eff_tool_id not in ("default", "none"):
+        candidate_tools.add(eff_tool_id)
+
+    candidate_tools.discard("default")
+    candidate_tools.discard("none")
+
+    for t_name in sorted(candidate_tools):
+        t_manifest: ToolManifest | None = None
+        p = Path(t_name).expanduser()
+        if p.is_dir() and (p / "tool.json").is_file():
+            t_manifest = validate_tool_dir(p)
+        else:
+            bp = resolve_builtin_path("tool", t_name)
+            if bp is not None:
+                t_manifest = validate_tool_dir(bp)
+
+        if t_manifest is not None and t_manifest.source_dir and t_manifest.tool_xml:
+            t_xml_text = (t_manifest.source_dir / t_manifest.tool_xml).read_text(encoding="utf-8")
+            tool_packs[t_name] = {
+                "tool_manifest": t_manifest.to_dict(),
+                "tool_xml": t_xml_text,
+            }
+
+    # 6. Handle optional policy
     policy_manifest_dict: dict[str, Any] | None = None
     model_onnx_rel: str | None = None
     if policy_dir is not None:
@@ -377,12 +416,17 @@ def export_static_bundle(
         "robot": robot,
         "scene_id": eff_scene_id,
         "tool_id": eff_tool_id,
+        "base_xml": base_xml_content,
+        "scene_world_xml": scene_world_xml,
         "mjcf_xml": mjcf_xml,
+        "tool_packs": tool_packs,
         "scene_manifest": scene_manifest.to_dict() if scene_manifest else None,
         "tool_manifest": tool_manifest.to_dict() if tool_manifest else None,
         "policy_manifest": policy_manifest_dict,
         "model_onnx_rel": model_onnx_rel,
     }
+    if robot == "so-arm101":
+        bundle_data["mesh_files"] = mesh_files
 
     bundle_json_str = json.dumps(bundle_data, indent=2, ensure_ascii=False)
 

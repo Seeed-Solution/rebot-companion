@@ -1,0 +1,61 @@
+{
+  "id": "lab_desktop",
+  "name": "Laboratory Desktop Pick & Place",
+  "version": "1.0.0",
+  "description": "SO-ARM101 table sorting cell: pick cube from feeder tray and place into sorting bin with obstacle avoidance.",
+  "world_xml": "world.xml",
+  "robots": ["so-arm101"],
+  "default_tool": "default",
+  "recommended_tools": ["default"],
+  "objects": [
+    {
+      "name": "cube",
+      "body": "cube",
+      "geom": "cube",
+      "class_name": "cube",
+      "default_pos": [0.22, -0.05, 0.015],
+      "jitter_xy": 0.01
+    }
+  ],
+  "zones": {
+    "feeder_tray": {
+      "center": [0.22, -0.05, 0.018],
+      "half_extents": [0.045, 0.045, 0.02]
+    },
+    "target_bin": {
+      "center": [0.22, 0.08, 0.018],
+      "half_extents": [0.045, 0.045, 0.02]
+    }
+  },
+  "io": [],
+  "task_stages": [
+    {
+      "id": "cube_picked",
+      "type": "object_grasped",
+      "object": "cube",
+      "min_z": 0.04,
+      "latch": true
+    },
+    {
+      "id": "cube_placed",
+      "type": "object_in_zone",
+      "object": "cube",
+      "zone": "target_bin",
+      "latch": true
+    }
+  ],
+  "poses": {
+    "ready": [0.0, -0.25, 0.55, 0.0, 0.80, 0.0],
+    "above_pick": [-0.22, -0.15, 0.45, 0.0, 0.90, 0.0],
+    "pick_cube": [-0.22, -0.05, 0.35, 0.0, 0.90, 0.0],
+    "above_place": [0.35, -0.15, 0.45, 0.0, 0.90, 0.0],
+    "place_cube": [0.35, -0.05, 0.35, 0.0, 0.90, 0.0],
+    "park": [0.0, -1.2, 1.4, 0.0, 0.0, 0.0]
+  },
+  "keepout_boxes": [],
+  "training": {
+    "task": "so101_pick_place",
+    "observation_space": ["observation.state"],
+    "action_space": "action"
+  }
+}

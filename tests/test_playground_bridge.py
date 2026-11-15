@@ -12,6 +12,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import json
+import math
 import socket
 import urllib.error
 import urllib.parse
@@ -33,6 +34,7 @@ from rebot_companion.deploy_profile import (
 )
 from rebot_companion.onnx_policy import (
     scaffold_closed_loop_demo_policy,
+    scaffold_pcb_visual_servo_policy,
     validate_policy_dir,
 )
 from rebot_companion.scenes.bundle_export import (
@@ -81,6 +83,28 @@ def test_builtin_tool_packs_materialized():
     assert driver_m.motor_to_joint_scale == 1.0
     assert len(driver_m.io) == 1
 
+    # Physics realism verification: wide_cup_gripper silicone pads vs cup waxed surface
+    cup_gripper_path = resolve_builtin_path("tool", "wide_cup_gripper")
+    assert cup_gripper_path is not None
+    tool_xml = (cup_gripper_path / "tool.xml").read_text(encoding="utf-8")
+    assert 'priority="2"' in tool_xml
+    assert 'friction="2.4 0.04 0.004"' in tool_xml
+
+    coffee_kiosk_path = resolve_builtin_path("scene", "coffee_kiosk")
+    assert coffee_kiosk_path is not None
+    world_xml = (coffee_kiosk_path / "world.xml").read_text(encoding="utf-8")
+    assert 'priority="1"' in world_xml
+    assert 'friction="0.10 0.002 0.0002"' in world_xml
+
+    # Camera verification in pcb_suction
+    pcb_suction_path = resolve_builtin_path("scene", "pcb_suction")
+    assert pcb_suction_path is not None
+    suction_world = (pcb_suction_path / "world.xml").read_text(encoding="utf-8")
+    assert 'camera name="policy_cam"' in suction_world
+    suction_scene = validate_scene_dir(pcb_suction_path)
+    assert suction_scene.camera_extrinsics.get("name") == "policy_cam"
+    assert suction_scene.camera_extrinsics.get("pos") == [0.23, -0.14, 0.34]
+
 
 def test_builtin_scene_pcb_inspection():
     scene_path = resolve_builtin_path("scene", "pcb_inspection")
@@ -110,11 +134,28 @@ def test_builtin_scene_pcb_inspection():
     stage_ids = [s["id"] for s in m.task_stages]
     assert stage_ids == ["pcb_picked", "fixture_tested", "pcb_sorted"]
 
+    # Test screw_fastening builtin scene
+    screw_path = resolve_builtin_path("scene", "screw_fastening")
+    assert screw_path is not None and screw_path.is_dir()
+    screw_m = validate_scene_dir(screw_path)
+    assert screw_m.id == "screw_fastening"
+    assert screw_m.default_tool == "screwdriver"
+    assert "b601dm" in screw_m.robots
+
+    # Test lab_desktop builtin scene
+    lab_path = resolve_builtin_path("scene", "lab_desktop")
+    assert lab_path is not None and lab_path.is_dir()
+    lab_m = validate_scene_dir(lab_path)
+    assert lab_m.id == "lab_desktop"
+    assert "so-arm101" in lab_m.robots
+    assert lab_m.default_tool == "default"
+
     # Registry
     reg = load_registry()
-    scene_entry = next((s for s in reg.get("scenes", []) if s.get("id") == "pcb_inspection"), None)
-    assert scene_entry is not None
-    assert scene_entry["default_tool"] == "suction"
+    scene_ids = [s.get("id") for s in reg.get("scenes", [])]
+    assert "pcb_inspection" in scene_ids
+    assert "screw_fastening" in scene_ids
+    assert "lab_desktop" in scene_ids
 
     packs = list_builtin_packs()
     assert any(s["id"] == "pcb_inspection" for s in packs["scenes"])
@@ -245,6 +286,89 @@ def test_export_static_bundle_invariants(tmp_path: Path):
     assert "infeed_tray" in data["mjcf_xml"]
     assert "test_fixture" in data["mjcf_xml"]
 
+    # Base XML and scene world XML embedding
+    assert "base_xml" in data and "<mujoco" in data["base_xml"]
+    assert "scene_world_xml" in data and "infeed_tray" in data["scene_world_xml"]
+
+    # Runtime hot-swappable tool packs embedding
+    assert "tool_packs" in data
+    assert "default" in data["tool_packs"]
+    assert data["tool_packs"]["default"] == {"tool_preset": "default"}
+    assert "suction" in data["tool_packs"]
+    assert "screwdriver" in data["tool_packs"]
+    assert "wide_cup_gripper" in data["tool_packs"]
+    assert "tool_manifest" in data["tool_packs"]["suction"]
+    assert "tool_xml" in data["tool_packs"]["suction"]
+
+    # Test SO-ARM101 static bundle export and meshdir rewrite
+    so101_out = tmp_path / "so101_bundle_test"
+    so101_dir = export_static_bundle(
+        out_dir=so101_out,
+        scene_id="lab_desktop",
+        tool_id="default",
+        robot="so-arm101",
+        overwrite=True,
+        allow_fallback=True,
+    )
+    so101_json = json.loads((so101_dir / "bundle.json").read_text(encoding="utf-8"))
+    assert 'meshdir="../../../assets/so101"' not in so101_json["base_xml"]
+    assert 'meshdir="../../../assets/so101"' not in so101_json["mjcf_xml"]
+    assert 'meshdir="so101"' in so101_json["base_xml"] or "<mujoco" in so101_json["base_xml"]
+    assert "mesh_files" in so101_json
+    assert isinstance(so101_json["mesh_files"], list)
+
+
+def test_pcb_visual_servo_spatial_tracking(tmp_path: Path):
+    ort = pytest.importorskip("onnxruntime")
+    policy_dir = tmp_path / "pcb_vs_policy"
+    scaffold_pcb_visual_servo_policy(
+        policy_dir,
+        policy_id="pcb_visual_servo",
+        action_dim=7,
+        robot="b601dm",
+    )
+    manifest = validate_policy_dir(policy_dir)
+    assert manifest.action_space == "cartesian_xy_target"
+    assert manifest.image_y_up is False
+
+    session = ort.InferenceSession(str(policy_dir / "model.onnx"))
+    cam_x, cam_y, cam_z = 0.23, -0.14, 0.34
+    plane_z = 0.011
+    d = cam_z - plane_z
+    fovy_rad = math.radians(45.0)
+    s_half = d * math.tan(fovy_rad / 2.0)
+
+    for test_dx, test_dy in [(-0.03, 0.025), (0.028, -0.025)]:
+        target_x_real = cam_x + test_dx
+        target_y_real = cam_y + test_dy
+
+        center_c = 31.5 + 32.0 * test_dx / s_half
+        center_r = 31.5 - 32.0 * test_dy / s_half
+
+        # Synthetic 64x64 image with green PCB square
+        img = np.full((1, 3, 64, 64), 0.25, dtype=np.float32)
+        r0 = int(round(center_r - 4))
+        r1 = int(round(center_r + 5))
+        c0 = int(round(center_c - 4))
+        c1 = int(round(center_c + 5))
+        img[0, 0, r0:r1, c0:c1] = 0.05  # R
+        img[0, 1, r0:r1, c0:c1] = 0.85  # G
+        img[0, 2, r0:r1, c0:c1] = 0.08  # B
+
+        state = np.zeros((1, 7), dtype=np.float32)
+        res = session.run(["action"], {
+            "observation.images.policy_cam": img,
+            "observation.state": state,
+        })[0]
+        pred_x = float(res[0, 0])
+        pred_y = float(res[0, 1])
+
+        err = math.hypot(pred_x - target_x_real, pred_y - target_y_real)
+        assert err <= 0.003, (
+            f"Prediction ({pred_x}, {pred_y}) error {err*1000:.2f}mm exceeds 3mm "
+            f"for target ({target_x_real}, {target_y_real})"
+        )
+
 
 # ---------------------------------------------------------------------------
 # 4. Deploy Profile & Python 3.8 main.py Generator
@@ -290,6 +414,16 @@ def test_deploy_profile_validation_and_rejections():
     with pytest.raises(ValueError, match="Invalid pose name"):
         validate_deploy_profile(bad_pose)
 
+    # Fallback keepout_boxes from safety.keepout_boxes
+    safety_fallback_raw = json.loads(json.dumps(valid_raw))
+    del safety_fallback_raw["keepout_boxes"]
+    safety_fallback_raw["safety"]["keepout_boxes"] = [
+        {"name": "from_safety", "min_m": [0.1, -0.1, 0.0], "max_m": [0.2, 0.1, 0.1]}
+    ]
+    prof_fallback = validate_deploy_profile(safety_fallback_raw)
+    assert len(prof_fallback.keepout_boxes) == 1
+    assert prof_fallback.keepout_boxes[0]["name"] == "from_safety"
+
 
 def test_render_main_py_python38_ast():
     prof = DeployProfile(
@@ -317,6 +451,30 @@ def test_render_main_py_python38_ast():
     assert '"linear_speed_mps": 0.04' in code
     assert "set_tool_io" in code
     assert "arm.wait_until_clear()" in code
+    assert "arm.safety()" in code
+    assert "physical_estop" in code
+    assert "arm.recover()" not in code
+    assert "except Exception: pass" not in code
+
+    # SO-101 profile check for auto_yaw and physical estop warning
+    prof_so101 = DeployProfile(
+        format=DEPLOY_PROFILE_FORMAT,
+        robot="so-arm101",
+        scene_id="lab_desktop",
+        tool_id="default",
+        poses={"ready": [0.0] * 6},
+        keepout_boxes=[],
+        motion={"speed_scale": 0.3},
+        safety={},
+        program={"cycles": 1},
+    )
+    code_so101 = render_main_py(prof_so101)
+    assert '"is_so101": True' in code_so101
+    assert "arm.safety()" in code_so101
+    assert "auto_yaw=True" in code_so101
+    assert "arm.recover()" not in code_so101
+    assert "except Exception: pass" not in code_so101
+    ast.parse(code_so101, filename="main.py", mode="exec", feature_version=(3, 8))
 
 
 def test_apply_deploy_profile_dry_run(tmp_path: Path):
@@ -389,6 +547,64 @@ def test_apply_deploy_profile_live_apply(armd, tmp_path: Path):
     assert "pose_a" in armd.poses
     assert "pose_b" in armd.poses
     assert len(armd.keepout) == 2
+    assert res["diff"]["collision_guard_requested"] is True
+    assert res["diff"]["collision_sensitivity"] == "high"
+    assert armd.collision_cfg["enabled"] is False
+    assert any("Collision guard requested" in w for w in res["warnings"])
+
+
+def test_apply_deploy_profile_keepout_preservation_and_collision_guard(armd, tmp_path: Path):
+    armd.devplat = True
+    # Seed device with an existing keepout box
+    armd.keepout = [{"name": "existing_safe_zone", "min_m": [0.0, 0.0, 0.0], "max_m": [0.5, 0.5, 0.5]}]
+    assert len(armd.keepout) == 1
+
+    profile_path = tmp_path / "preserve_profile.json"
+    data = {
+        "format": DEPLOY_PROFILE_FORMAT,
+        "robot": "b601dm",
+        "scene_id": "pcb_inspection",
+        "tool_id": "suction",
+        "poses": {"scan": [0.0] * 7},
+        "keepout_boxes": [],  # Empty keepout in profile
+        "motion": {"speed_scale": 0.2},
+        "safety": {"collision_guard_enabled": True, "collision_sensitivity": "high"},
+    }
+    profile_path.write_text(json.dumps(data), encoding="utf-8")
+
+    # 1. Apply without clear_keepout (default clear_keepout=False, apply_collision_guard=False)
+    res = apply_deploy_profile(
+        profile_path,
+        client=armd.client,
+        apply_changes=True,
+    )
+    assert res["applied"] is True
+    # Existing keepout box was preserved!
+    assert len(armd.keepout) == 1
+    assert armd.keepout[0]["name"] == "existing_safe_zone"
+    # Collision guard was NOT silently mutated
+    assert armd.collision_cfg["enabled"] is False
+    # Warnings surfaced to operator
+    assert any("keep-out boxes preserved" in w for w in res["warnings"])
+    assert any("Collision guard requested" in w for w in res["warnings"])
+    # Diff recorded requested settings
+    assert res["diff"]["collision_guard_requested"] is True
+    assert res["diff"]["collision_sensitivity"] == "high"
+
+    # 2. Apply with explicit clear_keepout=True and apply_collision_guard=True
+    res2 = apply_deploy_profile(
+        profile_path,
+        client=armd.client,
+        apply_changes=True,
+        clear_keepout=True,
+        apply_collision_guard=True,
+    )
+    assert res2["applied"] is True
+    # Keepout is now cleared as explicitly requested
+    assert len(armd.keepout) == 0
+    # Collision guard was explicitly configured
+    assert armd.collision_cfg["enabled"] is True
+    assert armd.collision_cfg["sensitivity"] == "high"
 
 
 def test_cli_export_bundle_and_apply_profile(tmp_path: Path):
@@ -573,3 +789,431 @@ async def test_playground_proxy_websocket_relay():
     armd_ws.close()
     await armd_ws.wait_closed()
     assert len(ws_received) == 1
+
+
+@pytest.mark.asyncio
+async def test_playground_proxy_cross_origin_rejected_http():
+    fake_armd_port = get_free_port()
+    received_requests: list[dict[str, Any]] = []
+
+    async def armd_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        line = await reader.readline()
+        method, path, _ = line.decode("latin1").strip().split(" ", 2)
+        received_requests.append({"method": method, "path": path})
+        writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+        await writer.drain()
+        writer.close()
+
+    armd_server = await asyncio.start_server(armd_handler, "127.0.0.1", fake_armd_port)
+    proxy = PlaygroundProxyServer(
+        static_dir="/tmp",
+        armd_url=f"http://127.0.0.1:{fake_armd_port}",
+        port=0,
+    )
+    async with proxy:
+        proxy_port = proxy.port
+
+        # 1. Cross-origin POST -> 403 Forbidden without reaching upstream
+        def post_cross_origin() -> tuple[int, bytes]:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{proxy_port}/api/v1/action/move_to",
+                data=b'{"test": 1}',
+                headers={"Content-Type": "application/json", "Origin": "http://evil.example"},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=3.0) as resp:
+                    return resp.status, resp.read()
+            except urllib.error.HTTPError as err:
+                return err.code, err.read()
+
+        status, body = await asyncio.to_thread(post_cross_origin)
+        assert status == 403
+        assert b"Cross-origin proxy requests are not allowed" in body
+        assert len(received_requests) == 0  # Upstream TCP was never opened
+
+        # 2. CLI tool without Origin header (e.g. curl) -> allowed
+        def post_cli_no_origin() -> tuple[int, bytes]:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{proxy_port}/api/v1/action/move_to",
+                data=b'{"test": 2}',
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=3.0) as resp:
+                return resp.status, resp.read()
+
+        status2, _ = await asyncio.to_thread(post_cli_no_origin)
+        assert status2 == 200
+        assert len(received_requests) == 1
+
+    armd_server.close()
+    await armd_server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_playground_proxy_ws_path_and_origin_security():
+    fake_armd_port = get_free_port()
+    ws_received: list[str] = []
+
+    async def ws_handler(websocket: websockets.asyncio.server.ServerConnection):
+        async for msg in websocket:
+            ws_received.append(str(msg))
+            await websocket.send(f"echo:{msg}")
+
+    armd_ws = await ws_serve(ws_handler, "127.0.0.1", fake_armd_port)
+    proxy = PlaygroundProxyServer(
+        static_dir="/tmp",
+        armd_url=f"http://127.0.0.1:{fake_armd_port}",
+        port=0,
+    )
+    async with proxy:
+        proxy_port = proxy.port
+
+        # 1. Disallowed WS path -> 404
+        with pytest.raises(websockets.exceptions.InvalidStatus) as exc_404:
+            async with websockets.asyncio.client.connect(
+                f"ws://127.0.0.1:{proxy_port}/other/ws",
+                origin=f"http://127.0.0.1:{proxy_port}",
+            ):
+                pass
+        assert exc_404.value.response.status_code == 404
+
+        # 2. Cross-origin WS upgrade -> 403
+        with pytest.raises(websockets.exceptions.InvalidStatus) as exc_403:
+            async with websockets.asyncio.client.connect(
+                f"ws://127.0.0.1:{proxy_port}/api/v1/ws",
+                origin="http://evil.example",
+            ):
+                pass
+        assert exc_403.value.response.status_code == 403
+
+        # 3. Allowed same-origin paths -> all succeed
+        for path in ("/api/v1/ws", "/api/v1/detection/ws", "/results"):
+            async with websockets.asyncio.client.connect(
+                f"ws://127.0.0.1:{proxy_port}{path}",
+                origin=f"http://127.0.0.1:{proxy_port}",
+            ) as ws:
+                await ws.send(f"ping:{path}")
+                reply = await ws.recv()
+                assert reply == f"echo:ping:{path}"
+
+    armd_ws.close()
+    await armd_ws.wait_closed()
+
+
+class _MockArm:
+    def __init__(self):
+        self.moves: list[tuple[Any, ...]] = []
+        self.poses: list[tuple[str, Any]] = []
+        self.gripper_state: str | None = None
+        self.feed_calls: int = 0
+        self.holding: bool = True
+
+    def feed(self) -> None:
+        self.feed_calls += 1
+
+    def move_to(self, xyz: Any, speed: Any = None, auto_yaw: Any = None) -> None:
+        self.moves.append((xyz, speed, auto_yaw))
+
+    def move_to_pose(self, name: str, speed_scale: Any = None) -> None:
+        self.poses.append((name, speed_scale))
+
+    def gripper_open(self) -> None:
+        self.gripper_state = "open"
+
+    def gripper_close(self) -> Any:
+        self.gripper_state = "closed"
+        from dataclasses import dataclass
+
+        @dataclass
+        class _Res:
+            holding: bool = self.holding
+
+        return _Res()
+
+    def wait_until_clear(self, timeout_s: float = 10.0) -> None:
+        pass
+
+    def detect(self, min_score: float = 0.4) -> list[Any]:
+        return []
+
+
+def test_apply_deploy_profile_preflight_failures(armd, tmp_path: Path, monkeypatch):
+    from rebot.client import ArmSession
+
+    armd.devplat = True
+    profile_path = tmp_path / "test_preflight_profile.json"
+    data = {
+        "format": DEPLOY_PROFILE_FORMAT,
+        "robot": "b601dm",
+        "scene_id": "pcb_inspection",
+        "tool_id": "suction",
+        "poses": {"home": [0.0] * 7},
+        "keepout_boxes": [{"name": "box", "min": [0.1, 0.1, 0.0], "max": [0.2, 0.2, 0.1]}],
+    }
+    profile_path.write_text(json.dumps(data), encoding="utf-8")
+
+    set_keepout_calls = 0
+    orig_session_set_keepout = ArmSession.set_keepout
+
+    def tracking_set_keepout(self, *args, **kwargs):
+        nonlocal set_keepout_calls
+        set_keepout_calls += 1
+        return orig_session_set_keepout(self, *args, **kwargs)
+
+    monkeypatch.setattr(ArmSession, "set_keepout", tracking_set_keepout)
+
+    # 1. get_keepout fails
+    def fail_keepout():
+        raise RuntimeError("simulated keepout read failure")
+
+    monkeypatch.setattr(armd.client, "get_keepout", fail_keepout)
+    with pytest.raises(RuntimeError, match=r"Required pre-flight read failed \(keepout\)"):
+        apply_deploy_profile(profile_path, client=armd.client, apply_changes=True)
+    assert set_keepout_calls == 0
+
+    # 2. get_poses fails
+    monkeypatch.setattr(armd.client, "get_keepout", lambda: {"boxes": []})
+
+    def fail_poses():
+        raise RuntimeError("simulated poses read failure")
+
+    monkeypatch.setattr(armd.client, "get_poses", fail_poses)
+    with pytest.raises(RuntimeError, match=r"Required pre-flight read failed \(poses\)"):
+        apply_deploy_profile(profile_path, client=armd.client, apply_changes=True)
+    assert set_keepout_calls == 0
+
+    # 3. get_safety_describe fails
+    monkeypatch.setattr(armd.client, "get_poses", lambda: [])
+
+    def fail_safety():
+        raise RuntimeError("simulated safety read failure")
+
+    monkeypatch.setattr(armd.client, "get_safety_describe", fail_safety)
+    with pytest.raises(RuntimeError, match=r"Required pre-flight read failed \(safety_describe\)"):
+        apply_deploy_profile(profile_path, client=armd.client, apply_changes=True)
+    assert set_keepout_calls == 0
+
+    # 4. get_collision_guard fails when apply_collision_guard=True
+    monkeypatch.setattr(armd.client, "get_safety_describe", lambda: {"hardware": {"physical_estop": True}})
+
+    def fail_col():
+        raise RuntimeError("simulated collision read failure")
+
+    monkeypatch.setattr(armd.client, "get_collision_guard", fail_col)
+    with pytest.raises(RuntimeError, match=r"Required pre-flight read failed \(collision_guard\)"):
+        apply_deploy_profile(profile_path, client=armd.client, apply_changes=True, apply_collision_guard=True)
+    assert set_keepout_calls == 0
+
+
+def test_apply_deploy_profile_dry_run_keepout_failure_preserves(armd, tmp_path: Path, monkeypatch):
+    armd.devplat = True
+    profile_path = tmp_path / "test_dry_run_keepout_fail.json"
+    data = {
+        "format": DEPLOY_PROFILE_FORMAT,
+        "robot": "b601dm",
+        "scene_id": "pcb_inspection",
+        "tool_id": "suction",
+        "poses": {"home": [0.0] * 7},
+        "keepout_boxes": [],  # Profile specifies none
+    }
+    profile_path.write_text(json.dumps(data), encoding="utf-8")
+
+    def fail_keepout():
+        raise RuntimeError("simulated keepout network timeout")
+
+    monkeypatch.setattr(armd.client, "get_keepout", fail_keepout)
+
+    res = apply_deploy_profile(profile_path, client=armd.client, apply_changes=False, clear_keepout=False)
+    assert res["applied"] is False
+    assert res["dry_run"] is True
+    assert any("Could not read device keepout boxes" in w for w in res["warnings"])
+    assert any("preserving device state" in w for w in res["warnings"])
+
+
+def test_apply_deploy_profile_mid_mutation_rollback(armd, tmp_path: Path, monkeypatch):
+    from rebot.client import ArmSession
+
+    armd.devplat = True
+    armd.keepout = [{"name": "prior_box", "min_m": [0.0, 0.0, 0.0], "max_m": [0.1, 0.1, 0.1]}]
+    armd.poses = {"pose_prior": {"name": "pose_prior", "positions": [0.1] * 7}}
+
+    profile_path = tmp_path / "test_rollback_profile.json"
+    data = {
+        "format": DEPLOY_PROFILE_FORMAT,
+        "robot": "b601dm",
+        "scene_id": "pcb_inspection",
+        "tool_id": "suction",
+        "poses": {
+            "pose_prior": [0.5] * 7,
+            "pose_new": [0.9] * 7,
+        },
+        "keepout_boxes": [{"name": "new_box", "min_m": [0.2, 0.2, 0.0], "max_m": [0.3, 0.3, 0.1]}],
+    }
+    profile_path.write_text(json.dumps(data), encoding="utf-8")
+
+    orig_save_pose = ArmSession.save_pose
+
+    def failing_save_pose(self, name, positions=None):
+        if name == "pose_new":
+            raise RuntimeError("simulated save_pose failure on pose_new")
+        return orig_save_pose(self, name, positions)
+
+    monkeypatch.setattr(ArmSession, "save_pose", failing_save_pose)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        apply_deploy_profile(profile_path, client=armd.client, apply_changes=True)
+
+    err_msg = str(exc_info.value)
+    assert "Failed applying deploy profile mid-mutation" in err_msg
+    assert "rollback=" in err_msg
+    assert "backup=" in err_msg
+
+    # Verify rollback in armd: keepout restored, pose_prior restored, pose_new absent
+    assert len(armd.keepout) == 1
+    assert armd.keepout[0]["name"] == "prior_box"
+    assert armd.poses["pose_prior"]["positions"] == [0.1] * 7
+    assert "pose_new" not in armd.poses
+
+
+def test_render_main_py_scene_parity_and_execution(monkeypatch):
+    # 1. Coffee scene
+    prof_coffee = DeployProfile(
+        format=DEPLOY_PROFILE_FORMAT,
+        robot="b601dm",
+        scene_id="level1_coffee",
+        tool_id="default",
+        poses={"scan": [0.0] * 7, "home": [0.0] * 7},
+        keepout_boxes=[],
+    )
+    code_coffee = render_main_py(prof_coffee)
+    ast.parse(code_coffee, filename="main.py", mode="exec", feature_version=(3, 8))
+    assert "brew_button_pressed" in code_coffee
+    assert "drip tray" in code_coffee
+    assert "counter" in code_coffee.lower()
+
+    # Runtime exec of coffee cycle
+    monkeypatch.setenv("REBOT_ALLOW_DRY_IO", "1")
+    ns_coffee: dict[str, Any] = {}
+    exec(compile(code_coffee, "main.py", "exec"), ns_coffee)
+    mock_arm_coffee = _MockArm()
+    assert ns_coffee["run_single_cycle"](mock_arm_coffee) is True
+    assert ("scan", 0.3) in mock_arm_coffee.poses
+
+    # 2. Screwdriver scene
+    prof_screw = DeployProfile(
+        format=DEPLOY_PROFILE_FORMAT,
+        robot="b601dm",
+        scene_id="template_screwdriver",
+        tool_id="screwdriver",
+        poses={"scan": [0.0] * 7, "home": [0.0] * 7},
+        keepout_boxes=[],
+    )
+    code_screw = render_main_py(prof_screw)
+    ast.parse(code_screw, filename="main.py", mode="exec", feature_version=(3, 8))
+    assert "spindle_rpm" in code_screw
+    ns_screw: dict[str, Any] = {}
+    exec(compile(code_screw, "main.py", "exec"), ns_screw)
+    mock_arm_screw = _MockArm()
+    assert ns_screw["run_single_cycle"](mock_arm_screw) is True
+
+    # 3. SO-ARM101 cube pick scene
+    prof_so = DeployProfile(
+        format=DEPLOY_PROFILE_FORMAT,
+        robot="so-arm101",
+        scene_id="template_so101_pick",
+        tool_id="default",
+        poses={"scan": [0.0] * 6, "home": [0.0] * 6},
+        keepout_boxes=[],
+    )
+    code_so = render_main_py(prof_so)
+    ast.parse(code_so, filename="main.py", mode="exec", feature_version=(3, 8))
+    assert "auto_yaw=True" in code_so
+    ns_so: dict[str, Any] = {}
+    exec(compile(code_so, "main.py", "exec"), ns_so)
+    mock_arm_so = _MockArm()
+    assert ns_so["run_single_cycle"](mock_arm_so) is True
+
+    # 4. Inspection scene: test error handling and NG sorting logic
+    prof_insp = DeployProfile(
+        format=DEPLOY_PROFILE_FORMAT,
+        robot="b601dm",
+        scene_id="level4_inspection",
+        tool_id="suction",
+        poses={"scan": [0.0] * 7, "home": [0.0] * 7},
+        keepout_boxes=[],
+        program={"ng_sorting": False, "dwell_s": 0.01, "via_point_z": 0.12},
+    )
+    code_insp = render_main_py(prof_insp)
+    ast.parse(code_insp, filename="main.py", mode="exec", feature_version=(3, 8))
+    assert '"via_point_z": 0.12' in code_insp
+
+    ns_insp: dict[str, Any] = {}
+    exec(compile(code_insp, "main.py", "exec"), ns_insp)
+
+    # 4a. set_tool_io rejects without REBOT_SIM_IO_URL or REBOT_ALLOW_DRY_IO
+    monkeypatch.delenv("REBOT_ALLOW_DRY_IO", raising=False)
+    monkeypatch.delenv("REBOT_SIM_IO_URL", raising=False)
+    monkeypatch.delenv("REBOT_FIXTURE_RESULT", raising=False)
+    with pytest.raises(RuntimeError, match="Tool requires digital I/O"):
+        ns_insp["set_tool_io"]("vacuum", True)
+
+    # 4b. get_sim_io raises if REBOT_SIM_IO_URL missing
+    with pytest.raises(RuntimeError, match="REBOT_SIM_IO_URL is not configured"):
+        ns_insp["get_sim_io"]()
+
+    # 4c. Missing REBOT_FIXTURE_RESULT raises RuntimeError
+    monkeypatch.setenv("REBOT_ALLOW_DRY_IO", "1")
+    mock_arm_insp = _MockArm()
+    with pytest.raises(RuntimeError, match="Inspection fixture result missing"):
+        ns_insp["run_single_cycle"](mock_arm_insp)
+
+    # 4d. Unknown REBOT_FIXTURE_RESULT raises RuntimeError
+    monkeypatch.setenv("REBOT_FIXTURE_RESULT", "UNKNOWN")
+    with pytest.raises(RuntimeError, match="Unknown REBOT_FIXTURE_RESULT"):
+        ns_insp["run_single_cycle"](mock_arm_insp)
+
+    # 4e. Defective board with ng_sorting=False raises ActionFailed("INVALID_COMMAND")
+    from rebot import ActionFailed
+
+    monkeypatch.setenv("REBOT_FIXTURE_RESULT", "NG")
+    with pytest.raises(ActionFailed) as exc_af:
+        ns_insp["run_single_cycle"](mock_arm_insp)
+    assert exc_af.value.code == "INVALID_COMMAND"
+
+    # 4f. PASS board succeeds and routes to PASS bin (0.26, 0.14, 0.030)
+    monkeypatch.setenv("REBOT_FIXTURE_RESULT", "PASS")
+    mock_arm_pass = _MockArm()
+    assert ns_insp["run_single_cycle"](mock_arm_pass) is True
+    assert any(m[0] == (0.26, 0.14, 0.030) for m in mock_arm_pass.moves)
+
+    # 4g. Defective board with ng_sorting=True routes to NG bin (0.16, 0.14, 0.030)
+    prof_insp_ng = DeployProfile(
+        format=DEPLOY_PROFILE_FORMAT,
+        robot="b601dm",
+        scene_id="level4_inspection",
+        tool_id="suction",
+        poses={"scan": [0.0] * 7, "home": [0.0] * 7},
+        keepout_boxes=[],
+        program={"ng_sorting": True, "dwell_s": 0.01},
+    )
+    code_insp_ng = render_main_py(prof_insp_ng)
+    ns_insp_ng: dict[str, Any] = {}
+    exec(compile(code_insp_ng, "main.py", "exec"), ns_insp_ng)
+    monkeypatch.setenv("REBOT_FIXTURE_RESULT", "NG")
+    mock_arm_ng = _MockArm()
+    assert ns_insp_ng["run_single_cycle"](mock_arm_ng) is True
+    assert any(m[0] == (0.16, 0.14, 0.030) for m in mock_arm_ng.moves)
+
+    # 5. Custom cell fallback with empty poses raises
+    prof_empty = DeployProfile(
+        format=DEPLOY_PROFILE_FORMAT,
+        robot="b601dm",
+        scene_id="custom_cell",
+        tool_id="default",
+        poses={},
+        keepout_boxes=[],
+    )
+    with pytest.raises(RuntimeError, match="Deploy profile contains no poses"):
+        render_main_py(prof_empty)

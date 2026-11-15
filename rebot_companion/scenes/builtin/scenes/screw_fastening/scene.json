@@ -1,0 +1,104 @@
+{
+  "id": "screw_fastening",
+  "name": "Aluminum Assembly & Screw Fastening Cell",
+  "version": "1.0.0",
+  "description": "2-point automated M3 screw fastening workflow with electric screwdriver: align bit with M3 screw targets on aluminum assembly carrier and fasten with torque feedback.",
+  "world_xml": "world.xml",
+  "robots": ["b601dm"],
+  "default_tool": "screwdriver",
+  "recommended_tools": ["screwdriver", "default"],
+  "objects": [
+    {
+      "name": "screw1",
+      "body": "screw1",
+      "geom": "screw1_head",
+      "class_name": "screw",
+      "default_pos": [0.23, -0.025, 0.019],
+      "jitter_xy": 0.002
+    },
+    {
+      "name": "screw2",
+      "body": "screw2",
+      "geom": "screw2_head",
+      "class_name": "screw",
+      "default_pos": [0.27, 0.025, 0.019],
+      "jitter_xy": 0.002
+    }
+  ],
+  "zones": {
+    "carrier_fixture": {
+      "center": [0.25, 0.0, 0.025],
+      "half_extents": [0.065, 0.055, 0.025]
+    },
+    "screw_target_1": {
+      "center": [0.23, -0.025, 0.022],
+      "half_extents": [0.015, 0.015, 0.015]
+    },
+    "screw_target_2": {
+      "center": [0.27, 0.025, 0.022],
+      "half_extents": [0.015, 0.015, 0.015]
+    }
+  },
+  "io": [
+    {
+      "name": "spindle_run",
+      "kind": "bool",
+      "direction": "output",
+      "default": false,
+      "description": "Electric screwdriver spindle motor run command"
+    },
+    {
+      "name": "torque_reached",
+      "kind": "bool",
+      "direction": "input",
+      "default": false,
+      "description": "Target torque reached indicator signal from clutch sensor"
+    }
+  ],
+  "task_stages": [
+    {
+      "id": "approach_screw1",
+      "type": "custom",
+      "description": "Approach screw target 1 with screwdriver bit oriented vertically",
+      "latch": true
+    },
+    {
+      "id": "fasten_screw1",
+      "type": "custom",
+      "description": "Engage spindle, press screw head and drive until torque reached",
+      "latch": true
+    },
+    {
+      "id": "approach_screw2",
+      "type": "custom",
+      "description": "Retract and approach screw target 2",
+      "latch": true
+    },
+    {
+      "id": "fasten_screw2",
+      "type": "custom",
+      "description": "Drive screw 2 to full torque depth",
+      "latch": true
+    }
+  ],
+  "poses": {
+    "ready": [0.0, -0.35, 0.65, 0.0, 0.85, 0.0, 0.0],
+    "above_screw1": [0.12, -0.22, 0.55, 0.0, 0.92, 0.0, 0.0],
+    "fasten_screw1": [0.12, -0.15, 0.48, 0.0, 0.92, 0.0, 0.0],
+    "above_screw2": [0.02, -0.28, 0.58, 0.0, 0.92, 0.0, 0.0],
+    "fasten_screw2": [0.02, -0.21, 0.51, 0.0, 0.92, 0.0, 0.0],
+    "park": [0.0, -1.2, 1.4, 0.0, 0.0, 0.0, 0.0]
+  },
+  "keepout_boxes": [
+    {
+      "name": "rear_guard_keepout",
+      "min_m": [0.32, -0.07, 0.0],
+      "max_m": [0.34, 0.07, 0.08]
+    }
+  ],
+  "training": {
+    "task": "screw_fastening",
+    "observation_space": ["observation.state", "observation.images.policy_cam"],
+    "action_space": "action"
+  }
+}
