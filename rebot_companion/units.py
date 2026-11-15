@@ -468,6 +468,11 @@ def load_lerobot_norm_bounds(
                     "%s: homing_applied_in_hw=True means EEPROM homing_offset cannot be cross-verified against homing_offset_steps",
                     name,
                 )
+            else:
+                log.warning(
+                    "%s: homing_offset in calibration JSON cannot be cross-verified against schema homing_offset_steps",
+                    name,
+                )
 
         if "zero_step" in entry or "center" in entry:
             raw_c = entry["zero_step"] if "zero_step" in entry else entry["center"]
@@ -556,6 +561,10 @@ def load_lerobot_norm_bounds(
         elif g_homing_applied:
             log.warning(
                 "gripper: homing_applied_in_hw=True means EEPROM homing_offset cannot be cross-verified against homing_offset_steps"
+            )
+        else:
+            log.warning(
+                "gripper: homing_offset in calibration JSON cannot be cross-verified against schema homing_offset_steps"
             )
 
     if "zero_step" in grip_entry or "center" in grip_entry:

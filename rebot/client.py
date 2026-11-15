@@ -53,8 +53,6 @@ from typing import Any, Callable, Iterable, Optional, Sequence
 
 from . import _http, _ws
 from ._log import _log
-
-log = _log
 from .errors import (
     ActionFailed,
     ArmCommandRejected,
@@ -69,6 +67,8 @@ from .errors import (
     UnloadFailed,
     UnsupportedError,
 )
+
+log = _log
 
 SERVO_MAX_STEP = 0.35  # rad; armd drops frames jumping further from its commanded position
 SERVO_MIN_RATE_HZ = 10.0  # armd motion_frame_timeout is 200 ms
@@ -749,8 +749,14 @@ def _json_dict(response: Any) -> dict:
 def _vec(v: Sequence[float] | None, n: int, name: str) -> list[float]:
     if v is None:
         raise ValueError(f"{name} cannot be None; needs {n} values")
+    try:
+        items = list(v)
+    except TypeError as exc:
+        raise ValueError(f"{name} must be an iterable, got {type(v).__name__}") from exc
     out = []
-    for idx, x in enumerate(v):
+    for idx, x in enumerate(items):
+        if isinstance(x, bool):
+            raise ValueError(f"{name}[{idx}] must be numeric, got bool: {x!r}")
         try:
             xf = float(x)
         except (ValueError, TypeError) as exc:
@@ -1250,7 +1256,7 @@ class ArmSession:
                 self._pending[(kind, key)] = p
             try:
                 self._send(message)
-            except Exception:
+            except BaseException:
                 with self._state:
                     self._pending.pop((kind, key), None)
                 raise

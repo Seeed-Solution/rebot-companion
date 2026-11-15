@@ -976,6 +976,8 @@ class LeaderTeleopBridge:
         self._last_obs_frames: int | None = None
         self._last_obs_time: float = time.monotonic()
         self._transient_disjoint_counts = [0] * 6
+        self._recovery_streak_ok = [0] * 6
+        self._last_disjoint_ts = [0.0] * 6
 
     def _check_follower_healthy(self, obs: Any, *, require_torqued: bool = True) -> None:
         if obs is None:
@@ -1160,7 +1162,15 @@ class LeaderTeleopBridge:
         j_max: float | None = None,
         joint_index: int = 0,
     ) -> float:
-        """Clamp joint target using _clamp_lead_and_step with bounded transient droop recovery."""
+        """Clamp joint target using _clamp_lead_and_step with bounded transient droop recovery.
+
+        If lead and step intervals are disjoint due to transient follower droop, tracking lag,
+        or telemetry perturbation, this allows up to 5 bounded recovery steps toward the follower
+        lead window provided the discontinuity gap is within safe_jump_cap. Each recovery command
+        is strictly bounded by max_step (abs(out - prev_val) <= max_step) and joint limits [j_min, j_max].
+        Alternating or repeated disjoint events fail closed if 5 recovery steps are exhausted without
+        at least 10 consecutive healthy frames and 1.0s elapsed.
+        """
         try:
             clamped = _clamp_lead_and_step(
                 val,
@@ -1173,9 +1183,21 @@ class LeaderTeleopBridge:
                 joint_index=joint_index,
             )
             if 0 <= joint_index < len(self._transient_disjoint_counts):
-                self._transient_disjoint_counts[joint_index] = 0
+                if self._transient_disjoint_counts[joint_index] > 0:
+                    self._recovery_streak_ok[joint_index] += 1
+                    if (
+                        self._recovery_streak_ok[joint_index] >= 10
+                        and (time.monotonic() - self._last_disjoint_ts[joint_index]) >= 1.0
+                    ):
+                        self._transient_disjoint_counts[joint_index] = 0
+                        self._recovery_streak_ok[joint_index] = 0
             return clamped
         except _DisjointLeadError:
+            if not (0 <= joint_index < len(self._transient_disjoint_counts)):
+                raise
+
+            self._recovery_streak_ok[joint_index] = 0
+
             lead_lo = float(ref_val) - float(max_lead)
             lead_hi = float(ref_val) + float(max_lead)
             if j_min is not None:
@@ -1184,44 +1206,51 @@ class LeaderTeleopBridge:
                 lead_hi = min(lead_hi, float(j_max))
             if lead_lo > lead_hi + 1e-9:
                 raise
+            if lead_lo > lead_hi:
+                lead_lo = lead_hi = 0.5 * (lead_lo + lead_hi)
 
             lead_nearest = min(max(float(prev_val), lead_lo), lead_hi)
             gap_step = abs(lead_nearest - float(prev_val))
-            safe_jump_cap = min(0.25, max(3.0 * float(max_step), 0.06))
+            safe_jump_cap = min(0.15, max(5.0 * float(max_step), 0.05))
 
-            cur_count = (
-                self._transient_disjoint_counts[joint_index]
-                if 0 <= joint_index < len(self._transient_disjoint_counts)
-                else 0
+            cur_count = self._transient_disjoint_counts[joint_index]
+            if gap_step > safe_jump_cap or cur_count >= 5:
+                raise
+
+            step_j_lo = float(prev_val) - float(max_step)
+            step_j_hi = float(prev_val) + float(max_step)
+            if j_min is not None:
+                step_j_lo = max(step_j_lo, float(j_min))
+            if j_max is not None:
+                step_j_hi = min(step_j_hi, float(j_max))
+            if step_j_lo > step_j_hi + 1e-9:
+                raise
+            if step_j_lo > step_j_hi:
+                step_j_lo = step_j_hi = 0.5 * (step_j_lo + step_j_hi)
+
+            out = min(max(lead_nearest, step_j_lo), step_j_hi)
+
+            self._transient_disjoint_counts[joint_index] += 1
+            self._last_disjoint_ts[joint_index] = time.monotonic()
+
+            log.warning(
+                "leader teleop: joint %d transient disjoint interval (gap=%.4f <= %.4f, count=%d/5); "
+                "clamping step to follower lead window (out=%.4f)",
+                joint_index + 1,
+                gap_step,
+                safe_jump_cap,
+                self._transient_disjoint_counts[joint_index],
+                out,
             )
-            if gap_step <= safe_jump_cap and cur_count < 5:
-                if 0 <= joint_index < len(self._transient_disjoint_counts):
-                    self._transient_disjoint_counts[joint_index] += 1
-                cur_count_display = (
-                    self._transient_disjoint_counts[joint_index]
-                    if 0 <= joint_index < len(self._transient_disjoint_counts)
-                    else 1
-                )
-                log.warning(
-                    "leader teleop: joint %d transient disjoint interval (gap=%.4f <= %.4f, count=%d/5); clamping to lead window",
-                    joint_index + 1,
-                    gap_step,
-                    safe_jump_cap,
-                    cur_count_display,
-                )
-                eff_lo = max(lead_lo, float(prev_val) - safe_jump_cap)
-                eff_hi = min(lead_hi, float(prev_val) + safe_jump_cap)
-                if eff_lo > eff_hi:
-                    return 0.5 * (eff_lo + eff_hi)
-                return min(max(float(val), eff_lo), eff_hi)
-
-            raise
+            return float(out)
 
     def align_and_ramp(self) -> None:
         """Verify alignment against the follower arm and perform a smooth quintic ramp-in."""
         if self._stop:
             return
         self._transient_disjoint_counts = [0] * 6
+        self._recovery_streak_ok = [0] * 6
+        self._last_disjoint_ts = [0.0] * 6
 
         if self.schema.dof != 6 or self.schema.arm_dof not in (5, None) or self.schema.gripper_joint != 5:
             raise LeaderError(
@@ -1433,6 +1462,8 @@ class LeaderTeleopBridge:
         self._error = None
         self._parked = False
         self._transient_disjoint_counts = [0] * 6
+        self._recovery_streak_ok = [0] * 6
+        self._last_disjoint_ts = [0.0] * 6
         self.bus.disable_torque(self.calib.servo_ids)
         try:
             try:
