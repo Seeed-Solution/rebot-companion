@@ -3023,13 +3023,19 @@ def test_leader_teleop_settle_phase_stop_before_servo():
 
     # Count ramp servo frames
     with patch("time.sleep", return_value=None):
+        zero_ticks = {sid: 2048 for sid in range(1, 7)}
         settle_ticks = {sid: int(2048 + 0.5 * 4096 / (2 * math.pi)) for sid in range(1, 7)}
         ramp_frames = []
+        settle_entered = False
 
         def read_and_track(sids):
-            # When settle phase reads leader position, stop the bridge
-            if len(ramp_frames) >= 10:  # ramp has completed 10 frames
-                bridge.stop()
+            nonlocal settle_entered
+            if len(ramp_frames) < 10:
+                return zero_ticks
+            if not settle_entered:
+                settle_entered = True
+                return settle_ticks
+            bridge.stop()
             return settle_ticks
 
         bus.read_positions_sync.side_effect = read_and_track
@@ -3038,6 +3044,7 @@ def test_leader_teleop_settle_phase_stop_before_servo():
         bridge.align_and_ramp()
 
     # The settle loop should have broken immediately after bridge.stop() before sending any settle servo frame
+    assert settle_entered is True
     assert bridge._stop is True
     # Exactly the 10 ramp frames were sent; zero settle frames were sent!
     assert len(ramp_frames) == 10
@@ -4094,3 +4101,236 @@ def test_clamp_lead_and_step_disjoint_diagnostic_message():
     msg = str(exc_info.value)
     assert "disjoint lead and step intervals" in msg
     assert "pushed/blocked" in msg
+
+
+def test_onnx_policy_unit_mode_omitted_so_arm_vs_7dof(tmp_path: Path):
+    from rebot_companion.onnx_policy import scaffold_onnx_policy
+    from rebot_companion.policy_runner import OnnxPolicy
+    from rebot_companion.units import resolve_unit_mode
+
+    pol_dir = scaffold_onnx_policy(tmp_path / "onnx_no_unit", policy_id="no_unit", action_dim=6)
+    p_json = pol_dir / "policy.json"
+    data = json.loads(p_json.read_text(encoding="utf-8"))
+    data.pop("unit_mode", None)  # omit unit_mode
+    p_json.write_text(json.dumps(data), encoding="utf-8")
+
+    pol = OnnxPolicy(pol_dir)
+    assert pol.unit_mode is None
+    assert "unit_mode" not in pol.info
+
+    # On SO-ARM (require_metadata=True), resolve_unit_mode with "auto" must raise ValueError
+    with pytest.raises(ValueError, match="cannot infer unit mode 'auto' without explicit 'unit_mode' in metadata"):
+        resolve_unit_mode("auto", pol.info, require_metadata=True)
+
+    # On 7-DOF (require_metadata=False), resolve_unit_mode with "auto" defaults to "rad"
+    mode_7dof = resolve_unit_mode("auto", pol.info, require_metadata=False)
+    assert mode_7dof == "rad"
+
+
+def test_policy_runner_rejects_lerobot_calib_with_deg(tmp_path: Path):
+    from rebot_companion.policy_runner import PolicyRunner, RunnerError
+
+    mock_client = MagicMock()
+    mock_policy = MagicMock()
+    mock_policy.fps = 10
+    mock_policy.image_key = None
+    mock_policy.name = "mock_policy"
+    mock_policy.info = {"unit_mode": "rad"}
+
+    calib_file = tmp_path / "calib.json"
+    calib_file.write_text("{}", encoding="utf-8")
+
+    # Explicit action_units="deg" with lerobot_calib raises RunnerError
+    with pytest.raises(RunnerError, match="incompatible with 'deg' unit mode"):
+        PolicyRunner(mock_client, mock_policy, lerobot_calib=calib_file, action_units="deg")
+
+    # Explicit state_units="deg" with lerobot_calib raises RunnerError
+    with pytest.raises(RunnerError, match="incompatible with 'deg' unit mode"):
+        PolicyRunner(mock_client, mock_policy, lerobot_calib=calib_file, state_units="deg")
+
+    # Policy metadata unit_mode="deg" with action_units="auto" and lerobot_calib raises RunnerError
+    mock_policy_deg = MagicMock()
+    mock_policy_deg.fps = 10
+    mock_policy_deg.image_key = None
+    mock_policy_deg.name = "deg_policy"
+    mock_policy_deg.info = {"unit_mode": "deg"}
+    with pytest.raises(RunnerError, match="incompatible with 'deg' unit mode"):
+        PolicyRunner(mock_client, mock_policy_deg, lerobot_calib=calib_file, action_units="auto")
+
+
+def test_policy_runner_warns_on_unit_mode_metadata_mismatch(caplog):
+    import logging
+    from rebot_companion.policy_runner import PolicyRunner
+
+    mock_client = MagicMock()
+    mock_policy = MagicMock()
+    mock_policy.fps = 10
+    mock_policy.image_key = None
+    mock_policy.name = "mock_policy"
+    mock_policy.info = {"unit_mode": "rad"}
+
+    with caplog.at_level(logging.WARNING):
+        PolicyRunner(mock_client, mock_policy, action_units="deg", state_units="so101_norm")
+    assert "differs from policy metadata unit_mode" in caplog.text
+
+
+def test_leader_teleop_ref_validation_short_and_nan():
+    from rebot_companion.leader_teleop import _validate_telemetry_ref, LeaderError
+
+    # Length < 6 raises LeaderError
+    with pytest.raises(LeaderError, match="must have length 6"):
+        _validate_telemetry_ref([0.0] * 5)
+
+    # Length > 6 raises LeaderError
+    with pytest.raises(LeaderError, match="must have length 6"):
+        _validate_telemetry_ref([0.0] * 7)
+
+    # NaN in ref raises LeaderError
+    with pytest.raises(LeaderError, match="must be finite"):
+        _validate_telemetry_ref([0.0, 0.0, float("nan"), 0.0, 0.0, 0.0])
+
+    # Inf in ref raises LeaderError
+    with pytest.raises(LeaderError, match="must be finite"):
+        _validate_telemetry_ref([0.0, 0.0, float("inf"), 0.0, 0.0, 0.0])
+
+    # Valid 6-element list passes
+    valid = _validate_telemetry_ref([0.1, 0.2, 0.3, 0.4, 0.5, 0.6])
+    assert len(valid) == 6
+
+
+def test_clamp_lead_and_step_non_finite_rejection():
+    from rebot_companion.leader_teleop import _clamp_lead_and_step, LeaderTeleopError
+
+    with pytest.raises(LeaderTeleopError, match="must be finite"):
+        _clamp_lead_and_step(float("nan"), 0.0, 0.0, 0.1, 0.1)
+
+    with pytest.raises(LeaderTeleopError, match="must be finite"):
+        _clamp_lead_and_step(0.0, float("inf"), 0.0, 0.1, 0.1)
+
+    with pytest.raises(LeaderTeleopError, match="must be finite"):
+        _clamp_lead_and_step(0.0, 0.0, float("nan"), 0.1, 0.1)
+
+
+def test_leader_teleop_gripper_clamp_across_phases():
+    from rebot_companion.leader_teleop import LeaderTeleopBridge
+
+    bus = MagicMock()
+    session = MagicMock()
+    schema = ObservationSchema.from_dict({
+        "dof": 6, "arm_dof": 5, "gripper_joint": 5,
+        "gripper_policy": {"closed_rad": 0.0, "open_rad": 1.5},
+        "limits": [{"name": f"j{i}", "min_position": -3.0, "max_position": 3.0, "max_velocity": 1.0, "max_acceleration": 1.0} for i in range(5)]
+        + [{"name": "gripper", "min_position": 0.0, "max_position": 1.5, "max_velocity": 1.0, "max_acceleration": 1.0}],
+    })
+    bridge = LeaderTeleopBridge(bus, session, schema, fps=50, follower="mock")
+
+    # _clamp_gripper_step_and_range clamps large jumps to max_gripper_step = max(0.30, 0.25 * 1.5) = 0.375
+    clamped = bridge._clamp_gripper_step_and_range(1.5, prev_val=0.0)
+    assert clamped == pytest.approx(0.375, abs=1e-3)
+
+    # Clamping against upper limit (1.5)
+    clamped_max = bridge._clamp_gripper_step_and_range(2.0, prev_val=1.4)
+    assert clamped_max == pytest.approx(1.5, abs=1e-3)
+
+
+def test_client_finite_float_validation_and_null_handling():
+    from rebot.client import _vec, _put_speed, TcpPose, GripperStatus, ArmSession, UnsupportedError
+
+    # 1. _vec rejects NaN, Inf, and wrong length
+    with pytest.raises(ValueError, match="must be finite"):
+        _vec([1.0, float("nan"), 3.0], 3, "test_vec")
+    with pytest.raises(ValueError, match="needs 3 values"):
+        _vec([1.0, 2.0], 3, "test_vec")
+
+    # 2. _put_speed rejects <= 0 or non-finite speed
+    body = {}
+    with pytest.raises(ValueError, match="must be positive"):
+        _put_speed(body, linear=0.0, angular=1.0)
+    with pytest.raises(ValueError, match="must be positive"):
+        _put_speed(body, linear=-0.5, angular=1.0)
+    with pytest.raises(ValueError, match="must be finite"):
+        _put_speed(body, linear=float("inf"), angular=1.0)
+
+    # 3. TcpPose.from_dict tolerates None/null in lists
+    pose = TcpPose.from_dict({"xyz_m": [None, 0.2, 0.3], "rpy_rad": [None, 0.1, 0.2]})
+    assert pose.xyz_m == [0.2, 0.3]
+    assert pose.rpy_rad == [0.1, 0.2]
+
+    # 4. GripperStatus.from_dict tolerates None/null fields
+    grip = GripperStatus.from_dict({"joint": None, "rad": None, "fraction": None, "opening_m": None})
+    assert grip.joint == 0
+    assert grip.rad == 0.0
+    assert grip.fraction == 0.0
+    assert grip.opening_m is None
+
+    # 5. ArmSession.servo rejects empty, NaN, and Inf
+    mock_client = MagicMock()
+    s = ArmSession(mock_client)
+    with pytest.raises(ValueError, match="cannot be empty"):
+        s.servo([])
+    with pytest.raises(ValueError, match="must be finite"):
+        s.servo([0.0, float("nan"), 0.0, 0.0, 0.0, 0.0])
+
+    # 6. ArmSession.move_pose with _schema=None: auto_yaw=True raises UnsupportedError, auto_yaw=False strips auto_yaw
+    s._action = MagicMock()
+    s._schema = None
+    mock_client.get_schema.side_effect = ConnectionError("offline")
+    with pytest.raises(UnsupportedError, match="does not advertise auto_yaw capability"):
+        s.move_pose([0.2, 0.0, 0.1], auto_yaw=True)
+
+    s.move_pose([0.2, 0.0, 0.1], auto_yaw=False)
+    sent_body = s._action.call_args[0][1]
+    assert "auto_yaw" not in sent_body
+
+
+def test_lerobot_recorder_add_frame_rejects_nan_in_rad_mode(tmp_path: Path):
+    from rebot_companion.lerobot_recorder import LeRobotRecorder
+
+    rec = LeRobotRecorder(
+        root=tmp_path / "rec_nan",
+        repo_id="test/nan_repo",
+        fps=10,
+        camera_url=None,
+        armd_host=None,
+        unit_mode="rad",
+        with_camera=False,
+    )
+    rec.start_episode(task="test")
+
+    # NaN in state raises ValueError
+    with pytest.raises(ValueError, match="state.*must be finite"):
+        rec.add_frame(state=[0.0, float("nan"), 0.0, 0.0, 0.0, 0.0], action=[0.0] * 6)
+
+    # Inf in action raises ValueError
+    with pytest.raises(ValueError, match="action.*must be finite"):
+        rec.add_frame(state=[0.0] * 6, action=[0.0, 0.0, float("inf"), 0.0, 0.0, 0.0])
+
+    rec.stop_episode()
+
+
+def test_load_lerobot_norm_bounds_homing_offset_mismatch_raises(tmp_path: Path):
+    calib_json = tmp_path / "calib_mismatch.json"
+    calib_data = {
+        "shoulder_pan": {"range_min": 1024, "range_max": 3072, "homing_offset": 200},
+        "shoulder_lift": {"range_min": 1024, "range_max": 3072, "homing_offset": 200},
+        "elbow_flex": {"range_min": 1024, "range_max": 3072, "homing_offset": 200},
+        "wrist_flex": {"range_min": 1024, "range_max": 3072, "homing_offset": 200},
+        "wrist_roll": {"range_min": 1024, "range_max": 3072, "homing_offset": 200},
+        "gripper": {"range_min": 1500, "range_max": 2500, "homing_offset": 200},
+    }
+    calib_json.write_text(json.dumps(calib_data), encoding="utf-8")
+
+    # schema has homing_offset_steps=100 (mismatch against JSON's 200) with homing_applied_in_hw=False
+    schema_feetech = ObservationSchema.from_dict({
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "limits": [{"name": f"j{i}", "min_position": -3.0, "max_position": 3.0, "max_velocity": 1.0, "max_acceleration": 1.0} for i in range(6)],
+        "feetech_joints": [
+            {"zero_step": 2048, "homing_applied_in_hw": False, "homing_offset_steps": 100, "drive_mode_invert": False}
+            for _ in range(6)
+        ],
+    })
+
+    with pytest.raises(ValueError, match="homing_offset mismatch"):
+        units.load_lerobot_norm_bounds(calib_json, schema=schema_feetech)

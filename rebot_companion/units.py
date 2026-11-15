@@ -375,7 +375,8 @@ def load_lerobot_norm_bounds(
     - If "zero_step" or "center" is explicitly in the calibration JSON entry, use that center.
     - Else if "homing_offset" is in the calibration JSON entry (standard LeRobot post-EEPROM-homing
       Present_Position), preserve follower feetech_joints[i].zero_step (default 2048) without re-adding
-      homing_offset_steps.
+      homing_offset_steps. When homing_applied_in_hw=False, verifies that JSON homing_offset matches
+      follower homing_offset_steps (raises ValueError on mismatch).
     - Else (raw unhomed ticks without homing_offset or center), apply zero_step if homing_applied_in_hw
       else zero_step + homing_offset_steps.
 
@@ -443,9 +444,6 @@ def load_lerobot_norm_bounds(
             if feetech_joints and i < len(feetech_joints) and isinstance(feetech_joints[i], dict)
             else None
         )
-        if "homing_offset" in entry:
-            _finite_float(entry["homing_offset"], f"{name}.homing_offset")
-
         if fj is not None:
             armd_sign = -1.0 if fj.get("drive_mode_invert") else 1.0
             zero_step_fj = _finite_float(fj.get("zero_step", 2048.0), f"{name}.fj.zero_step")
@@ -456,6 +454,15 @@ def load_lerobot_norm_bounds(
             zero_step_fj = 2048.0
             homing_applied = False
             homing_offset_steps = 0.0
+
+        if "homing_offset" in entry:
+            calib_ho = _finite_float(entry["homing_offset"], f"{name}.homing_offset")
+            if fj is not None and not homing_applied and ("homing_offset_steps" in fj or fj.get("homing_offset_steps") is not None):
+                if abs(calib_ho - homing_offset_steps) > 1e-4:
+                    raise ValueError(
+                        f"{name}: homing_offset mismatch between calibration JSON ({calib_ho}) and "
+                        f"armd schema feetech_joints ({homing_offset_steps}) when homing_applied_in_hw=False"
+                    )
 
         if "zero_step" in entry or "center" in entry:
             raw_c = entry["zero_step"] if "zero_step" in entry else entry["center"]
@@ -522,9 +529,6 @@ def load_lerobot_norm_bounds(
         if feetech_joints and len(feetech_joints) > 5 and isinstance(feetech_joints[5], dict)
         else None
     )
-    if "homing_offset" in grip_entry:
-        _finite_float(grip_entry["homing_offset"], "gripper.homing_offset")
-
     if fj_grip is not None:
         g_armd_sign = -1.0 if fj_grip.get("drive_mode_invert") else 1.0
         g_zero_step_fj = _finite_float(fj_grip.get("zero_step", 2048.0), "gripper.fj.zero_step")
@@ -535,6 +539,15 @@ def load_lerobot_norm_bounds(
         g_zero_step_fj = 2048.0
         g_homing_applied = False
         g_homing_offset_steps = 0.0
+
+    if "homing_offset" in grip_entry:
+        g_calib_ho = _finite_float(grip_entry["homing_offset"], "gripper.homing_offset")
+        if fj_grip is not None and not g_homing_applied and ("homing_offset_steps" in fj_grip or fj_grip.get("homing_offset_steps") is not None):
+            if abs(g_calib_ho - g_homing_offset_steps) > 1e-4:
+                raise ValueError(
+                    f"gripper: homing_offset mismatch between calibration JSON ({g_calib_ho}) and "
+                    f"armd schema feetech_joints ({g_homing_offset_steps}) when homing_applied_in_hw=False"
+                )
 
     if "zero_step" in grip_entry or "center" in grip_entry:
         raw_gc = grip_entry.get("zero_step", grip_entry.get("center"))

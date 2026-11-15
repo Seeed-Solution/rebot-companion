@@ -741,6 +741,38 @@ def _clamp_lead_and_step(
     Intersects [prev_val - max_step, prev_val + max_step], [ref_val - max_lead, ref_val + max_lead],
     and [j_min, j_max] if provided. Raises LeaderTeleopError if lead and step intervals are disjoint.
     """
+    for name, v in (
+        ("val", val),
+        ("prev_val", prev_val),
+        ("ref_val", ref_val),
+        ("max_step", max_step),
+        ("max_lead", max_lead),
+    ):
+        try:
+            vf = float(v)
+        except (ValueError, TypeError) as exc:
+            raise LeaderTeleopError(f"{name} must be numeric, got {v!r}") from exc
+        if not math.isfinite(vf):
+            raise LeaderTeleopError(f"{name} must be finite, got {v!r}")
+
+    if j_min is not None:
+        try:
+            jf_min = float(j_min)
+        except (ValueError, TypeError) as exc:
+            raise LeaderTeleopError(f"j_min must be numeric, got {j_min!r}") from exc
+        if not math.isfinite(jf_min):
+            raise LeaderTeleopError(f"j_min must be finite, got {j_min!r}")
+        j_min = jf_min
+
+    if j_max is not None:
+        try:
+            jf_max = float(j_max)
+        except (ValueError, TypeError) as exc:
+            raise LeaderTeleopError(f"j_max must be numeric, got {j_max!r}") from exc
+        if not math.isfinite(jf_max):
+            raise LeaderTeleopError(f"j_max must be finite, got {j_max!r}")
+        j_max = jf_max
+
     lo = max(prev_val - max_step, ref_val - max_lead)
     hi = min(prev_val + max_step, ref_val + max_lead)
     if j_min is not None:
@@ -769,6 +801,22 @@ def _measured_ref(obs: Any) -> list[float]:
     if commanded:
         return list(commanded)
     return []
+
+
+def _validate_telemetry_ref(ref: Any) -> list[float]:
+    """Validate follower reference positions: must be length 6 and all elements finite floats."""
+    if not isinstance(ref, (list, tuple)) or len(ref) != 6:
+        raise LeaderError(f"follower reference positions must have length 6, got {ref!r}")
+    validated: list[float] = []
+    for i, x in enumerate(ref):
+        try:
+            val = float(x)
+        except (ValueError, TypeError) as exc:
+            raise LeaderError(f"follower reference position[{i}] must be numeric, got {x!r}") from exc
+        if not math.isfinite(val):
+            raise LeaderError(f"follower reference position[{i}] must be finite, got {x!r}")
+        validated.append(val)
+    return validated
 
 
 # --------------------------------------------------------------------------- leader bridge
@@ -1031,6 +1079,32 @@ class LeaderTeleopBridge:
             caps.append(0.6)
         return caps
 
+    def _clamp_gripper_step_and_range(self, target_val: float, prev_val: float) -> float:
+        """Clamp gripper target against per-frame max step and follower limits/bounds."""
+        for name, v in (("target_val", target_val), ("prev_val", prev_val)):
+            try:
+                vf = float(v)
+            except (ValueError, TypeError) as exc:
+                raise LeaderTeleopError(f"gripper {name} must be numeric, got {v!r}") from exc
+            if not math.isfinite(vf):
+                raise LeaderTeleopError(f"gripper {name} must be finite, got {v!r}")
+
+        max_gripper_step = max(
+            0.30, 0.25 * abs(self.follower_gripper_open - self.follower_gripper_closed)
+        )
+        follower_limits = getattr(self, "follower_limits", None) or self.limits
+        gj = self.gripper_joint if self.gripper_joint is not None else 5
+        if follower_limits and len(follower_limits) > gj:
+            fl_lo, fl_hi = follower_limits[gj]
+            g_lo, g_hi = (fl_lo, fl_hi) if fl_lo <= fl_hi else (fl_hi, fl_lo)
+        else:
+            g_lo = min(self.follower_gripper_open, self.follower_gripper_closed)
+            g_hi = max(self.follower_gripper_open, self.follower_gripper_closed)
+
+        clamped = min(max(float(target_val), prev_val - max_gripper_step), prev_val + max_gripper_step)
+        clamped = min(max(clamped, g_lo), g_hi)
+        return float(clamped)
+
     def align_and_ramp(self) -> None:
         """Verify alignment against the follower arm and perform a smooth quintic ramp-in."""
         if self._stop:
@@ -1126,7 +1200,7 @@ class LeaderTeleopBridge:
             due = t0 + step * period
             cur_obs = self.session.latest_observation() or obs
             self._check_follower_healthy(cur_obs, require_torqued=True)
-            ref = _measured_ref(cur_obs)
+            ref = _validate_telemetry_ref(_measured_ref(cur_obs))
             s = step / ramp_steps
             # Quintic polynomial: 10s^3 - 15s^4 + 6s^5 (smooth acceleration & deceleration)
             alpha = 10.0 * (s**3) - 15.0 * (s**4) + 6.0 * (s**5)
@@ -1137,6 +1211,8 @@ class LeaderTeleopBridge:
             now = time.monotonic()
             dt = min(max(now - prev_t, 1e-3), 3.0 * period)
             prev_t = now
+            if len(ref) < len(interp):
+                raise LeaderError(f"follower reference length ({len(ref)}) < command length ({len(interp)})")
             for j in range(min(len(interp), len(ref))):
                 if j != self.gripper_joint and j < 5:
                     max_step = v_cap * dt
@@ -1151,6 +1227,9 @@ class LeaderTeleopBridge:
                         j_max=j_max,
                         joint_index=j,
                     )
+            gj = self.gripper_joint if self.gripper_joint is not None else 5
+            if gj is not None and gj < len(interp) and gj < len(prev_cmd):
+                interp[gj] = self._clamp_gripper_step_and_range(interp[gj], prev_cmd[gj])
             prev_cmd = list(interp)
             self.session.servo(interp)
             self._last_servo_cmd = list(interp)
@@ -1189,7 +1268,7 @@ class LeaderTeleopBridge:
                     cur_obs = self.session.latest_observation() or obs
                     self._check_follower_healthy(cur_obs, require_torqued=True)
                     cur_follower = cur_obs.positions
-                    ref = _measured_ref(cur_obs)
+                    ref = _validate_telemetry_ref(_measured_ref(cur_obs))
                     cur_leader = self.read_leader_target()
                     if self._stop:
                         break
@@ -1204,6 +1283,8 @@ class LeaderTeleopBridge:
                     now = time.monotonic()
                     dt = min(max(now - prev_t, 1e-3), 3.0 * period)
                     prev_t = now
+                    if len(ref) < len(settle_cmd):
+                        raise LeaderError(f"follower reference length ({len(ref)}) < command length ({len(settle_cmd)})")
                     for j in range(min(len(settle_cmd), len(ref))):
                         if j != self.gripper_joint and j < 5:
                             max_step = v_cap * dt
@@ -1218,6 +1299,9 @@ class LeaderTeleopBridge:
                                 j_max=j_max,
                                 joint_index=j,
                             )
+                    gj = self.gripper_joint if self.gripper_joint is not None else 5
+                    if gj is not None and gj < len(settle_cmd) and gj < len(prev_cmd):
+                        settle_cmd[gj] = self._clamp_gripper_step_and_range(settle_cmd[gj], prev_cmd[gj])
                     prev_cmd = list(settle_cmd)
                     self.session.servo(settle_cmd)
                     self._last_servo_cmd = list(settle_cmd)
@@ -1266,13 +1350,15 @@ class LeaderTeleopBridge:
             try:
                 obs = self.session.latest_observation()
                 self._check_follower_healthy(obs, require_torqued=True)
-                ref = _measured_ref(obs)
+                ref = _validate_telemetry_ref(_measured_ref(obs))
                 target = self.read_leader_target()
                 if self._stop:
                     break
                 clamped_target = list(target)
                 prev = self._last_servo_cmd or list(ref)
                 saturated = False
+                if len(ref) < len(clamped_target):
+                    raise LeaderError(f"follower reference length ({len(ref)}) < target length ({len(clamped_target)})")
                 for j in range(min(len(clamped_target), len(ref))):
                     if j != self.gripper_joint and j < 5:
                         orig_val = clamped_target[j]
@@ -1296,20 +1382,7 @@ class LeaderTeleopBridge:
 
                 gj = self.gripper_joint if self.gripper_joint is not None else 5
                 if gj is not None and gj < len(clamped_target) and gj < len(prev):
-                    max_gripper_step = max(
-                        0.30, 0.25 * abs(self.follower_gripper_open - self.follower_gripper_closed)
-                    )
-                    follower_limits = getattr(self, "follower_limits", None) or self.limits
-                    if follower_limits and len(follower_limits) > gj:
-                        fl_lo, fl_hi = follower_limits[gj]
-                        g_lo, g_hi = (fl_lo, fl_hi) if fl_lo <= fl_hi else (fl_hi, fl_lo)
-                    else:
-                        g_lo = min(self.follower_gripper_open, self.follower_gripper_closed)
-                        g_hi = max(self.follower_gripper_open, self.follower_gripper_closed)
-                    orig_g = clamped_target[gj]
-                    clamped_g = min(max(orig_g, prev[gj] - max_gripper_step), prev[gj] + max_gripper_step)
-                    clamped_g = min(max(clamped_g, g_lo), g_hi)
-                    clamped_target[gj] = clamped_g
+                    clamped_target[gj] = self._clamp_gripper_step_and_range(clamped_target[gj], prev[gj])
 
                 if saturated:
                     self._lead_clamp_consecutive += 1
@@ -1340,6 +1413,12 @@ class LeaderTeleopBridge:
                 self._error = exc
                 raise
             k += 1
+
+        if self._error is not None and self.park_on_exit and self._activated:
+            try:
+                self.session.unload(wait=True, timeout=15.0)
+            except Exception as exc:
+                log.warning("fail-closed park on error failed: %s", exc)
 
     def close(self) -> None:
         """Clean shutdown: park and release lease."""

@@ -39,6 +39,7 @@ import argparse
 import collections
 import json
 import logging
+import math
 import queue
 import shutil
 import sys
@@ -729,6 +730,27 @@ class LeRobotRecorder:
                     self.gripper_joint = 6
         if len(state) != self._dof or len(action) != self._dof:
             raise ValueError(f"state and action need {self._dof} values")
+
+        for vec_name, vec in (("state", state), ("action", action)):
+            for idx, x in enumerate(vec):
+                try:
+                    xf = float(x)
+                except (ValueError, TypeError) as exc:
+                    raise ValueError(f"{vec_name}[{idx}] must be numeric, got {x!r}") from exc
+                if not math.isfinite(xf):
+                    raise ValueError(f"{vec_name}[{idx}] must be finite, got {x!r}")
+
+        for name, values in (("velocity", velocity), ("effort", effort)):
+            if name in ep.extras:
+                if values is None or len(values) != self._dof:
+                    raise ValueError(f"{name} needs {self._dof} values")
+                for idx, x in enumerate(values):
+                    try:
+                        xf = float(x)
+                    except (ValueError, TypeError) as exc:
+                        raise ValueError(f"{name}[{idx}] must be numeric, got {x!r}") from exc
+                    if not math.isfinite(xf):
+                        raise ValueError(f"{name}[{idx}] must be finite, got {x!r}")
 
         if self.unit_mode != "rad":
             if not self.limits or len(self.limits) != len(state):

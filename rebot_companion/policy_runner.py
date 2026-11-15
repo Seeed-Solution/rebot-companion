@@ -391,8 +391,23 @@ class OnnxPolicy(Policy):
         self.source = f"local directory {p.resolve()}"
         self.fps = manifest.fps
         self.action_dim = manifest.action_dim
-        self.unit_mode = manifest.unit_mode
-        self.info = {"unit_mode": manifest.unit_mode, "fps": manifest.fps}
+
+        raw_unit_mode = None
+        policy_json_path = p / "policy.json"
+        if policy_json_path.is_file():
+            try:
+                raw_json = json.loads(policy_json_path.read_text(encoding="utf-8"))
+                if isinstance(raw_json, dict):
+                    raw_unit_mode = raw_json.get("unit_mode")
+            except Exception:
+                raw_unit_mode = None
+
+        if raw_unit_mode is not None:
+            self.unit_mode = manifest.unit_mode
+            self.info = {"unit_mode": manifest.unit_mode, "fps": manifest.fps}
+        else:
+            self.unit_mode = None
+            self.info = {"fps": manifest.fps}
 
         state_spec = manifest.inputs["state"]
         self._state_input_name = str(state_spec["name"])
@@ -960,6 +975,37 @@ class PolicyRunner:
         self.action_units_requested = action_units
         self.state_units_requested = state_units
         self.lerobot_calib = lerobot_calib
+        if self.lerobot_calib is not None:
+            if "deg" in (action_units, state_units):
+                raise RunnerError(
+                    "--lerobot-calib is incompatible with 'deg' unit mode; it calibrates 'so101_norm' [-100, 100] ranges"
+                )
+            p_info = getattr(policy, "info", None)
+            if isinstance(p_info, dict):
+                p_unit = p_info.get("unit_mode") or p_info.get("rebot_unit_mode")
+                if p_unit == "deg" and (action_units == "auto" or state_units == "auto"):
+                    raise RunnerError(
+                        "--lerobot-calib is incompatible with 'deg' unit mode; it calibrates 'so101_norm' [-100, 100] ranges"
+                    )
+
+        p_info = getattr(policy, "info", None)
+        if isinstance(p_info, dict):
+            meta_unit = p_info.get("unit_mode") or p_info.get("rebot_unit_mode")
+            if meta_unit is not None:
+                meta_unit_str = str(meta_unit).strip()
+                if meta_unit_str:
+                    if action_units != "auto" and action_units != meta_unit_str:
+                        log.warning(
+                            "explicit action_units %r differs from policy metadata unit_mode %r",
+                            action_units,
+                            meta_unit_str,
+                        )
+                    if state_units != "auto" and state_units != meta_unit_str:
+                        log.warning(
+                            "explicit state_units %r differs from policy metadata unit_mode %r",
+                            state_units,
+                            meta_unit_str,
+                        )
         self._lerobot_limits: list[tuple[float, float]] | None = None
         self._lerobot_closed_rad: float | None = None
         self._lerobot_open_rad: float | None = None
@@ -1213,6 +1259,29 @@ class PolicyRunner:
             self.state_units = units.resolve_unit_mode(
                 self.state_units_requested, policy_info, require_metadata=require_meta
             )
+
+        if self.lerobot_calib is not None and ("deg" in (self.action_units, self.state_units)):
+            raise RunnerError(
+                "--lerobot-calib is incompatible with 'deg' unit mode; it calibrates 'so101_norm' [-100, 100] ranges"
+            )
+
+        if isinstance(policy_info, dict):
+            meta_unit = policy_info.get("unit_mode") or policy_info.get("rebot_unit_mode")
+            if meta_unit is not None:
+                meta_unit_str = str(meta_unit).strip()
+                if meta_unit_str:
+                    if self.action_units_requested != "auto" and self.action_units_requested != meta_unit_str:
+                        log.warning(
+                            "explicit action_units %r differs from policy metadata unit_mode %r",
+                            self.action_units_requested,
+                            meta_unit_str,
+                        )
+                    if self.state_units_requested != "auto" and self.state_units_requested != meta_unit_str:
+                        log.warning(
+                            "explicit state_units %r differs from policy metadata unit_mode %r",
+                            self.state_units_requested,
+                            meta_unit_str,
+                        )
 
         if (
             any(m in ("so101_norm", "deg") for m in (self.action_units, self.state_units))

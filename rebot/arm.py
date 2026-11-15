@@ -374,16 +374,26 @@ class Arm:
         """
         if auto_yaw is not None and not isinstance(auto_yaw, bool):
             raise ValueError(f"auto_yaw must be bool or None, got {type(auto_yaw).__name__}: {auto_yaw!r}")
-        caps = getattr(getattr(self, "schema", None), "capabilities", None) or {}
-        has_auto_yaw_cap = caps.get("auto_yaw") is True
-        if auto_yaw is True:
-            if not has_auto_yaw_cap:
+        if getattr(self, "schema", None) is None:
+            sess = getattr(self, "session", None)
+            if sess is not None:
+                if getattr(sess, "_schema", None) is not None:
+                    self.schema = sess._schema
+                elif hasattr(sess, "schema") and callable(sess.schema):
+                    try:
+                        self.schema = sess.schema(timeout=1.0)
+                    except Exception:
+                        pass
+        schema_obj = getattr(self, "schema", None) or getattr(getattr(self, "session", None), "_schema", None)
+        caps = getattr(schema_obj, "capabilities", None) or {}
+        has_auto_yaw_cap = bool(isinstance(caps, dict) and caps.get("auto_yaw") is True)
+        if not has_auto_yaw_cap:
+            if auto_yaw is True:
                 raise UnsupportedError(
                     "armd does not advertise auto_yaw capability",
                     code="UNSUPPORTED",
                 )
-        elif auto_yaw is False:
-            if not has_auto_yaw_cap:
+            if auto_yaw is False:
                 auto_yaw = None
         return self._motion(
             lambda: self.session.move_pose(xyz, rpy=rpy, linear_speed=speed, timeout=timeout, auto_yaw=auto_yaw),

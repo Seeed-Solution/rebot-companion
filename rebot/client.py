@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import math
 import os
 import threading
 import time
@@ -123,7 +124,32 @@ ACTION_TERMINAL_STATES = ("done", "failed", "cancelled")
 
 
 def _opt_float(v: Any) -> float | None:
-    return None if v is None else float(v)
+    if v is None:
+        return None
+    try:
+        vf = float(v)
+        return vf if math.isfinite(vf) else None
+    except (ValueError, TypeError):
+        return None
+
+
+def _safe_float(v: Any, default: float = 0.0) -> float:
+    if v is None:
+        return default
+    try:
+        vf = float(v)
+        return vf if math.isfinite(vf) else default
+    except (ValueError, TypeError):
+        return default
+
+
+def _safe_int(v: Any, default: int = 0) -> int:
+    if v is None:
+        return default
+    try:
+        return int(v)
+    except (ValueError, TypeError):
+        return default
 
 
 @dataclass
@@ -237,11 +263,37 @@ class TcpPose:
 
     @classmethod
     def from_dict(cls, d: dict) -> TcpPose:
-        floats = lambda key: [float(x) for x in d.get(key) or []] if d.get(key) is not None else None
+        def _safe_floats(key: str) -> list[float] | None:
+            raw = d.get(key)
+            if raw is None or not isinstance(raw, (list, tuple)):
+                return None
+            res = []
+            for x in raw:
+                if x is not None:
+                    try:
+                        xf = float(x)
+                        if math.isfinite(xf):
+                            res.append(xf)
+                    except (ValueError, TypeError):
+                        pass
+            return res
+
+        raw_xyz = d.get("xyz_m")
+        xyz_list: list[float] = []
+        if isinstance(raw_xyz, (list, tuple)):
+            for x in raw_xyz:
+                if x is not None:
+                    try:
+                        xf = float(x)
+                        if math.isfinite(xf):
+                            xyz_list.append(xf)
+                    except (ValueError, TypeError):
+                        pass
+
         return cls(
-            xyz_m=[float(x) for x in d.get("xyz_m") or []],
-            rpy_rad=floats("rpy_rad"),
-            quat_wxyz=floats("quat_wxyz"),
+            xyz_m=xyz_list,
+            rpy_rad=_safe_floats("rpy_rad"),
+            quat_wxyz=_safe_floats("quat_wxyz"),
         )
 
     def to_dict(self) -> dict:
@@ -274,9 +326,9 @@ class GripperStatus:
     @classmethod
     def from_dict(cls, d: dict) -> GripperStatus:
         return cls(
-            joint=int(d.get("joint", 0)),
-            rad=float(d.get("rad", 0.0)),
-            fraction=float(d.get("fraction", 0.0)),
+            joint=_safe_int(d.get("joint"), 0),
+            rad=_safe_float(d.get("rad"), 0.0),
+            fraction=_safe_float(d.get("fraction"), 0.0),
             opening_m=_opt_float(d.get("opening_m")),
             stalled=bool(d.get("stalled", False)),
         )
@@ -669,14 +721,35 @@ def _json_dict(response: Any) -> dict:
 
 
 def _vec(v: Sequence[float] | None, n: int, name: str) -> list[float]:
-    out = [float(x) for x in (v or [])]
+    if v is None:
+        raise ValueError(f"{name} cannot be None; needs {n} values")
+    out = []
+    for idx, x in enumerate(v):
+        try:
+            xf = float(x)
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f"{name}[{idx}] must be numeric, got {x!r}") from exc
+        if not math.isfinite(xf):
+            raise ValueError(f"{name}[{idx}] must be finite, got {x!r}")
+        out.append(xf)
     if len(out) != n:
-        raise ValueError(f"{name} needs {n} values")
+        raise ValueError(f"{name} needs {n} values, got {len(out)}")
     return out
 
 
 def _put_speed(body: dict, linear: float | None, angular: float | None) -> None:
-    speed = {k: float(v) for k, v in (("linear", linear), ("angular", angular)) if v is not None}
+    speed = {}
+    for k, v in (("linear", linear), ("angular", angular)):
+        if v is not None:
+            try:
+                vf = float(v)
+            except (ValueError, TypeError) as exc:
+                raise ValueError(f"speed {k} must be numeric, got {v!r}") from exc
+            if not math.isfinite(vf):
+                raise ValueError(f"speed {k} must be finite, got {v!r}")
+            if vf <= 0:
+                raise ValueError(f"speed {k} must be positive (> 0), got {vf}")
+            speed[k] = vf
     if speed:
         body["speed"] = speed
 
@@ -1001,9 +1074,17 @@ class ArmSession:
         except ArmConnectionError:
             pass
         if obs is not None:
-            return 6 if len(obs.positions) == 7 else None
+            if len(obs.positions) == 7:
+                return 6
+            if len(obs.positions) == 6:
+                return 5
+            return None
         if pos_len is not None:
-            return 6 if pos_len == 7 else None
+            if pos_len == 7:
+                return 6
+            if pos_len == 6:
+                return 5
+            return None
         return None
 
     @property
@@ -1029,7 +1110,7 @@ class ArmSession:
             raise ArmConnectionError(self._closed_reason or "session is not open")
         try:
             with self._send_lock:
-                ws.send(json.dumps(message))
+                ws.send(json.dumps(message, allow_nan=False))
         except _ws.WebSocketClosed as exc:
             raise ArmConnectionError(f"WebSocket closed: {exc}") from exc
 
@@ -1297,10 +1378,24 @@ class ArmSession:
         acceleration limits. Arrival means armd reports the trajectory finished
         (state left ``Moving``) and measured positions are within ``tolerance``.
         """
-        target = [float(x) for x in target_positions]
+        target = []
+        for idx, x in enumerate(target_positions):
+            try:
+                xf = float(x)
+            except (ValueError, TypeError) as exc:
+                raise ValueError(f"target_positions[{idx}] must be numeric, got {x!r}") from exc
+            if not math.isfinite(xf):
+                raise ValueError(f"target_positions[{idx}] must be finite, got {x!r}")
+            target.append(xf)
         body: dict = {"target_positions": target}
         if duration is not None:
-            body["duration_secs"] = float(duration)
+            try:
+                df = float(duration)
+            except (ValueError, TypeError) as exc:
+                raise ValueError(f"duration must be numeric, got {duration!r}") from exc
+            if not math.isfinite(df) or df <= 0:
+                raise ValueError(f"duration must be positive and finite, got {duration!r}")
+            body["duration_secs"] = df
         frames_at_ack = self._frames_after(lambda: self.command("/api/v1/motion/jog", body))
         if not wait:
             return None
@@ -1310,7 +1405,15 @@ class ArmSession:
 
     def home(self, duration: float | None = None, wait: bool = True, timeout: float | None = None) -> ArmStatus | None:
         """Move to armd's configured home positions."""
-        body = {"duration_secs": float(duration)} if duration is not None else {}
+        body = {}
+        if duration is not None:
+            try:
+                df = float(duration)
+            except (ValueError, TypeError) as exc:
+                raise ValueError(f"duration must be numeric, got {duration!r}") from exc
+            if not math.isfinite(df) or df <= 0:
+                raise ValueError(f"duration must be positive and finite, got {duration!r}")
+            body["duration_secs"] = df
         frames_at_ack = self._frames_after(lambda: self.command("/api/v1/motion/home", body))
         if not wait:
             return None
@@ -1381,13 +1484,24 @@ class ArmSession:
         """
         if auto_yaw is not None and not isinstance(auto_yaw, bool):
             raise ValueError(f"auto_yaw must be bool or None, got {type(auto_yaw).__name__}: {auto_yaw!r}")
-        if getattr(self, "_schema", None) is not None:
-            caps = getattr(self._schema, "capabilities", None) or {}
-            if caps.get("auto_yaw") is not True:
-                if auto_yaw is True:
-                    raise UnsupportedError("armd does not advertise auto_yaw capability", code="UNSUPPORTED")
-                if auto_yaw is False:
-                    auto_yaw = None
+        if getattr(self, "_schema", None) is None:
+            if hasattr(self, "schema") and callable(self.schema):
+                try:
+                    self.schema(timeout=1.0)
+                except Exception:
+                    pass
+            elif hasattr(self, "get_schema") and callable(self.get_schema):
+                try:
+                    self._schema = self.get_schema(timeout=1.0)
+                except Exception:
+                    pass
+        caps = getattr(getattr(self, "_schema", None), "capabilities", None) or {}
+        has_auto_yaw_cap = bool(isinstance(caps, dict) and caps.get("auto_yaw") is True)
+        if not has_auto_yaw_cap:
+            if auto_yaw is True:
+                raise UnsupportedError("armd does not advertise auto_yaw capability", code="UNSUPPORTED")
+            if auto_yaw is False:
+                auto_yaw = None
         if rpy is not None and quat is not None:
             raise ValueError("give rpy or quat, not both")
         body: dict = {"position": _vec(position, 3, "position")}
@@ -1762,7 +1876,23 @@ class ArmSession:
         since the previous call is raised here as :class:`ServoRejected`.
         """
         self._raise_servo_error()
-        target = [float(x) for x in positions]
+        if not positions:
+            raise ValueError("servo positions cannot be empty")
+        target = []
+        for idx, x in enumerate(positions):
+            try:
+                xf = float(x)
+            except (ValueError, TypeError) as exc:
+                raise ValueError(f"servo position[{idx}] must be numeric, got {x!r}") from exc
+            if not math.isfinite(xf):
+                raise ValueError(f"servo position[{idx}] must be finite, got {x!r}")
+            target.append(xf)
+
+        if self._schema is not None and getattr(self._schema, "dof", None) is not None:
+            expected_dof = int(self._schema.dof)
+            if len(target) != expected_dof:
+                raise ValueError(f"servo target length ({len(target)}) does not match schema DOF ({expected_dof})")
+
         now = time.monotonic()
         last = self._last_servo
         if last is not None and now - last[0] <= 0.2:
@@ -1771,11 +1901,14 @@ class ArmSession:
             obs = self.latest_observation()
             ref = obs.positions if obs is not None else None
         gj = self._cached_gripper_joint(len(target))
+        if gj is None and self._schema is None:
+            if len(target) == 6:
+                gj = 5
+            elif len(target) >= 7:
+                gj = 6
         if ref is not None and len(ref) == len(target):
             for i, (t, r) in enumerate(zip(target, ref)):
                 if gj is not None and i == gj:
-                    continue
-                if self._schema is None and gj is None and i == GRIPPER_INDEX and len(target) >= 7:
                     continue
                 if abs(t - r) > SERVO_MAX_STEP:
                     raise ServoJumpError(
