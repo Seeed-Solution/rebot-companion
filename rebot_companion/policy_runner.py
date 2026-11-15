@@ -38,6 +38,8 @@ Policies (``--policy``):
 * ``replay:<dataset root>:<episode>``: the ``action`` column of a recorded episode (pyarrow).
 * ``sine:<joint>:<amp rad>:<period s>``: ``start + amp * sin(2 pi t / period)`` on one joint
   (1..7 or a joint name); ``amp`` <= 0.5 rad.
+* ``onnx:<dir>`` or local directory containing ``policy.json``: an ONNX policy package
+  (``rebot-onnx-policy/v1``) driven by ``onnxruntime``.
 * anything else: a LeRobot pretrained policy directory or Hub repo id (``PreTrainedConfig`` /
   ``PreTrainedPolicy.from_pretrained``, the saved pre/post-processors, ``predict_action``).
   Needs ``torch`` and ``lerobot`` 0.6.1 / 0.7.0 (Python >= 3.12), which are not dependencies of this package;
@@ -73,6 +75,7 @@ from rebot.errors import ArmConnectionError, LeaseError, RebotError, ServoReject
 
 from . import units
 from .lerobot_recorder import EXTRAS, JOINT_NAMES, armd_url
+from .onnx_policy import validate_image_spec, validate_normalization_stats, validate_policy_dir
 
 log = logging.getLogger("rebot_companion.policy_runner")
 
@@ -221,8 +224,10 @@ class SinePolicy(Policy):
             self.joint = int(joint)
             self.target_joint = target_joint if target_joint is not None else (self.joint + 1)
 
-        name_target = str(self.target_joint) if not isinstance(self.target_joint, int) else (
-            JOINT_NAMES[self.joint] if 0 <= self.joint < len(JOINT_NAMES) else str(self.target_joint)
+        name_target = (
+            str(self.target_joint)
+            if not isinstance(self.target_joint, int)
+            else (JOINT_NAMES[self.joint] if 0 <= self.joint < len(JOINT_NAMES) else str(self.target_joint))
         )
         self.name = f"sine:{name_target}:{self.amp:g}:{self.period:g}"
 
@@ -249,9 +254,7 @@ class SinePolicy(Policy):
                 if target in joint_names:
                     self.joint = joint_names.index(target)
                 else:
-                    raise RunnerError(
-                        f"unknown joint name {target!r} in sine policy (schema joints: {joint_names})"
-                    )
+                    raise RunnerError(f"unknown joint name {target!r} in sine policy (schema joints: {joint_names})")
             elif target in JOINT_NAMES:
                 idx = JOINT_NAMES.index(target)
                 if idx >= dof or (gripper_joint is not None and idx == gripper_joint):
@@ -260,9 +263,7 @@ class SinePolicy(Policy):
                     )
                 self.joint = idx
             else:
-                raise RunnerError(
-                    f"unknown joint name {target!r} in sine policy (schema joints: {JOINT_NAMES[:dof]})"
-                )
+                raise RunnerError(f"unknown joint name {target!r} in sine policy (schema joints: {JOINT_NAMES[:dof]})")
             return
 
         # 1-based integer or 0-based joint index
@@ -359,6 +360,178 @@ class LeRobotPolicy(Policy):
             obs, self.policy, self.device, self.pre, self.post, use_amp=False, task=self.task, robot_type=ROBOT_TYPE
         )
         return action.squeeze(0).to("cpu").numpy().astype(np.float64)
+
+
+class OnnxPolicy(Policy):
+    """Unified ``rebot-onnx-policy/v1`` policy executed via ``onnxruntime``."""
+
+    warmup = True
+
+    def __init__(self, path: str | Path) -> None:
+        p = Path(path).expanduser()
+        if p.is_file() and p.name == "policy.json":
+            p = p.parent
+        if not p.is_dir():
+            raise RunnerError(f"ONNX policy directory {path} does not exist")
+
+        try:
+            manifest = validate_policy_dir(p)
+        except FileNotFoundError as exc:
+            raise RunnerError(str(exc)) from exc
+
+        try:
+            import onnxruntime as ort
+        except ImportError as exc:
+            raise RunnerError("ONNX policies require onnxruntime, e.g. uv run --extra onnx rebot-policy ...") from exc
+
+        model_path = p / manifest.model_file
+        self.session = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
+        self.manifest = manifest
+        self.name = f"onnx:{manifest.name}"
+        self.source = f"local directory {p.resolve()}"
+        self.fps = manifest.fps
+        self.action_dim = manifest.action_dim
+        self.unit_mode = manifest.unit_mode
+        self.info = {"unit_mode": manifest.unit_mode, "fps": manifest.fps}
+
+        state_spec = manifest.inputs["state"]
+        self._state_input_name = str(state_spec["name"])
+
+        img_spec = manifest.inputs.get("image")
+        if img_spec is not None:
+            validate_image_spec(img_spec)
+            self._image_input_name = str(img_spec["name"])
+            self._image_layout = str(img_spec.get("layout", "NCHW")).upper()
+            shape = [int(v) for v in img_spec["shape"]]
+            if self._image_layout == "NCHW":
+                self._image_channels = shape[1]
+                h, w = shape[2], shape[3]
+                mean_broadcast = (1, -1, 1, 1)
+            else:
+                self._image_channels = shape[3]
+                h, w = shape[1], shape[2]
+                mean_broadcast = (1, 1, 1, -1)
+            self.image_size = (h, w)
+            self.image_key = (
+                self._image_input_name
+                if self._image_input_name.startswith("observation.images.")
+                else "observation.images.wrist"
+            )
+            self._image_scale = float(img_spec.get("scale", 1.0 / 255.0))
+            mean = img_spec.get("mean")
+            std = img_spec.get("std")
+            self._image_mean = np.asarray(mean, dtype=np.float32).reshape(mean_broadcast) if mean is not None else None
+            self._image_std = np.asarray(std, dtype=np.float32).reshape(mean_broadcast) if std is not None else None
+            self.inputs = (STATE_KEY, self.image_key)
+        else:
+            self._image_input_name = None
+            self._image_channels = 3
+            self.image_key = None
+            self.image_size = None
+            self._image_layout = "NCHW"
+            self._image_scale = 1.0 / 255.0
+            self._image_mean = None
+            self._image_std = None
+            self.inputs = (STATE_KEY,)
+
+        norm = manifest.normalization or {}
+        state_shape = manifest.inputs.get("state", {}).get("shape", [])
+        state_dim = int(state_shape[-1]) if state_shape else manifest.action_dim
+        validate_normalization_stats(norm, state_dim=state_dim, action_dim=manifest.action_dim)
+
+        self._state_mean = (
+            np.asarray(norm["state_mean"], dtype=np.float32).reshape(-1) if norm.get("state_mean") is not None else None
+        )
+        self._state_std = (
+            np.asarray(norm["state_std"], dtype=np.float32).reshape(-1) if norm.get("state_std") is not None else None
+        )
+        self._action_mean = (
+            np.asarray(norm["action_mean"], dtype=np.float32).reshape(-1)
+            if norm.get("action_mean") is not None
+            else None
+        )
+        self._action_std = (
+            np.asarray(norm["action_std"], dtype=np.float32).reshape(-1) if norm.get("action_std") is not None else None
+        )
+
+        self._action_output_name = str(manifest.outputs["action"]["name"])
+        io_spec = manifest.outputs.get("io") or {}
+        self._io_output_name = io_spec.get("name")
+        self._io_channels = list(io_spec.get("channels") or ())
+        self.last_io_updates: dict[str, Any] = {}
+
+    def reset(self) -> None:
+        self.last_io_updates = {}
+
+    def select(self, obs: dict[str, np.ndarray], step: int, t: float) -> np.ndarray | None:
+        raw_state = obs[STATE_KEY] if STATE_KEY in obs else obs[self._state_input_name]
+        state = np.asarray(raw_state, dtype=np.float32).reshape(-1)
+        if self._state_mean is not None and self._state_std is not None:
+            if state.shape != self._state_mean.shape:
+                raise ValueError(
+                    f"Observation state shape {state.shape} does not match "
+                    f"normalization state_mean shape {self._state_mean.shape}"
+                )
+            state = (state - self._state_mean) / self._state_std
+
+        feed: dict[str, np.ndarray] = {self._state_input_name: np.ascontiguousarray(state.reshape(1, -1))}
+        if self._image_input_name is not None and self.image_key is not None:
+            raw_img = obs[self.image_key] if self.image_key in obs else obs[self._image_input_name]
+            arr = np.asarray(raw_img)
+            if arr.ndim == 4 and arr.shape[0] == 1:
+                arr = arr[0]
+            if (
+                arr.ndim == 3
+                and arr.shape[-1] in (1, 3, 4)
+                and self.image_size is not None
+                and arr.shape[:2] != self.image_size
+                and np.issubdtype(arr.dtype, np.integer)
+            ):
+                arr = to_image(arr, self.image_size)
+            scale = self._image_scale if np.issubdtype(arr.dtype, np.integer) else 1.0
+            arr_f = arr.astype(np.float32) * scale
+            if arr_f.ndim == 3 and arr_f.shape[-1] in (1, 3, 4):
+                if self._image_layout == "NCHW":
+                    arr_f = np.transpose(arr_f[..., : self._image_channels], (2, 0, 1))
+                else:
+                    arr_f = arr_f[..., : self._image_channels]
+            elif arr_f.ndim == 3 and arr_f.shape[0] in (1, 3, 4) and self._image_layout == "NHWC":
+                arr_f = np.transpose(arr_f[: self._image_channels, ...], (1, 2, 0))
+            batch = arr_f[np.newaxis, ...]
+            if self._image_mean is not None and self._image_std is not None and batch.ndim == 4:
+                batch = (batch - self._image_mean) / self._image_std
+            feed[self._image_input_name] = np.ascontiguousarray(batch, dtype=np.float32)
+
+        output_names = [self._action_output_name]
+        if self._io_output_name:
+            output_names.append(str(self._io_output_name))
+        outs = self.session.run(output_names, feed)
+
+        action = np.asarray(outs[0], dtype=np.float32).reshape(-1)
+        if self._action_mean is not None and self._action_std is not None:
+            if action.shape != self._action_mean.shape:
+                raise ValueError(
+                    f"Action output shape {action.shape} does not match "
+                    f"normalization action_mean shape {self._action_mean.shape}"
+                )
+            action = action * self._action_std + self._action_mean
+
+        if self._io_output_name and len(outs) > 1:
+            io_vals = np.asarray(outs[1], dtype=np.float32).reshape(-1)
+            updates: dict[str, Any] = {}
+            for idx, ch in enumerate(self._io_channels):
+                if idx >= io_vals.shape[0]:
+                    break
+                val = float(io_vals[idx])
+                if isinstance(ch, dict):
+                    ch_name = str(ch.get("name", ""))
+                    if ch_name:
+                        updates[ch_name] = bool(val > 0.5) if ch.get("kind") == "bool" else val
+                elif isinstance(ch, str) and ch:
+                    updates[ch] = bool(val > 0.5) if ch == "vacuum" else val
+            self.last_io_updates = updates
+
+        return action.astype(np.float64)
 
 
 def _fps_field(container: Any, where: str) -> int | None:
@@ -552,8 +725,8 @@ _PREFIX = re.compile(r"[A-Za-z][\w.+-]*:")
 
 
 def parse_policy(spec: str, device: str | None = None, task: str = "") -> Policy:
-    """``replay:<root>:<episode>``, ``sine:<joint>:<amp>:<period>`` (optional ``scripted:`` prefix), or a
-    LeRobot pretrained path / repo id."""
+    """``replay:<root>:<episode>``, ``sine:<joint>:<amp>:<period>`` (optional ``scripted:`` prefix),
+    ``onnx:<dir>``, a local directory containing ``policy.json``, or a LeRobot pretrained path / repo id."""
     s = spec[len("scripted:") :] if spec.startswith("scripted:") else spec
     if s.startswith("replay:"):
         root, sep, ep = s[len("replay:") :].rpartition(":")
@@ -568,12 +741,20 @@ def parse_policy(spec: str, device: str | None = None, task: str = "") -> Policy
         amp = float(parts[1]) if len(parts) > 1 else 0.05
         period = float(parts[2]) if len(parts) > 2 else 4.0
         return SinePolicy(j, amp, period)
+    if s.startswith("onnx:") and not spec.startswith("scripted:"):
+        return OnnxPolicy(s[len("onnx:") :])
     if spec.startswith("scripted:"):
         raise ValueError(f"unknown scripted policy {spec!r}: replay:<root>:<episode> or sine:<joint>:<amp>:<period>")
+    local = Path(spec).expanduser()
+    if local.is_dir() and (local / "policy.json").is_file():
+        if not (local / "config.json").is_file() and not (local / "pretrained_model").is_dir():
+            return OnnxPolicy(local)
+    elif local.is_file() and local.name == "policy.json":
+        return OnnxPolicy(local)
     # a Hub repo id ("org/name") has no colon: "<word>:..." is a mistyped prefix unless it is a local directory
-    if _PREFIX.match(spec) and not Path(spec).expanduser().is_dir():
+    if _PREFIX.match(spec) and not local.is_dir():
         raise ValueError(
-            f"unknown policy prefix in {spec!r}: use replay:<root>:<episode>, sine:<joint>:<amp>:<period>, "
+            f"unknown policy prefix in {spec!r}: use onnx:<dir>, replay:<root>:<episode>, sine:<joint>:<amp>:<period>, "
             "a LeRobot pretrained directory or a Hub repo id"
         )
     return LeRobotPolicy(spec, device=device, task=task)
@@ -744,6 +925,7 @@ class PolicyRunner:
         action_units: str = "auto",
         state_units: str = "auto",
         lerobot_calib: str | Path | None = None,
+        io_sender: Any = None,
     ) -> None:
         if fps is None and policy.fps is None:
             raise ValueError(f"fps of {policy.name} is unknown ({policy.fps_problem or 'not given'}): pass --fps")
@@ -832,6 +1014,23 @@ class PolicyRunner:
         self._log_file = None
         self._last_seq: Any = None
         self._streaming = False
+        self.io_sender = io_sender
+        self._last_io_sent: dict[str, Any] = {}
+        self._sandbox_io_checked: bool = False
+        self._sandbox_io_enabled: bool = bool(io_sender is not None)
+        base_url = getattr(client, "base_url", None)
+        if isinstance(base_url, str) and base_url:
+            from urllib.parse import urlparse
+
+            parsed = urlparse(base_url)
+            self.host = parsed.hostname or "127.0.0.1"
+            self.port = parsed.port or 8765
+        else:
+            raw_host = getattr(client, "host", None)
+            raw_port = getattr(client, "port", None)
+            self.host = raw_host if isinstance(raw_host, str) else "127.0.0.1"
+            self.port = raw_port if isinstance(raw_port, int) else 8765
+
         self._torque_sent = False  # torque-on was sent: the arm may be armed, so cleanup stops and parks
         self._stopping = False  # stop/cleanup in progress: handle_signal ignores further signals
 
@@ -943,9 +1142,7 @@ class PolicyRunner:
 
         if self.lerobot_calib is not None:
             if not (
-                self.dof == 6
-                and self.gripper_joint == 5
-                and (self.schema is None or self.schema.arm_dof in (None, 5))
+                self.dof == 6 and self.gripper_joint == 5 and (self.schema is None or self.schema.arm_dof in (None, 5))
             ):
                 raise RunnerError(
                     f"--lerobot-calib requires a 6-DOF arm with gripper_joint=5 (got dof={self.dof}, "
@@ -989,7 +1186,7 @@ class PolicyRunner:
             or schema.arm_dof == 5
             or (self.dof == 6 and self.gripper_joint is not None)
         )
-        is_learned_or_replay = isinstance(self.policy, (LeRobotPolicy, ReplayPolicy))
+        is_learned_or_replay = isinstance(self.policy, (LeRobotPolicy, ReplayPolicy, OnnxPolicy))
         require_meta = is_learned_or_replay and is_so_arm
 
         policy_info = getattr(self.policy, "info", None)
@@ -1026,23 +1223,32 @@ class PolicyRunner:
                 rec_lims = norm_b.get("limits")
                 if rec_lims is not None:
                     if not isinstance(rec_lims, (list, tuple)) or len(rec_lims) != self.dof:
+                        lims_len = len(rec_lims) if isinstance(rec_lims, (list, tuple)) else "invalid"
                         raise RunnerError(
-                            f"normalization_bounds limits length ({len(rec_lims) if isinstance(rec_lims, (list, tuple)) else 'invalid'}) "
-                            f"does not match arm DOF ({self.dof})"
+                            f"normalization_bounds limits length ({lims_len}) does not match arm DOF ({self.dof})"
                         )
                     parsed_lims = []
                     for i, lim in enumerate(rec_lims):
                         if not isinstance(lim, (list, tuple)) or len(lim) != 2:
-                            raise RunnerError(f"normalization_bounds limits[{i}] must be sequence of length 2, got {lim!r}")
+                            raise RunnerError(
+                                f"normalization_bounds limits[{i}] must be sequence of length 2, got {lim!r}"
+                            )
                         try:
                             lo = float(lim[0])
                             hi = float(lim[1])
                         except (ValueError, TypeError) as exc:
-                            raise RunnerError(f"normalization_bounds limits[{i}] values must be floats, got {lim!r}: {exc}") from exc
+                            raise RunnerError(
+                                f"normalization_bounds limits[{i}] values must be floats, got {lim!r}: {exc}"
+                            ) from exc
                         if not (math.isfinite(lo) and math.isfinite(hi)):
-                            raise RunnerError(f"normalization_bounds limits[{i}] values must be finite floats, got ({lo}, {hi})")
+                            raise RunnerError(
+                                f"normalization_bounds limits[{i}] values must be finite floats, got ({lo}, {hi})"
+                            )
                         if abs(hi - lo) <= 1e-6:
-                            raise RunnerError(f"normalization_bounds limits[{i}] range must satisfy abs(hi - lo) > 1e-6, got ({lo}, {hi})")
+                            raise RunnerError(
+                                f"normalization_bounds limits[{i}] range must satisfy "
+                                f"abs(hi - lo) > 1e-6, got ({lo}, {hi})"
+                            )
                         parsed_lims.append((lo, hi))
                     self._recorded_limits = parsed_lims
 
@@ -1069,12 +1275,11 @@ class PolicyRunner:
                 if self._recorded_closed_rad is not None and self._recorded_open_rad is not None:
                     if abs(self._recorded_open_rad - self._recorded_closed_rad) <= 1e-6:
                         raise RunnerError(
-                            f"normalization_bounds open_rad ({self._recorded_open_rad}) and closed_rad ({self._recorded_closed_rad}) "
-                            f"must satisfy abs(open_rad - closed_rad) > 1e-6"
+                            f"normalization_bounds open_rad ({self._recorded_open_rad}) and "
+                            f"closed_rad ({self._recorded_closed_rad}) must satisfy abs(open_rad - closed_rad) > 1e-6"
                         )
-            elif (
-                (self.action_units == "so101_norm" or self.state_units == "so101_norm")
-                and not (isinstance(policy_info, dict) and policy_info.get("rebot_unit_mode"))
+            elif (self.action_units == "so101_norm" or self.state_units == "so101_norm") and not (
+                isinstance(policy_info, dict) and policy_info.get("rebot_unit_mode")
             ):
                 log.warning(
                     "so101_norm is active without --lerobot-calib and without 'rebot_unit_mode' in metadata; "
@@ -1230,6 +1435,166 @@ class PolicyRunner:
             self._segment = _Segment(self._last_sent.copy(), target, now, 1.0 / self.fps)
             self._last_target_t = now
 
+    def _policy_has_io(self) -> bool:
+        if getattr(self.policy, "io", None):
+            return True
+        manifest = getattr(self.policy, "manifest", None)
+        if manifest and hasattr(manifest, "outputs") and isinstance(manifest.outputs, dict):
+            if manifest.outputs.get("io"):
+                return True
+        if getattr(self.policy, "_io_output_name", None) or getattr(self.policy, "_io_channels", None):
+            return True
+        if getattr(self.policy, "last_io_updates", None) is not None or hasattr(self.policy, "io_sequence"):
+            return True
+        return False
+
+    def _check_sandbox_io(self) -> None:
+        """Check armd sandbox mode and decide whether to enable sandbox IO forwarding."""
+        if self._sandbox_io_checked:
+            return
+        self._sandbox_io_checked = True
+
+        if self.io_sender is not None:
+            self._sandbox_io_enabled = True
+            return
+
+        if not self._policy_has_io():
+            self._sandbox_io_enabled = False
+            return
+
+        mode = None
+        try:
+            if hasattr(self.client, "request"):
+                res = self.client.request("GET", "/api/v1/sandbox/state")
+                status = getattr(res, "status_code", getattr(res, "status", 200))
+                if isinstance(status, int) and status >= 400:
+                    raise RuntimeError(f"HTTP {status}")
+                if hasattr(res, "raise_for_status") and callable(res.raise_for_status):
+                    res.raise_for_status()
+                if hasattr(res, "json") and callable(res.json):
+                    data = res.json()
+                elif hasattr(res, "text") and isinstance(res.text, str):
+                    import json
+
+                    data = json.loads(res.text) if res.text else {}
+                else:
+                    data = {}
+                mode = data.get("mode") if isinstance(data, dict) else None
+            else:
+                import json
+                import urllib.error
+                import urllib.request
+
+                url = f"http://{self.host}:{self.port}/api/v1/sandbox/state"
+                req = urllib.request.Request(
+                    url,
+                    headers={"Accept": "application/json"},
+                    method="GET",
+                )
+                with urllib.request.urlopen(req, timeout=5.0) as resp:
+                    raw = resp.read().decode("utf-8")
+                    data = json.loads(raw) if raw else {}
+                    mode = data.get("mode") if isinstance(data, dict) else None
+        except Exception as exc:
+            log.warning(
+                "Sandbox IO forwarding disabled: /api/v1/sandbox/state unavailable (%s). "
+                "Running on real hardware or unconfigured sandbox.",
+                exc,
+            )
+            self._sandbox_io_enabled = False
+            return
+
+        if mode in {"sim", "wasm"}:
+            self._sandbox_io_enabled = True
+            log.info("Sandbox IO forwarding enabled (armd sandbox mode: %s).", mode)
+        else:
+            self._sandbox_io_enabled = False
+            log.warning(
+                "Sandbox IO forwarding disabled: armd sandbox mode is %r (requires 'sim' or 'wasm').",
+                mode,
+            )
+
+    def _reset_io_channels(self) -> None:
+        """Best-effort reset of previously sent boolean IO channels back to False."""
+        if not self._sandbox_io_enabled:
+            return
+        bool_resets = {k: False for k, v in self._last_io_sent.items() if isinstance(v, bool) and v is not False}
+        if not bool_resets:
+            bool_resets = {k: False for k, v in self._last_io_sent.items() if isinstance(v, bool)}
+        if not bool_resets:
+            return
+        try:
+            if self.io_sender is not None:
+                self.io_sender(bool_resets)
+            elif hasattr(self.client, "request"):
+                res = self.client.request("POST", "/api/v1/sandbox/io", json={"updates": bool_resets})
+                if hasattr(res, "raise_for_status") and callable(res.raise_for_status):
+                    res.raise_for_status()
+                elif hasattr(res, "status_code") and isinstance(res.status_code, int) and res.status_code >= 400:
+                    raise RuntimeError(f"HTTP {res.status_code}")
+                elif hasattr(res, "status") and isinstance(res.status, int) and res.status >= 400:
+                    raise RuntimeError(f"HTTP {res.status}")
+            else:
+                import json
+                import urllib.request
+
+                url = f"http://{self.host}:{self.port}/api/v1/sandbox/io"
+                data = json.dumps({"updates": bool_resets}).encode("utf-8")
+                req = urllib.request.Request(
+                    url,
+                    data=data,
+                    headers={"Content-Type": "application/json", "Accept": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=3.0):
+                    pass
+            self._last_io_sent.update(bool_resets)
+        except Exception as exc:
+            log.warning("Failed to reset boolean IO channels to False on stop: %s", exc)
+
+    def _send_io_update(self, updates: dict[str, Any]) -> None:
+        """Send changed IO outputs to armd POST /api/v1/sandbox/io."""
+        if not updates:
+            return
+        if not self._sandbox_io_checked:
+            self._check_sandbox_io()
+        if not self._sandbox_io_enabled:
+            return
+        # deduplicate identical consecutive updates
+        changed = {k: v for k, v in updates.items() if self._last_io_sent.get(k) != v}
+        if not changed:
+            return
+
+        try:
+            if self.io_sender is not None:
+                self.io_sender(changed)
+            elif hasattr(self.client, "request"):
+                res = self.client.request("POST", "/api/v1/sandbox/io", json={"updates": changed})
+                if hasattr(res, "raise_for_status") and callable(res.raise_for_status):
+                    res.raise_for_status()
+                elif hasattr(res, "status_code") and isinstance(res.status_code, int) and res.status_code >= 400:
+                    raise RuntimeError(f"HTTP {res.status_code}")
+                elif hasattr(res, "status") and isinstance(res.status, int) and res.status >= 400:
+                    raise RuntimeError(f"HTTP {res.status}")
+            else:
+                import json
+                import urllib.request
+
+                url = f"http://{self.host}:{self.port}/api/v1/sandbox/io"
+                data = json.dumps({"updates": changed}).encode("utf-8")
+                req = urllib.request.Request(
+                    url,
+                    data=data,
+                    headers={"Content-Type": "application/json", "Accept": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=5.0):
+                    pass
+            self._last_io_sent.update(changed)
+        except Exception as exc:
+            self.request_stop("io_delivery_failed", f"Failed to deliver IO updates: {exc}")
+            raise
+
     # ---- run -----------------------------------------------------------------
 
     def run(self) -> RunResult:
@@ -1245,6 +1610,7 @@ class PolicyRunner:
                 "wait for it or create a new policy"
             )
         self._read_arm()
+        self._check_sandbox_io()
         self.result.lead_clips_per_joint = [0] * self.dof
         if self.log_path:
             self.log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1286,6 +1652,7 @@ class PolicyRunner:
             finally:
                 self._stopping = True
                 self._stop.set()
+                self._reset_io_channels()
                 sender_done = self._stop_sender()
                 self.result.duration_s = round(time.monotonic() - t_start, 3)
                 if (self._streaming or self._torque_sent) and sender_done:
@@ -1454,9 +1821,7 @@ class PolicyRunner:
                     open_rad = self._lerobot_open_rad
                 else:
                     limits = self._recorded_limits if self._recorded_limits is not None else self.limits
-                    closed_rad = (
-                        self._recorded_closed_rad if self._recorded_closed_rad is not None else self.closed_rad
-                    )
+                    closed_rad = self._recorded_closed_rad if self._recorded_closed_rad is not None else self.closed_rad
                     open_rad = self._recorded_open_rad if self._recorded_open_rad is not None else self.open_rad
                 action_rad = units.to_armd(
                     action.tolist(),
@@ -1471,6 +1836,12 @@ class PolicyRunner:
                     self.request_stop("bad_action", f"post-conversion action returned {action.tolist()}")
                     break
             self._publish(action)
+            io_updates = getattr(self.policy, "last_io_updates", None)
+            if io_updates:
+                try:
+                    self._send_io_update(io_updates)
+                except Exception:
+                    break
             self.result.steps = k + 1
             if self._log_file is not None:
                 self._log_file.write(
@@ -1600,13 +1971,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--action-units",
         choices=["auto", "rad", "so101_norm", "deg"],
         default="auto",
-        help="units for policy actions: auto (read from info.json, default rad; strictly requires unit_mode on SO-ARM), rad, so101_norm ([-100, 100], gripper [0, 100]), deg",
+        help=(
+            "units for policy actions: auto (read from info.json, default rad; strictly requires unit_mode on SO-ARM), "
+            "rad, so101_norm ([-100, 100], gripper [0, 100]), deg"
+        ),
     )
     p.add_argument(
         "--state-units",
         choices=["auto", "rad", "so101_norm", "deg"],
         default="auto",
-        help="units for policy observations: auto (read from info.json, default rad; strictly requires unit_mode on SO-ARM), rad, so101_norm, deg",
+        help=(
+            "units for policy observations: auto (read from info.json, default rad; strictly requires unit_mode on "
+            "SO-ARM), rad, so101_norm, deg"
+        ),
     )
     p.add_argument(
         "--lerobot-calib",

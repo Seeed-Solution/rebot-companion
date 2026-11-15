@@ -38,6 +38,7 @@ rebot-record = "rebot_companion.lerobot_recorder:main"
 rebot-policy = "rebot_companion.policy_runner:main"
 rebot-gripper-calib = "rebot_companion.gripper_calib:main"
 rebot-teleop-leader = "rebot_companion.leader_teleop:main"
+rebot-scene = "rebot_companion.scenes.cli:main"
 
 [project.optional-dependencies]
 calib = [
@@ -57,6 +58,9 @@ record = [
 policy = [
     "av>=12",
     "pyarrow>=14",
+]
+onnx = [
+    "onnxruntime>=1.18",
 ]
 
 [build-system]
