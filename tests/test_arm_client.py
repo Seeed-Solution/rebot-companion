@@ -219,8 +219,10 @@ def test_servo_stream_rejects_low_rate(armd):
 def test_targets_must_have_seven_joints(armd):
     with armd.client.session(client_id="len") as s:
         s.torque(True)
-        with pytest.raises(ArmCommandRejected) as exc:
+        with pytest.raises(ValueError, match="target_positions length \\(6\\) does not match schema DOF \\(7\\)"):
             s.move_to([0.0] * 6, duration=0.1)
+        with pytest.raises(ArmCommandRejected) as exc:
+            s.command("/api/v1/motion/jog", {"target_positions": [0.0] * 6, "duration_secs": 0.1})
         assert exc.value.code == "SAFETY_ERROR"
 
 
