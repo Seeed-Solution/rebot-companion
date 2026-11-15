@@ -7,5 +7,8 @@ from rebot.client import (  # noqa: F401
     SAFE_EXIT_POLICIES,
     SERVO_MAX_STEP,
     SERVO_MIN_RATE_HZ,
+    ArmObservation,
+    GripperStatus,
+    TcpPose,
     __all__,
 )

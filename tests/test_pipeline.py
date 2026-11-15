@@ -4,7 +4,15 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 
-from rebot.client import ArmCommandRejected, ArmdClient, ArmSession, ArmStatus, SafeExitOutcome
+from rebot.client import (
+    ArmCommandRejected,
+    ArmdClient,
+    ArmSession,
+    ArmStatus,
+    JointLimit,
+    ObservationSchema,
+    SafeExitOutcome,
+)
 from rebot_companion import kinematics as K
 from rebot_companion.calibration import HandEyeResult
 from rebot_companion.camera_client import MarkerDetection, ReCameraClient
@@ -122,7 +130,7 @@ def test_pipeline_fault_aborts():
 
 def test_pipeline_motion_uses_lease_session():
     arm = MagicMock(spec=ArmdClient)
-    arm.get_observation.return_value = status("Idle")
+    arm.get_observation.return_value = status("Idle", positions=[0.0] * 7)
     session = session_mock("Idle")
     arm.session.return_value.__enter__.return_value = session
     ik = MagicMock(side_effect=lambda pose: [float(pose.translation[2])] + [0.0] * 5)
@@ -236,8 +244,21 @@ def test_ik_adapter_returns_full_armd_vector():
         ik(Transform.from_rot_trans(np.eye(3), [2.0, 0.0, 0.1]))
 
 
+B601_SCHEMA = ObservationSchema.from_dict({
+    "dof": 7,
+    "arm_dof": 6,
+    "gripper_joint": 6,
+    "profile_id": "rebot-b601dm",
+    "limits": [
+        {"name": f"j{i}", "min_position": -3.14, "max_position": 3.14, "max_velocity": 2.0, "max_acceleration": 5.0}
+        for i in range(7)
+    ],
+})
+
+
 def test_pipeline_with_ik_adapter_moves_seven_joint_targets():
     arm = MagicMock(spec=ArmdClient)
+    arm.get_schema.return_value = B601_SCHEMA
     arm.get_observation.return_value = status("Armed", torqued=True, positions=HOME7)
     session = session_mock("Armed", positions=HOME7)
     marker = Transform.from_translation_euler([0.3, 0.05, 0.4], 0.0, 0.0, 0.0)
@@ -262,6 +283,7 @@ Q_DET = [0.3, 0.4, -0.5, 0.2, 0.0, 1.5707963, 0.0]
 
 def test_eye_in_hand_uses_arm_pose_at_detection():
     arm = MagicMock(spec=ArmdClient)
+    arm.get_schema.return_value = B601_SCHEMA
     arm.get_observation.return_value = status("Armed", torqued=True, positions=Q_DET)
     camera = marker_scene()
     res = DeterministicPickPlacePipeline(
@@ -277,6 +299,7 @@ def test_eye_in_hand_uses_arm_pose_at_detection():
 
 def test_eye_in_hand_rejects_arm_motion_during_detection():
     arm = MagicMock(spec=ArmdClient)
+    arm.get_schema.return_value = B601_SCHEMA
     moved = list(Q_DET)
     moved[0] += 0.05
     arm.get_observation.side_effect = [status("Armed", True, Q_DET), status("Armed", True, moved)]
@@ -316,3 +339,82 @@ def test_rebot_companion_re_exports_the_core():
     assert legacy.ArmSession is rebot.client.ArmSession and legacy.GRIPPER_INDEX == 6
     assert rebot_companion.ArmdClient is rebot.client.ArmdClient
     assert rebot_companion.ArmdError is rebot.RebotError
+
+
+def test_dynamic_gripper_bounds_in_pipeline():
+    so_limits = [
+        {"name": f"j{i}", "min_position": -3.14, "max_position": 3.14, "max_velocity": 2.0, "max_acceleration": 5.0}
+        for i in range(5)
+    ] + [{"name": "gripper", "min_position": 0.0, "max_position": 1.745329, "max_velocity": 2.0, "max_acceleration": 5.0}]
+    so_schema = ObservationSchema.from_dict({
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "profile_id": "so-arm101",
+        "limits": so_limits,
+    })
+    arm = MagicMock(spec=ArmdClient)
+    arm.get_schema.return_value = so_schema
+    arm.get_observation.return_value = status("Idle", positions=[0.0] * 6)
+    session = session_mock("Idle", positions=[0.0] * 6)
+    arm.session.return_value.__enter__.return_value = session
+    ik = MagicMock(side_effect=lambda pose: [float(pose.translation[2]), 0, 0, 0, 0, 0.0])
+    cam_to_base = Transform.from_translation_euler([0.1, -0.1, 0.1], 0.0, 0.0, 0.0)
+
+    # Dynamic resolution from SO-ARM schema (no explicit gripper bounds in config)
+    res = DeterministicPickPlacePipeline(
+        marker_scene(), arm, cam_to_base, PipelineConfig(max_allowed_distance=1.0), ik_solver=ik
+    ).run_cycle()
+    assert res.success is True
+    targets = [c.args[0] for c in session.move_to.call_args_list]
+    # In SO-ARM: gripper_joint=5, open=1.745329, closed=0.0
+    assert targets[0][5] == pytest.approx(1.745329)
+    assert [t[5] for t in targets] == pytest.approx([1.745329, 1.745329, 1.745329, 0.0, 0.0, 0.0, 1.745329])
+
+    # Explicit customization overrides schema
+    session2 = session_mock("Idle", positions=[0.0] * 6)
+    arm.session.return_value.__enter__.return_value = session2
+    res2 = DeterministicPickPlacePipeline(
+        marker_scene(),
+        arm,
+        cam_to_base,
+        PipelineConfig(max_allowed_distance=1.0, gripper_open=-2.5, gripper_closed=-0.1),
+        ik_solver=ik,
+    ).run_cycle()
+    assert res2.success is True
+    targets2 = [c.args[0] for c in session2.move_to.call_args_list]
+    assert [t[5] for t in targets2] == pytest.approx([-2.5, -2.5, -2.5, -0.1, -0.1, -0.1, -2.5])
+
+
+def test_pipeline_toolless_7dof_schema():
+    """7-DOF toolless arm with schema.gripper_joint=None commands 4 motion steps and has_gripper=False."""
+    arm = MagicMock(spec=ArmdClient)
+    arm.get_observation.return_value = status("Armed", torqued=True, positions=[0.0] * 7)
+    session = session_mock("Armed", positions=[0.0] * 7)
+    arm.session.return_value.__enter__.return_value = session
+
+    schema = ObservationSchema(
+        dof=7,
+        joint_names=[f"joint_{i+1}" for i in range(7)],
+        limits=[
+            JointLimit(name=f"j{i+1}", min_position=-3.14, max_position=3.14, max_velocity=2.0, max_acceleration=5.0)
+            for i in range(7)
+        ],
+        fields=[],
+        capabilities={"gripper": False},
+        arm_dof=7,
+        gripper_joint=None,
+    )
+    arm.get_schema.return_value = schema
+    ik = MagicMock(side_effect=lambda pose: [float(pose.translation[2])] + [0.0] * 6)
+    cam_to_base = Transform.from_translation_euler([0.1, -0.1, 0.1], 0.0, 0.0, 0.0)
+    pipeline = DeterministicPickPlacePipeline(
+        marker_scene(), arm, cam_to_base, PipelineConfig(max_allowed_distance=1.0), ik_solver=ik
+    )
+    res = pipeline.run_cycle()
+    assert res.success is True, res.error_message
+    # Without gripper, only 4 moves are commanded: approach, grasp, lift, place
+    assert session.move_to.call_count == 4
+    for call in session.move_to.call_args_list:
+        cmd = call.args[0]
+        assert len(cmd) == 7

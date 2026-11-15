@@ -139,6 +139,7 @@ uv sync --extra agent        # + MCP 服务器：mcp 2.x、av、pillow
 uv sync --extra calib        # + OpenCV，用于 tools/calibrate_intrinsics.py
 uv sync --extra record       # + PyAV、pyarrow，用于 rebot-record
 uv sync --extra policy       # + PyAV、pyarrow，用于 rebot-policy（学习策略见“运行学习策略”）
+uv sync --extra onnx         # + onnxruntime，无需 PyTorch/LeRobot 即可执行 ONNX 策略
 uv sync --all-extras         # 全部（开发用）
 ```
 
@@ -148,6 +149,7 @@ uv sync --all-extras         # 全部（开发用）
 | `calib` | `opencv-python-headless>=4.8,<5` | 相机内参工具 |
 | `record` | `av>=12`、`pyarrow>=14` | `rebot-record`（LeRobot 数据集录制） |
 | `policy` | `av>=12`、`pyarrow>=14` | `rebot-policy`（相机、脚本策略）；torch 和 lerobot 需另行安装 |
+| `onnx` | `onnxruntime>=1.18` | `rebot-policy --policy onnx:<dir>` 与 `rebot-scene` ONNX 策略校验 |
 
 测试在 `uv.lock` 锁定的版本上运行（例如 mcp 2.3.0）。
 
@@ -786,6 +788,34 @@ servo 被拒、策略停滞、错误动作和策略异常时停止；结束时�
 
 ---
 
+## 仿真场景与自定义末端 (`rebot-scene`)
+
+仿真场景与自定义末端执行器放在 `rebot_companion/scenes/`，运行期按需加载到 `rebot-sim`，不进入纯标准库
+的 `rebot/` 核心包，也不打入 reCamera 设备端固件包：
+
+- **两级资产加载（Tier-0 / Tier-1）**：内置场景（如 `coffee_kiosk`）默认使用原生 MuJoCo 几何体
+  （`world.xml`），离线直接可跑；可选的 Tier-1 精细模型或纹理按需缓存到
+  `$REBOT_SCENE_CACHE`（默认 `~/.cache/rebot/scenes/<scene_id>/`），文件名与校验遵循
+  `solution-assets` 规范（`<stem>-<md5前8位>.<ext>`、`.part` 原子写入和 SHA-256 校验）。
+- **自定义夹爪、ONNX 策略与浏览器 WASM 沙箱**：通过 `rebot-sim --scene ... --tool ...` 或热切换接口 `rebot-scene load`（`POST /sim/scene`）可加载本地目录或独立 XML。若需让 Agent 在接入实体机械臂/RK 之前先于浏览器 WASM 预览并迭代场景与策略，可通过 `rebot-scene upload` 上传场景/夹爪/`rebot-onnx-policy/v1` 策略至 `armd`，再用 `rebot-scene activate` 在 `mode="wasm"`（`?sim=wasm`）与 `mode="sim"` 之间切换。虚拟 I/O 工具支持 `/sim/io` 与 `/api/v1/sandbox/io`。详见 [`docs/agent_sandbox_workflow.md`](docs/agent_sandbox_workflow.md)。
+
+```bash
+rebot-scene list                                  # 列出内置场景（coffee_kiosk, pcb_suction）与末端预设
+rebot-scene info pcb_suction                      # 查看任务阶段、参考位姿、禁入区与资产状态
+rebot-scene init ./my_scene --kind scene          # 生成自定义场景模板 (scene.json + world.xml)
+rebot-scene init ./my_gripper --kind tool         # 生成自定义夹爪模板 (tool.json + tool.xml)
+rebot-scene init ./my_policy --kind policy        # 生成 ONNX 策略模板 (policy.json + model.onnx)
+rebot-scene validate ./my_policy
+rebot-scene upload ./my_policy --armd-url http://127.0.0.1:8080
+rebot-scene activate --mode wasm --scene pcb_suction --tool suction --policy my_policy
+rebot-scene status --armd-url http://127.0.0.1:8080
+rebot-scene load --scene coffee_kiosk --tool wide_cup_gripper
+rebot-scene io --set vacuum=true                  # 控制吸盘等虚拟 I/O
+rebot-scene asset-hash mesh.stl --prefix rebot/scenes
+```
+
+---
+
 ## 示例
 
 | 脚本 | 内容 | 是否驱动机械臂 |
@@ -793,6 +823,9 @@ servo 被拒、策略停滞、错误动作和策略异常时停止；结束时�
 | `examples/01_atomic_api_demo.py` | reCamera 触发和 armd 状态；`--move` 执行开力矩、回 home、微动 J1、卸载 | 仅在 `--move` 时 |
 | `examples/02_hand_eye_calib.py` | 交互式手眼标定向导（见上文） | 否（由人摆放机械臂） |
 | `examples/03_agent_orchestrator.py` | 阶段 1 工具调用模式：JSON schema 工具定义和分发函数 | 仅 `plan_and_execute_pick`，且需要 `--calib` |
+| `examples/scenes/coffee_kiosk/coffee_kiosk_fsm.py` | 四阶段咖啡亭流程（纯 `rebot.Arm`；`--no-vision` 可对比固定位姿与视觉抓取） | 是（仿真 `armd --follower sim` 或实体臂低速试跑） |
+| `examples/scenes/coffee_kiosk/train_and_eval_demo.py` | 多种子 `coffee_kiosk` 分阶段评测与可选 LeRobot v3.0 数据集录制（`--record-dir`） | 是，除非 `--dry-run` |
+| `examples/scenes/pcb_suction/pcb_suction_fsm.py` | 三阶段 PCB 真空吸取测试/下料流程（跨越隔断墙，使用 `rebot.Arm` 与虚拟真空 I/O） | 是（仿真 `armd --follower sim` 或实体臂低速试跑） |
 | `examples/04_hardened_pick_place.py` | 阶段 2 通过 `B601IkAdapter` 执行抓放循环 | 是，除非 `--dry-run` |
 
 ```bash

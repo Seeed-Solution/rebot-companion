@@ -44,7 +44,6 @@ from pydantic import BaseModel, Field
 from scipy.spatial.transform import Rotation
 
 from rebot.client import (
-    GRIPPER_INDEX,
     ActionFailed,
     ActionResult,
     ArmCommandRejected,
@@ -55,6 +54,7 @@ from rebot.client import (
     ArmStatus,
     LeaseError,
     MotionTimeout,
+    ObservationSchema,
 )
 from rebot.detection import (
     DEFAULT_TRIGGER_PIPELINES,
@@ -64,7 +64,7 @@ from rebot.detection import (
 )
 from rebot.errors import UnsupportedError
 
-from . import kinematics
+from . import calibration, kinematics, units
 from .snapshot import (
     CameraUnavailable,
     SnapshotError,
@@ -78,6 +78,7 @@ log = logging.getLogger("rebot_mcp")
 GRIP_CLOSED_RAD = 0.0  # armd GripperPolicy::rebot_dm closed_rad (cockpit CFG.gripClosed)
 GRIP_OPEN_RAD = -5.7  # open_rad (cockpit CFG.gripOpen)
 MAX_LINEAR_MPS = 0.15
+_SCHEMA_RETRY_COOLDOWN_S = 5.0
 MAX_STEP_M = 0.30
 MAX_ROT_DEG = 90.0
 
@@ -258,8 +259,40 @@ def tcp_dict(positions: list[float], joint_map: kinematics.JointMap = kinematics
     }
 
 
-def gripper_fraction(rad: float) -> float:
-    return max(0.0, min(1.0, (rad - GRIP_CLOSED_RAD) / (GRIP_OPEN_RAD - GRIP_CLOSED_RAD)))
+def gripper_fraction(
+    rad: float,
+    closed_rad: float = GRIP_CLOSED_RAD,
+    open_rad: float = GRIP_OPEN_RAD,
+) -> float:
+    span = open_rad - closed_rad
+    if abs(span) < 1e-6:
+        return 0.0
+    return max(0.0, min(1.0, (rad - closed_rad) / span))
+
+
+def _tcp_rpy_rad(obs_tcp: Any) -> list[float] | None:
+    """Extract TCP orientation as [roll, pitch, yaw] in radians from obs_tcp.
+
+    Tries rpy_rad first; if missing or < 3 items, tries quat_wxyz ([w, x, y, z]).
+    """
+    if obs_tcp is None:
+        return None
+    rpy_rad = obs_tcp.get("rpy_rad") if hasattr(obs_tcp, "get") else getattr(obs_tcp, "rpy_rad", None)
+    if rpy_rad is not None and len(rpy_rad) >= 3 and all(math.isfinite(x) for x in rpy_rad[:3]):
+        return [float(x) for x in rpy_rad[:3]]
+    quat = (
+        obs_tcp.get("quat_wxyz") if hasattr(obs_tcp, "get") else getattr(obs_tcp, "quat_wxyz", None)
+    ) or (
+        obs_tcp.get("quat") if hasattr(obs_tcp, "get") else getattr(obs_tcp, "quat", None)
+    )
+    if quat is not None and len(quat) == 4 and all(math.isfinite(x) for x in quat):
+        norm_sq = sum(float(x) * float(x) for x in quat)
+        if norm_sq > 1e-9:
+            q = [float(x) for x in quat]
+            # Rotation.from_quat expects [x, y, z, w]; quat_wxyz is [w, x, y, z]
+            euler = Rotation.from_quat([q[1], q[2], q[3], q[0]]).as_euler("xyz")
+            return [float(v) for v in euler]
+    return None
 
 
 class Controller:
@@ -282,6 +315,100 @@ class Controller:
         self.released = False  # release_control was called: no automatic re-acquire
         self._lock = threading.RLock()
         self._joint_map: kinematics.JointMap | None = None
+        self._schema: ObservationSchema | None = None
+        self._schema_is_fallback: bool = False
+        self._last_schema_attempt: float | None = None
+        self._cached_fallback_schema: ObservationSchema | None = None
+
+    def _build_fallback_schema(self) -> ObservationSchema:
+        obs = self.observation()
+        dof = len(obs.positions) if obs and hasattr(obs, "positions") and obs.positions else 7
+        return ObservationSchema(
+            dof=dof,
+            joint_names=[],
+            limits=[],
+            fields=[],
+            capabilities={},
+            arm_dof=6 if dof == 7 else None,
+            gripper_joint=6 if dof == 7 else None,
+            orientation_dof=3 if dof == 7 else None,
+        )
+
+    def schema(self) -> ObservationSchema:
+        if self._schema is None:
+            now = time.monotonic()
+            if self._last_schema_attempt is not None and now - self._last_schema_attempt < _SCHEMA_RETRY_COOLDOWN_S:
+                if self._cached_fallback_schema is not None:
+                    return self._cached_fallback_schema
+                self._cached_fallback_schema = self._build_fallback_schema()
+                self._schema_is_fallback = True
+                return self._cached_fallback_schema
+            try:
+                self._schema = self.client.get_schema()
+                self._last_schema_attempt = None
+                self._cached_fallback_schema = None
+                self._schema_is_fallback = False
+            except Exception as exc:
+                self._last_schema_attempt = time.monotonic()
+                log.warning("observation schema unavailable: %s", exc)
+                self._cached_fallback_schema = self._build_fallback_schema()
+                self._schema_is_fallback = True
+                return self._cached_fallback_schema
+        return self._schema
+
+    def gripper_joint(self) -> int | None:
+        try:
+            return self.schema().gripper_joint
+        except Exception:
+            obs = self.observation()
+            return 6 if obs and len(obs.positions) == 7 else None
+
+    def gripper_bounds(self) -> tuple[float, float]:
+        sch = None
+        try:
+            sch = self.schema()
+        except Exception:
+            pass
+        if sch is not None:
+            gj = getattr(sch, "gripper_joint", None)
+            if gj is None:
+                gj = self.gripper_joint()
+            return units.resolve_schema_gripper_bounds(
+                getattr(sch, "gripper_policy", None),
+                getattr(sch, "limits", None),
+                gj,
+            )
+        return GRIP_CLOSED_RAD, GRIP_OPEN_RAD
+
+    def format_tcp(self, obs_tcp: Any, positions: list[float]) -> dict | None:
+        if obs_tcp is not None:
+            raw_xyz = obs_tcp.get("xyz_m") if hasattr(obs_tcp, "get") else getattr(obs_tcp, "xyz_m", [])
+            xyz = [_r(v) for v in raw_xyz or []]
+            rpy_rad = _tcp_rpy_rad(obs_tcp)
+            quat = (
+                obs_tcp.get("quat_wxyz") if hasattr(obs_tcp, "get") else getattr(obs_tcp, "quat_wxyz", None)
+            ) or (
+                obs_tcp.get("quat") if hasattr(obs_tcp, "get") else getattr(obs_tcp, "quat", None)
+            )
+            rpy_deg = [_r(math.degrees(v), 2) for v in rpy_rad] if rpy_rad is not None else None
+            return {
+                "xyz_m": xyz,
+                "rpy_deg": rpy_deg,
+                "quat": [_r(v, 5) for v in quat] if quat is not None else None,
+            }
+        can_b601 = False
+        if self._schema is not None and not self._schema_is_fallback and self._schema.arm_dof == 6:
+            try:
+                calibration.check_b601_compatibility(self._schema)
+                can_b601 = True
+            except ValueError:
+                can_b601 = False
+        elif self._schema is None and len(positions) == 7:
+            can_b601 = True
+
+        if can_b601 and len(positions) >= 6:
+            return tcp_dict(positions, self.joint_map())
+        return None
 
     def joint_map(self) -> kinematics.JointMap:
         """armd's motor -> URDF map (schema ``model_joint_map``), read once; the B601-DM map when
@@ -391,7 +518,22 @@ class Controller:
 
     def get_state(self) -> dict:
         obs = self.observation()
-        grip = obs.positions[GRIPPER_INDEX] if len(obs.positions) > GRIPPER_INDEX else None
+        if obs.gripper is not None:
+            gripper = {
+                "joint": obs.gripper.joint,
+                "rad": _r(obs.gripper.rad),
+                "fraction": _r(obs.gripper.fraction, 3),
+                "opening_m": _r(obs.gripper.opening_m, 4) if obs.gripper.opening_m is not None else None,
+                "stalled": obs.gripper.stalled,
+            }
+        else:
+            gj = self.gripper_joint()
+            if gj is not None and len(obs.positions) > gj:
+                grip = obs.positions[gj]
+                closed_rad, open_rad = self.gripper_bounds()
+                gripper = {"rad": _r(grip), "fraction": _r(gripper_fraction(grip, closed_rad, open_rad), 3)}
+            else:
+                gripper = None
         return {
             "safety_state": obs.safety_state,
             "fault_reason": obs.fault_reason,
@@ -405,8 +547,8 @@ class Controller:
                 "temperatures": [_r(v, 1) for v in obs.temperatures],
             },
             "fault": obs.fault,
-            "tcp": tcp_dict(obs.positions, self.joint_map()),
-            "gripper": None if grip is None else {"rad": _r(grip), "fraction": _r(gripper_fraction(grip), 3)},
+            "tcp": self.format_tcp(obs.tcp, obs.positions),
+            "gripper": gripper,
             "action": obs.action.to_dict() if obs.action else None,
             "feedback_valid": obs.feedback_valid,
             "epoch_id": obs.epoch_id,
@@ -420,7 +562,7 @@ class Controller:
             "kind": a.kind if a else None,
             "state": a.state if a else "done",
             "settled": a.settled if a else None,
-            "tcp_after": tcp_dict(res.status.positions, self.joint_map()),
+            "tcp_after": self.format_tcp(res.status.tcp, res.status.positions),
             "duration_s": _r(res.duration_s, 3),
             "safety_state": res.status.safety_state,
             "is_torqued": res.status.is_torqued,
@@ -442,13 +584,108 @@ class Controller:
         rpy = None
         if quat is not None and any(v is not None for v in (roll_deg, pitch_deg, yaw_deg)):
             raise ToolFail("INVALID_ARGUMENT", "give roll/pitch/yaw or quat, not both")
-        if any(v is not None for v in (roll_deg, pitch_deg, yaw_deg)):
+        sch = self.schema()
+        orient_dof = (
+            sch.orientation_dof
+            if sch.orientation_dof is not None
+            else (2 if sch.arm_dof == 5 else (3 if sch.arm_dof == 6 else None))
+        )
+        auto_yaw = None
+
+        if quat is not None:
+            rpy = None
+        elif roll_deg is None and pitch_deg is None and yaw_deg is None:
+            caps = sch.capabilities or {}
+            if orient_dof == 2 and caps.get("auto_yaw") is True:
+                obs = s.latest_observation()
+                cur_rpy: list[float] | None = None
+                if obs is not None and getattr(obs, "tcp", None) is not None:
+                    cur_rpy = _tcp_rpy_rad(obs.tcp)
+                if cur_rpy is None:
+                    raise ToolFail(
+                        "INVALID_ARGUMENT",
+                        "current TCP orientation unavailable to fill omitted orientation angles",
+                    )
+                rpy = [cur_rpy[0], cur_rpy[1], 0.0]
+                auto_yaw = True
+            else:
+                rpy = None
+        else:
+            if orient_dof is None:
+                raise ToolFail("CONNECTION", "observation schema unavailable; cannot determine arm orientation DOF")
             obs = s.latest_observation()
-            cur = (tcp_dict(obs.commanded_positions or obs.positions, self.joint_map()) or {}).get(
-                "rpy_deg", [0.0, 0.0, 0.0]
-            )
-            rpy = [math.radians(v if v is not None else c) for v, c in zip((roll_deg, pitch_deg, yaw_deg), cur)]
-        res = s.move_pose([x, y, z], rpy=rpy, quat=quat, linear_speed=speed_mps, timeout=timeout_s)
+            cur_rpy: list[float] | None = None
+            if obs is not None and getattr(obs, "tcp", None) is not None:
+                cur_rpy = _tcp_rpy_rad(obs.tcp)
+            if cur_rpy is None and obs is not None:
+                can_b601_fk = (
+                    self._schema is not None
+                    and not self._schema_is_fallback
+                    and (sch.dof == 7 or sch.arm_dof == 6)
+                )
+                if can_b601_fk:
+                    try:
+                        calibration.check_b601_compatibility(sch)
+                    except ValueError:
+                        can_b601_fk = False
+                if can_b601_fk and len(obs.positions) >= 6:
+                    fk = tcp_dict(obs.commanded_positions or obs.positions, self.joint_map())
+                    if fk and fk.get("rpy_deg"):
+                        cur_rpy = [math.radians(v) for v in fk["rpy_deg"]]
+
+            if orient_dof == 2:
+                # 2-DOF orientation arm: pitch/roll controllable, yaw is coupled
+                if yaw_deg is None:
+                    caps = sch.capabilities or {}
+                    if caps.get("auto_yaw") is not True:
+                        raise ToolFail("UNSUPPORTED", "armd does not advertise auto_yaw capability")
+                    if roll_deg is None or pitch_deg is None:
+                        if cur_rpy is None:
+                            raise ToolFail(
+                                "INVALID_ARGUMENT",
+                                "current TCP orientation unavailable to fill omitted orientation angles",
+                            )
+                        roll = roll_deg if roll_deg is not None else math.degrees(cur_rpy[0])
+                        pitch = pitch_deg if pitch_deg is not None else math.degrees(cur_rpy[1])
+                    else:
+                        roll = roll_deg
+                        pitch = pitch_deg
+                    rpy = [math.radians(roll), math.radians(pitch), 0.0]
+                    auto_yaw = True
+                else:
+                    if roll_deg is None or pitch_deg is None:
+                        if cur_rpy is None:
+                            raise ToolFail(
+                                "INVALID_ARGUMENT",
+                                "current TCP orientation unavailable to fill omitted orientation angles",
+                            )
+                        roll = roll_deg if roll_deg is not None else math.degrees(cur_rpy[0])
+                        pitch = pitch_deg if pitch_deg is not None else math.degrees(cur_rpy[1])
+                    else:
+                        roll = roll_deg
+                        pitch = pitch_deg
+                    rpy = [math.radians(roll), math.radians(pitch), math.radians(yaw_deg)]
+                    auto_yaw = None
+            else:
+                if any(v is None for v in (roll_deg, pitch_deg, yaw_deg)):
+                    if cur_rpy is None:
+                        raise ToolFail(
+                            "INVALID_ARGUMENT",
+                            "current TCP orientation unavailable to fill omitted orientation angles",
+                        )
+                    roll = roll_deg if roll_deg is not None else math.degrees(cur_rpy[0])
+                    pitch = pitch_deg if pitch_deg is not None else math.degrees(cur_rpy[1])
+                    yaw = yaw_deg if yaw_deg is not None else math.degrees(cur_rpy[2])
+                else:
+                    roll = roll_deg
+                    pitch = pitch_deg
+                    yaw = yaw_deg
+                rpy = [math.radians(roll), math.radians(pitch), math.radians(yaw)]
+                auto_yaw = None
+        move_kwargs = {}
+        if auto_yaw is not None:
+            move_kwargs["auto_yaw"] = auto_yaw
+        res = s.move_pose([x, y, z], rpy=rpy, quat=quat, linear_speed=speed_mps, timeout=timeout_s, **move_kwargs)
         return self._action_dict(res)
 
     def move_relative(self, frame: str, d: list[float], rot_deg: dict, level: bool | None, speed_mps) -> dict:
@@ -458,16 +695,26 @@ class Controller:
         return self._action_dict(res)
 
     def gripper(self, command: str, fraction: float | None, grasp: bool | None) -> dict:
+        gj = self.gripper_joint()
+        if gj is None:
+            raise ToolFail("UNSUPPORTED", "This arm model does not have a gripper")
         s = self.actuator()
         res = s.gripper(command, fraction=fraction, grasp=grasp)
         obs, a = res.status, res.action
-        grip = obs.positions[GRIPPER_INDEX] if len(obs.positions) > GRIPPER_INDEX else 0.0
+        if obs.gripper is not None:
+            grip = obs.gripper.rad
+            frac = obs.gripper.fraction
+        else:
+            grip = obs.positions[gj] if len(obs.positions) > gj else 0.0
+            closed_rad, open_rad = self.gripper_bounds()
+            frac = gripper_fraction(grip, closed_rad, open_rad)
+        torque = _r(obs.torques[gj], 3) if len(obs.torques) > gj else None
         return {
             "state": a.state if a else "done",
             "holding": a.holding if a else None,
             "gap_rad": a.gripper_gap_rad if a else None,
-            "torque_nm": _r(obs.torques[GRIPPER_INDEX], 3) if len(obs.torques) > GRIPPER_INDEX else None,
-            "fraction": _r(gripper_fraction(grip), 3),
+            "torque_nm": torque,
+            "fraction": _r(frac, 3),
         }
 
     def home(self) -> dict:
@@ -640,7 +887,12 @@ class Controller:
         return [Image(data=snap.jpeg, format="jpeg"), json.dumps(meta)]
 
     def detect(self, wait_ms: int, min_score: float, pipelines: str | None = None) -> dict:
-        wanted = None if pipelines is None else (list(DEFAULT_TRIGGER_PIPELINES) if pipelines == "both" else [pipelines])
+        if pipelines is None:
+            wanted = None
+        elif pipelines == "both":
+            wanted = list(DEFAULT_TRIGGER_PIPELINES)
+        else:
+            wanted = [pipelines]
         res = self.detector.detect_once(wait_ms=wait_ms, pipelines=wanted)
         dets = [d for d in parse_detections(res["raw"]) if d.score >= min_score]
         out = {
@@ -740,7 +992,9 @@ def build_server(ctrl: Controller, allow_clear_fault: bool = False, allow_preemp
     @tool(
         "Straight-line move of end_link to (x, y, z) m in the base frame. Orientation: roll/pitch/yaw "
         "in degrees (URDF fixed-axis; missing angles keep the current value) or quat [w, x, y, z]; "
-        "omit both to keep the current orientation. Blocks until done."
+        "omit both to keep the current orientation (on 5-DOF arms with orient_dof=2, yaw is coupled: "
+        "omitted yaw or omitted orientation uses auto_yaw to solve yaw while maintaining pitch/roll). "
+        "Blocks until done."
     )
     async def move_to(
         x: float,

@@ -59,7 +59,7 @@ with Arm() as arm:  # $REBOT_HOST or 127.0.0.1; takes control, torque on
 |---|---|
 | `Arm(host, port, enable=True, park_on_exit=True, force=False, obs_hz=10, handle_sigterm=True)` | one `Arm` per program |
 | `home()`, `park()` | `park` ends with torque off; the next motion turns it on |
-| `move_to(xyz, rpy=None, speed=None)` | straight line; `speed` m/s (default 0.05) |
+| `move_to(xyz, rpy=None, speed=None, auto_yaw=None)` | straight line; `speed` m/s (default 0.05); `auto_yaw=True` solves yaw on 5-DOF arms |
 | `move_relative(dx, dy, dz, frame="base"\|"tool"\|"camera")` | relative move |
 | `move_joints(positions)` | 7 values in radians |
 | `poses()`, `save_pose(name)`, `delete_pose(name)`, `move_to_pose(name, speed_scale)` | capability `poses` |
@@ -107,6 +107,10 @@ Every call blocks until armd reports the result and raises a `RebotError` subcla
   `home()` before the first `move_to` of a program; without it the simulator reported `IK_BRANCH_FLIP`.
 - **Speed.** Use `speed_scale` <= 0.5 for the first real runs of any new script or pose, 0.3 when
   the arm moves near people, bins or the table. Raise it only after a successful run.
+- **SO-ARM101 follower.** Serial `/dev/ttySC0` (`--follower so-arm101` in armd), 6 DOF (5 arm + 1 gripper).
+  No gravity compensation, no mechanical zero-check (`gripper_zero_check`), and no physical e-stop (software
+  stops only); resting pose is folded `park()`. On 5-DOF arms (`orient_dof=2`), pitch and roll are directly
+  controllable while yaw is coupled; pass `auto_yaw=True` to `move_to(xyz, rpy=..., auto_yaw=True)` so armd solves yaw.
 - **Always `with Arm() as arm:`.** It parks and releases control on errors, Ctrl+C and SIGTERM. Do not
   call `Arm()` without `with` unless `arm.close()` is guaranteed.
 - **Hung loops.** In scripts that loop, call `arm.guard(seconds)` once and `arm.feed()` each cycle.
@@ -171,6 +175,26 @@ do not add them to `pyproject.toml`.
 - Use `--fps` equal to the training dataset's fps. The runner clips targets to armd's servo lead
   and stops on faults, collision holds, blocked holds, lease loss and servo rejections; it never
   clears a fault. Read the stop reason and park result in its summary before running again.
+- `--unit-mode so101_norm` in `rebot-record` records normalized dataset values (`[-100, 100]` for arm joints,
+  `[0, 100]` for gripper). In `rebot-policy`, `--action-units` and `--state-units` (default `auto`) read `info.json`
+  `unit_mode` and convert to/from armd radians.
+- `rebot-teleop-leader` streams USB Feetech STS3215 leader arm positions (USB serial) to armd's WebSocket
+  servo stream with initial alignment guard and quintic ramp-in.
+- Unified ONNX policies (`rebot-onnx-policy/v1`, directory with `policy.json` + `model.onnx`) run on
+  real hardware / RK and `armd --follower sim` via `rebot-policy --policy onnx:<dir>` (needs only
+  `--extra onnx`, zero torch/lerobot) and inside the browser `WASM_SIM` sandbox via
+  `onnxruntime-web`.
+
+## Simulation & WASM Sandbox (`rebot-scene` / `/api/v1/sandbox/*`)
+
+See [`docs/agent_sandbox_workflow.md`](docs/agent_sandbox_workflow.md). Quick commands for
+non-realtime training (`SimEnv`), built-in `pcb_suction`, custom packs, and browser preview:
+
+- Scaffold/validate: `rebot-scene init <dir> --kind scene|tool|policy`, `rebot-scene validate <dir>`.
+- Upload & activate on `armd`: `rebot-scene upload <dir>` (`POST /api/v1/sandbox/{scenes,tools,policies}`),
+  `rebot-scene activate --mode wasm|sim|none [--scene pcb_suction --tool suction --policy <id>]`,
+  `rebot-scene status`. Browser sandbox runs on `?sim=wasm` (or active `mode="wasm"`) via
+  `mujoco_wasm.js` + `onnxruntime-web` without Cockpit UI upload forms.
 
 ## Checks before finishing
 

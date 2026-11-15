@@ -48,7 +48,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Optional, Sequence
 
 from . import _http, _ws
 from ._log import _log
@@ -74,6 +74,8 @@ SAFE_EXIT_POLICIES = ("off", "error", "always")
 ACTION_MAX_TIMEOUT_S = 60.0
 TASK_UNSUPPORTED = "TASK_UNSUPPORTED"  # armd: the loaded vision model/depth cannot serve the grasp task
 CAPABILITIES_DEVPLAT = 6  # capabilities.version with obs_rate / fault_codes / poses / keepout / ...
+_GRIPPER_UNSET = object()
+_SCHEMA_RETRY_COOLDOWN_S = 5.0
 
 
 @dataclass
@@ -82,6 +84,7 @@ class SafeExitOutcome:
 
     ``action``: ``not_needed`` (torque already off), ``unloaded``, ``unsupported`` (armd has no
     resting-pose profile; arm left torqued), ``estop`` (E-stop latched; not cleared automatically),
+    ``fault`` (non-recoverable fault; not cleared automatically),
     ``no_lease`` (lease lost; nothing can be commanded) or ``failed``.
     """
 
@@ -225,6 +228,79 @@ class ActionResult:
 
 
 @dataclass
+class TcpPose:
+    """End-effector pose in arm base frame (metres and radians / quaternion [w, x, y, z])."""
+
+    xyz_m: list[float]
+    rpy_rad: list[float] | None = None
+    quat_wxyz: list[float] | None = None
+
+    @classmethod
+    def from_dict(cls, d: dict) -> TcpPose:
+        floats = lambda key: [float(x) for x in d.get(key) or []] if d.get(key) is not None else None
+        return cls(
+            xyz_m=[float(x) for x in d.get("xyz_m") or []],
+            rpy_rad=floats("rpy_rad"),
+            quat_wxyz=floats("quat_wxyz"),
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "xyz_m": self.xyz_m,
+            "rpy_rad": self.rpy_rad,
+            "quat_wxyz": self.quat_wxyz,
+        }
+
+    def __getitem__(self, item: str) -> Any:
+        return getattr(self, item)
+
+    def get(self, item: str, default: Any = None) -> Any:
+        return getattr(self, item, default)
+
+    def __contains__(self, item: str) -> bool:
+        return hasattr(self, item) and getattr(self, item) is not None
+
+
+@dataclass
+class GripperStatus:
+    """Gripper state reported by armd."""
+
+    joint: int
+    rad: float
+    fraction: float
+    opening_m: float | None = None
+    stalled: bool = False
+
+    @classmethod
+    def from_dict(cls, d: dict) -> GripperStatus:
+        return cls(
+            joint=int(d.get("joint", 0)),
+            rad=float(d.get("rad", 0.0)),
+            fraction=float(d.get("fraction", 0.0)),
+            opening_m=_opt_float(d.get("opening_m")),
+            stalled=bool(d.get("stalled", False)),
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "joint": self.joint,
+            "rad": self.rad,
+            "fraction": self.fraction,
+            "opening_m": self.opening_m,
+            "stalled": self.stalled,
+        }
+
+    def __getitem__(self, item: str) -> Any:
+        return getattr(self, item)
+
+    def get(self, item: str, default: Any = None) -> Any:
+        return getattr(self, item, default)
+
+    def __contains__(self, item: str) -> bool:
+        return hasattr(self, item)
+
+
+@dataclass
 class ArmStatus:
     """One ``ArmObservation`` as emitted by armd (REST ``GET /api/v1/observation`` or WS telemetry)."""
 
@@ -250,9 +326,12 @@ class ArmStatus:
     previous_action: ActionStatus | None = None
     fault: dict | None = None  # {"code", "message", "recoverable"} (capability fault_codes)
     residual_torques: list[float] | None = None  # capability residual_torques
+    loads: list[float] | None = None
     collision: dict | None = None  # capability collision_guard; None while the guard is off or unavailable
     motion_limit: dict | None = None  # capability servo_guard: {"reason", "joint", "since_ms"} or None
     gripper_zero: dict | None = None  # capability gripper_zero: {"state", "j7", "offset_rad"}
+    tcp: TcpPose | None = None
+    gripper: GripperStatus | None = None
 
     @classmethod
     def from_dict(cls, d: dict) -> ArmStatus:
@@ -283,9 +362,12 @@ class ArmStatus:
             ),
             fault=dict(d["fault"]) if isinstance(d.get("fault"), dict) else None,
             residual_torques=floats("residual_torques") if isinstance(d.get("residual_torques"), list) else None,
+            loads=floats("loads") if isinstance(d.get("loads"), list) else None,
             collision=dict(d["collision"]) if isinstance(d.get("collision"), dict) else None,
             motion_limit=dict(d["motion_limit"]) if isinstance(d.get("motion_limit"), dict) else None,
             gripper_zero=dict(d["gripper_zero"]) if isinstance(d.get("gripper_zero"), dict) else None,
+            tcp=TcpPose.from_dict(d["tcp"]) if isinstance(d.get("tcp"), dict) else None,
+            gripper=GripperStatus.from_dict(d["gripper"]) if isinstance(d.get("gripper"), dict) else None,
         )
 
     @property
@@ -321,6 +403,9 @@ class ArmStatus:
         return bool(self.fault and self.fault.get("recoverable") is True)
 
 
+ArmObservation = ArmStatus
+
+
 @dataclass
 class JointLimit:
     name: str
@@ -343,6 +428,13 @@ class ObservationSchema:
     # armd joint -> URDF angle per arm joint, [{sign, offset_rad}] (model = sign * motor + offset_rad);
     # empty on armd before 2026-11-12 (rebot_companion.kinematics.JointMap.from_schema falls back)
     model_joint_map: list[dict] = field(default_factory=list)
+    profile_id: str | None = None
+    arm_dof: int | None = None
+    gripper_joint: int | None = None
+    orientation_dof: int | None = None
+    gripper_policy: dict | None = None
+    feetech_joints: list[dict] | None = None
+    servo_max_lead_rad: float | None = None
 
     @property
     def capabilities_version(self) -> int:
@@ -361,8 +453,36 @@ class ObservationSchema:
 
     @classmethod
     def from_dict(cls, d: dict) -> ObservationSchema:
+        dof = int(d["dof"])
+        raw_arm_dof = d.get("arm_dof")
+        if raw_arm_dof is not None:
+            arm_dof = int(raw_arm_dof)
+        else:
+            arm_dof = 6 if dof == 7 else (dof if dof < 6 else None)
+
+        if "gripper_joint" in d:
+            raw_gripper_joint = d["gripper_joint"]
+            gripper_joint = int(raw_gripper_joint) if raw_gripper_joint is not None else None
+        else:
+            gripper_joint = 6 if dof == 7 and arm_dof != 7 else None
+
+        if gripper_joint is not None and not (0 <= gripper_joint < dof):
+            raise ValueError(f"gripper_joint {gripper_joint} out of range for dof={dof}")
+
+        raw_orientation_dof = d.get("orientation_dof")
+        if raw_orientation_dof is not None:
+            orientation_dof = int(raw_orientation_dof)
+        else:
+            orientation_dof = 3 if arm_dof == 6 else (2 if arm_dof == 5 else None)
+
+        gripper_policy = dict(d["gripper_policy"]) if isinstance(d.get("gripper_policy"), dict) else None
+        profile_id = str(d["profile_id"]) if d.get("profile_id") is not None else None
+        feetech_joints = list(d["feetech_joints"]) if isinstance(d.get("feetech_joints"), list) else None
+        raw_lead = d.get("servo_max_lead_rad")
+        servo_max_lead_rad = float(raw_lead) if raw_lead is not None else None
+
         return cls(
-            dof=int(d["dof"]),
+            dof=dof,
             joint_names=list(d.get("joint_names") or []),
             limits=[
                 JointLimit(**{k: lim[k] for k in JointLimit.__dataclass_fields__}) for lim in d.get("limits") or []
@@ -371,6 +491,13 @@ class ObservationSchema:
             capabilities=dict(d.get("capabilities") or {}),
             speed_cap=d.get("speed_cap") if isinstance(d.get("speed_cap"), dict) else None,
             model_joint_map=[m for m in d.get("model_joint_map") or [] if isinstance(m, dict)],
+            profile_id=profile_id,
+            arm_dof=arm_dof,
+            gripper_joint=gripper_joint,
+            orientation_dof=orientation_dof,
+            gripper_policy=gripper_policy,
+            feetech_joints=feetech_joints,
+            servo_max_lead_rad=servo_max_lead_rad,
         )
 
 
@@ -406,8 +533,8 @@ class ArmdClient:
             transport=self._transport,
         )
 
-    def _get(self, path: str) -> Any:
-        res = self.request("GET", path)
+    def _get(self, path: str, timeout: float | None = None) -> Any:
+        res = self.request("GET", path, timeout=timeout)
         res.raise_for_status()
         return res.json()
 
@@ -465,9 +592,9 @@ class ArmdClient:
         """``GET /api/v1/observation`` (no lease required)."""
         return ArmStatus.from_dict(self._get("/api/v1/observation"))
 
-    def get_schema(self) -> ObservationSchema:
+    def get_schema(self, timeout: float | None = None) -> ObservationSchema:
         """``GET /api/v1/observation/schema`` (no lease required): DOF, joint names, limits, capabilities."""
-        return ObservationSchema.from_dict(self._get("/api/v1/observation/schema"))
+        return ObservationSchema.from_dict(self._get("/api/v1/observation/schema", timeout=timeout))
 
     def require(self, capability: str, what: str, schema: ObservationSchema | None = None) -> ObservationSchema:
         """Raise :class:`UnsupportedError` unless armd reports ``capability`` (capabilities version >= 6)."""
@@ -643,6 +770,8 @@ class ArmSession:
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
         self._schema: ObservationSchema | None = None
+        self._gripper_joint: int | None | object = _GRIPPER_UNSET
+        self._last_schema_attempt: float | None = None
         self._unload_pending = False
         self._last_servo: tuple[float, list[float]] | None = None  # (monotonic time, positions)
 
@@ -670,13 +799,18 @@ class ArmSession:
         self._threads = [reader]
         try:
             self.wait_for_observation(timeout=self.connect_timeout)
+            if self._schema is None and self._gripper_joint is _GRIPPER_UNSET:
+                try:
+                    self.schema(timeout=min(self.connect_timeout, 1.5))
+                except Exception:
+                    pass
             self._acquire_lease()
+            heartbeat = threading.Thread(target=self._heartbeat_loop, name="armd-heartbeat", daemon=True)
+            heartbeat.start()
+            self._threads.append(heartbeat)
         except BaseException:
             self._shutdown()
             raise
-        heartbeat = threading.Thread(target=self._heartbeat_loop, name="armd-heartbeat", daemon=True)
-        heartbeat.start()
-        self._threads.append(heartbeat)
         return self
 
     def close(self, release: bool = True) -> None:
@@ -737,10 +871,11 @@ class ArmSession:
         """Bring a torqued arm to rest with torque off before the lease is released.
 
         Steps: if torque is off, nothing to do. A latched EStop is reported and left
-        alone. A Fault is cleared, the arm is re-armed (torque on, no motion) and
-        :meth:`unload` runs with ``timeout`` (default ``safe_exit_timeout``). If armd
-        has no resting-pose profile (``UNSUPPORTED``) the arm stays torqued and armd
-        latches ``Fault(WatchdogTimeout)`` once the lease is released; this is
+        alone. Only recoverable faults are cleared and re-armed (torque on, no motion)
+        before running :meth:`unload` with ``timeout`` (default ``safe_exit_timeout``);
+        unrecoverable faults and E-stop remain latched and automatic unloading is skipped.
+        If armd has no resting-pose profile (``UNSUPPORTED``) the arm stays torqued and
+        armd latches ``Fault(WatchdogTimeout)`` once the lease is released; this is
         reported, because torque cannot be disabled away from the resting pose.
         """
         outcome = self._safe_exit(self.safe_exit_timeout if timeout is None else timeout)
@@ -760,7 +895,22 @@ class ArmSession:
             if obs.e_stopped:
                 return SafeExitOutcome("estop", "EStop is latched; not cleared automatically, arm left holding")
             if obs.faulted:
-                self.clear_fault(obs, recheck=lambda o: o.faulted and not o.e_stopped)
+                def _is_rec(o: ArmStatus) -> bool:
+                    if o.fault is not None:
+                        return bool(o.recoverable)
+                    if self._schema is not None and self._schema.has("fault_codes"):
+                        return False
+                    return o.fault_reason in ("WatchdogTimeout", "ControlDeadline", "HandoverUnsettled")
+
+                if not _is_rec(obs):
+                    return SafeExitOutcome(
+                        "fault",
+                        f"Fault ({obs.fault_code or obs.fault_reason or obs.safety_state}) is not recoverable; not cleared automatically, arm left holding",
+                    )
+                self.clear_fault(
+                    obs,
+                    recheck=lambda o: o.faulted and not o.e_stopped and _is_rec(o),
+                )
                 obs = self.wait_for_observation(timeout=1.0)
             if not obs.is_operational:
                 self.torque(True)  # re-arm after clear_fault; plans no motion
@@ -825,10 +975,51 @@ class ArmSession:
                 raise ArmConnectionError(self._closed_reason)
             return self._obs
 
-    def schema(self) -> ObservationSchema:
+    def schema(self, timeout: float | None = None) -> ObservationSchema:
         if self._schema is None:
-            self._schema = self.client.get_schema()
+            try:
+                self._schema = self.client.get_schema(timeout=timeout)
+                self._last_schema_attempt = None
+            except Exception:
+                self._last_schema_attempt = time.monotonic()
+                raise
         return self._schema
+
+    def set_schema(self, schema: ObservationSchema) -> None:
+        self._schema = schema
+        self._gripper_joint = schema.gripper_joint
+        self._last_schema_attempt = None
+
+    def _cached_gripper_joint(self, pos_len: int | None = None) -> int | None:
+        if self._schema is not None:
+            return self._schema.gripper_joint
+        if self._gripper_joint is not _GRIPPER_UNSET:
+            return self._gripper_joint  # type: ignore[return-value]
+        obs = None
+        try:
+            obs = self.latest_observation()
+        except ArmConnectionError:
+            pass
+        if obs is not None:
+            return 6 if len(obs.positions) == 7 else None
+        if pos_len is not None:
+            return 6 if pos_len == 7 else None
+        return None
+
+    @property
+    def gripper_joint(self) -> int | None:
+        if self._schema is not None:
+            return self._schema.gripper_joint
+        if self._gripper_joint is not _GRIPPER_UNSET:
+            return self._gripper_joint  # type: ignore[return-value]
+        now = time.monotonic()
+        if self._last_schema_attempt is None or (now - self._last_schema_attempt >= _SCHEMA_RETRY_COOLDOWN_S):
+            try:
+                self._gripper_joint = self.schema(timeout=0.5).gripper_joint
+                return self._gripper_joint  # type: ignore[return-value]
+            except Exception:
+                pass
+        return self._cached_gripper_joint()
 
     # ---- background threads --------------------------------------------------
 
@@ -1179,13 +1370,21 @@ class ArmSession:
         angular_speed: float | None = None,
         tag: str | None = None,
         timeout: float | None = None,
+        auto_yaw: Optional[bool] = None,
     ) -> ActionResult:
         """Straight-line Cartesian move of ``end_link`` to ``position`` (m, base frame).
 
         Orientation: ``rpy`` (rad, URDF fixed-axis ``Rz @ Ry @ Rx``) or ``quat`` ``[w, x, y, z]``;
         neither keeps the current orientation. armd defaults: 0.05 m/s, 0.5 rad/s.
         (:meth:`move_to` is the joint-space jog.)
+        ``auto_yaw``: when True on 5-DOF arms (orient_dof=2), armd solves yaw from position.
         """
+        if auto_yaw is not None and not isinstance(auto_yaw, bool):
+            raise ValueError(f"auto_yaw must be bool or None, got {type(auto_yaw).__name__}: {auto_yaw!r}")
+        if auto_yaw is True and getattr(self, "_schema", None) is not None:
+            caps = getattr(self._schema, "capabilities", None) or {}
+            if caps.get("auto_yaw") is not True:
+                raise UnsupportedError("armd does not advertise auto_yaw capability", code="UNSUPPORTED")
         if rpy is not None and quat is not None:
             raise ValueError("give rpy or quat, not both")
         body: dict = {"position": _vec(position, 3, "position")}
@@ -1195,6 +1394,8 @@ class ArmSession:
         _put_speed(body, linear_speed, angular_speed)
         if tag is not None:
             body["tag"] = str(tag)
+        if auto_yaw is not None:
+            body["auto_yaw"] = bool(auto_yaw)
         return self._action("/api/v1/action/move_to", body, timeout, legacy_wait=None)
 
     def move_relative(
@@ -1566,9 +1767,12 @@ class ArmSession:
         else:
             obs = self.latest_observation()
             ref = obs.positions if obs is not None else None
+        gj = self._cached_gripper_joint(len(target))
         if ref is not None and len(ref) == len(target):
             for i, (t, r) in enumerate(zip(target, ref)):
-                if i == GRIPPER_INDEX:
+                if gj is not None and i == gj:
+                    continue
+                if self._schema is None and gj is None and i == GRIPPER_INDEX and len(target) >= 7:
                     continue
                 if abs(t - r) > SERVO_MAX_STEP:
                     raise ServoJumpError(
@@ -1631,9 +1835,22 @@ class ArmSession:
     def _tolerances(self, target: Sequence[float], tolerance: Any) -> list[float | None]:
         if tolerance is None:
             tol: list[float | None] = [0.03] * len(target)
-            if len(target) >= 7:
-                # armd excludes the 7-DOF gripper from following-error checks: it trails
-                # its command and stays off-target while holding an object.
+            if self._schema is not None:
+                gj = self._schema.gripper_joint
+            elif self._gripper_joint is not _GRIPPER_UNSET:
+                gj = self._gripper_joint  # type: ignore[assignment]
+            else:
+                now = time.monotonic()
+                if self._last_schema_attempt is None or (now - self._last_schema_attempt >= _SCHEMA_RETRY_COOLDOWN_S):
+                    try:
+                        gj = self.schema(timeout=0.5).gripper_joint
+                    except Exception:
+                        gj = self._cached_gripper_joint(len(target))
+                else:
+                    gj = self._cached_gripper_joint(len(target))
+            if gj is not None and len(target) > gj:
+                tol[gj] = None
+            elif self._schema is None and gj is None and len(target) >= 7:
                 tol[6] = None
             return tol
         if isinstance(tolerance, (int, float)):
@@ -1693,6 +1910,9 @@ __all__ = [
     "ArmdClient",
     "ArmSession",
     "ArmStatus",
+    "ArmObservation",
+    "TcpPose",
+    "GripperStatus",
     "ActionStatus",
     "ActionResult",
     "ActionFailed",
@@ -1708,4 +1928,5 @@ __all__ = [
     "ServoJumpError",
     "UnloadFailed",
     "SafeExitOutcome",
+    "GRIPPER_INDEX",
 ]

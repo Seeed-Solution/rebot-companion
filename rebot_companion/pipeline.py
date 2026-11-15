@@ -8,12 +8,12 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from rebot.client import ArmCommandRejected, ArmdClient, ArmdError, ArmSession, SafeExitOutcome
+from rebot.client import ArmCommandRejected, ArmdClient, ArmdError, ArmSession, ObservationSchema, SafeExitOutcome
 
-from . import kinematics
-from .calibration import HandEyeResult
+from . import kinematics, units
+from .calibration import HandEyeResult, check_b601_compatibility
 from .camera_client import CameraTriggerTimeout, MarkerDetection, ReCameraClient
-from .ik import GRIPPER_CLOSED, GRIPPER_INDEX, GRIPPER_OPEN
+from .ik import GRIPPER_CLOSED, GRIPPER_OPEN, B601IkAdapter
 from .transforms import Transform
 
 
@@ -30,9 +30,10 @@ class PipelineConfig:
     lift_duration: float = 1.0
     place_duration: float = 1.5
     gripper_duration: float = 1.0
-    # Gripper joint (index 6 of armd's 7-joint vector) targets; open is negative.
-    gripper_open: float = GRIPPER_OPEN
-    gripper_closed: float = GRIPPER_CLOSED
+    # Gripper joint targets (rad). When None, dynamically resolved from schema
+    # (via units.resolve_schema_gripper_bounds), falling back to B601 bounds (GRIPPER_OPEN, GRIPPER_CLOSED).
+    gripper_open: float | None = None
+    gripper_closed: float | None = None
     enable_torque: bool = True  # arm torque if the arm is Idle; otherwise fail the cycle
     # After the last segment: "unload" (park + torque off), "home", or "hold".
     # With a pipeline-owned session, "home"/"hold" leave the arm torqued without a
@@ -155,6 +156,38 @@ class DeterministicPickPlacePipeline:
 
         # Step 3: Coordinate frame transformation (Camera Frame -> Arm Base Frame)
         # T_marker_in_base = T_cam_to_base @ T_marker_in_cam
+        is_b601_ik = isinstance(self.ik_solver, B601IkAdapter)
+
+        schema = None
+        if eye_in_hand or is_b601_ik:
+            try:
+                get_schema = getattr(self.arm, "get_schema", None)
+                if not callable(get_schema):
+                    raise ValueError("arm client does not provide get_schema()")
+                sch = get_schema()
+                if not (isinstance(sch, ObservationSchema) or (hasattr(sch, "dof") and isinstance(sch.dof, int))):
+                    raise ValueError(f"invalid schema returned by get_schema(): {sch!r}")
+                check_b601_compatibility(sch)
+                schema = sch
+            except Exception as e:
+                stage = "frame_transform" if eye_in_hand else "ik_solve"
+                return PipelineResult(
+                    success=False,
+                    stage=stage,
+                    error_message=f"Refusing local B601 IK on incompatible arm: {e}"
+                    if not eye_in_hand
+                    else f"Camera pose unavailable: {e}",
+                )
+        else:
+            try:
+                get_schema = getattr(self.arm, "get_schema", None)
+                if callable(get_schema):
+                    sch = get_schema()
+                    if isinstance(sch, ObservationSchema) or (hasattr(sch, "dof") and isinstance(sch.dof, int)):
+                        schema = sch
+            except Exception:
+                pass
+
         try:
             if eye_in_hand:
                 after = self.arm.get_observation()
@@ -169,7 +202,11 @@ class DeterministicPickPlacePipeline:
                         error_message=f"Arm moved during eye_in_hand detection (max joint change {drift:.4f} rad)",
                     )
             cam_to_base = self.hand_eye.cam_to_base(
-                arm_status.positions, cfg.kinematics_sign, cfg.kinematics_offset, cfg.kinematics_joint_map
+                arm_status.positions,
+                cfg.kinematics_sign,
+                cfg.kinematics_offset,
+                cfg.kinematics_joint_map,
+                schema=schema,
             )
         except Exception as e:
             return PipelineResult(success=False, stage="frame_transform", error_message=f"Camera pose unavailable: {e}")
@@ -217,17 +254,41 @@ class DeterministicPickPlacePipeline:
                 success=False, stage="ik_solve", target_pose_base=target_in_base, error_message=f"IK failed: {e}"
             )
 
-        has_gripper = all(len(q) > GRIPPER_INDEX for q in (q_approach, q_grasp, q_lift, q_place))
-        if not has_gripper:
-            warnings.append(f"IK targets have no gripper joint (index {GRIPPER_INDEX}); gripper not commanded")
+        if schema is not None:
+            if hasattr(schema, "gripper_joint"):
+                raw_gj = schema.gripper_joint
+                gripper_joint = raw_gj if isinstance(raw_gj, int) and not isinstance(raw_gj, bool) else None
+            else:
+                raw_arm_dof = getattr(schema, "arm_dof", None)
+                gripper_joint = 6 if len(arm_status.positions) >= 7 and raw_arm_dof != 7 else None
+        else:
+            gripper_joint = 6 if len(arm_status.positions) >= 7 else None
+        capabilities = getattr(schema, "capabilities", {}) if schema else {}
+        cap_gripper = capabilities.get("gripper") if isinstance(capabilities, dict) else None
+        if cap_gripper is False or gripper_joint is None:
+            has_gripper = False
+        else:
+            has_gripper = all(len(q) > gripper_joint for q in (q_approach, q_grasp, q_lift, q_place))
+            if not has_gripper:
+                warnings.append(f"IK targets have no gripper joint (index {gripper_joint}); gripper not commanded")
 
         def grip(q: list[float], value: float) -> list[float]:
             q = list(q)
-            if has_gripper:
-                q[GRIPPER_INDEX] = value
+            if has_gripper and gripper_joint is not None:
+                q[gripper_joint] = value
             return q
 
-        opened, closed = cfg.gripper_open, cfg.gripper_closed
+        if schema is not None:
+            dyn_closed, dyn_open = units.resolve_schema_gripper_bounds(
+                getattr(schema, "gripper_policy", None),
+                getattr(schema, "limits", None),
+                gripper_joint,
+            )
+        else:
+            dyn_closed, dyn_open = GRIPPER_CLOSED, GRIPPER_OPEN
+
+        opened = dyn_open if cfg.gripper_open is None else float(cfg.gripper_open)
+        closed = dyn_closed if cfg.gripper_closed is None else float(cfg.gripper_closed)
 
         def execute(s: ArmSession) -> None:
             obs = s.latest_observation() or s.wait_for_observation()

@@ -55,6 +55,8 @@ from rebot import _ws
 from rebot._http import host_url
 from rebot.client import ArmStatus
 
+from . import units
+
 log = logging.getLogger(__name__)
 
 CODEBASE_VERSION = "v3.0"
@@ -76,6 +78,7 @@ EXTRAS = {"velocity": ("observation.velocity", "velocities"), "effort": ("observ
 ARMD_PORT = 8765
 CAMERA_PORT = 8001
 STATS_IMAGE_EVERY_S = 0.5  # one camera frame per 0.5 s goes into the image stats
+_SCHEMA_RETRY_COOLDOWN_S = 5.0
 
 
 class RecorderError(RuntimeError):
@@ -511,6 +514,7 @@ class LeRobotRecorder:
         frame_source: Any = None,
         connect_timeout: float = 5.0,
         with_camera: bool | None = None,
+        unit_mode: str = "rad",
     ) -> None:
         self.root = Path(root)
         if self.root.exists() and any(self.root.iterdir()):
@@ -529,7 +533,21 @@ class LeRobotRecorder:
         self.video = video or VideoSettings()
         self.robot_type = robot_type
         self.joint_names = list(joint_names)
+        self._custom_joint_names = list(joint_names) != list(JOINT_NAMES)
         self.connect_timeout = connect_timeout
+        if unit_mode == "auto" or unit_mode not in ("rad", "so101_norm", "deg"):
+            raise ValueError(f"unit_mode must be one of ('rad', 'so101_norm', 'deg'), got {unit_mode!r}")
+        self.unit_mode = unit_mode
+        self.armd_host = armd_host
+        self.schema = None
+        self.profile_id: str | None = None
+        self.arm_dof: int | None = None
+        self.gripper_joint: int | None = None
+        self.limits: list[Any] | None = None
+        self.closed_rad: float | None = None
+        self.open_rad: float | None = None
+        self._schema_fetched = False
+        self._last_schema_fetch_attempt: float | None = None
         if obs_source is None and armd_host is not None:
             obs_source = ObservationStream(armd_host, obs_hz=obs_hz or self.fps * 2, connect_timeout=connect_timeout)
         if frame_source is None and camera_url is not None:
@@ -557,10 +575,63 @@ class LeRobotRecorder:
 
     # ---- lifecycle -------------------------------------------------------------
 
+    def _fetch_schema(self) -> None:
+        if self._schema_fetched or self.armd_host is None:
+            return
+        now = time.monotonic()
+        if self._last_schema_fetch_attempt is not None and now - self._last_schema_fetch_attempt < _SCHEMA_RETRY_COOLDOWN_S:
+            return
+        try:
+            from rebot.client import ArmdClient
+
+            try:
+                client = ArmdClient(armd_url(self.armd_host), timeout_sec=min(1.0, self.connect_timeout))
+            except TypeError:
+                client = ArmdClient(armd_url(self.armd_host))
+            schema = client.get_schema()
+            if self.unit_mode != "rad":
+                if not schema.limits:
+                    raise RecorderError(
+                        f"armd schema joint limits required for non-radian unit_mode {self.unit_mode!r}"
+                    )
+                if schema.dof == 6 and schema.arm_dof is None and schema.gripper_joint is None:
+                    raise RecorderError(
+                        f"ambiguous 6-DOF schema missing arm_dof and gripper_joint for unit_mode {self.unit_mode!r}"
+                    )
+                if self.unit_mode == "so101_norm" and schema.gripper_joint is None:
+                    if not (schema.arm_dof in (6, 7) and schema.arm_dof == schema.dof):
+                        raise RecorderError(
+                            f"armd schema gripper_joint required for unit_mode {self.unit_mode!r} "
+                            f"(arm_dof={schema.arm_dof}, dof={schema.dof})"
+                        )
+            self.schema = schema
+            self.profile_id = schema.profile_id
+            self.arm_dof = schema.arm_dof
+            self.gripper_joint = schema.gripper_joint
+            self.limits = schema.limits
+            if schema.joint_names and not self._custom_joint_names:
+                self.joint_names = list(schema.joint_names)
+            if self.gripper_joint is not None:
+                self.closed_rad, self.open_rad = units.resolve_schema_gripper_bounds(
+                    schema.gripper_policy, schema.limits, self.gripper_joint
+                )
+            self._schema_fetched = True
+        except Exception as exc:
+            if isinstance(exc, RecorderError):
+                raise
+            if self.unit_mode != "rad":
+                raise RecorderError(
+                    f"failed to fetch schema from armd at {self.armd_host} for unit_mode {self.unit_mode!r}: {exc}"
+                ) from exc
+            log.info("schema fetch skipped or unavailable: %s", exc)
+        finally:
+            self._last_schema_fetch_attempt = time.monotonic()
+
     def open(self) -> LeRobotRecorder:
         """Start the sources and wait for the first observation / camera frame."""
         if self._opened:
             return self
+        self._fetch_schema()
         started = []
         try:
             for src in (self.obs_source, self.frame_source):
@@ -618,6 +689,8 @@ class LeRobotRecorder:
             raise RecorderError("sampling needs an observation source")
         if sample and not self._opened:
             self.open()
+        elif not self._schema_fetched:
+            self._fetch_schema()
         tmp = self.root / ".recording" / f"ep-{len(self._episodes):06d}"
         shutil.rmtree(tmp, ignore_errors=True)
         tmp.mkdir(parents=True)
@@ -649,8 +722,42 @@ class LeRobotRecorder:
         i = len(ep.state)
         if i == 0:
             self._dof = len(state)
+            if self.schema is None and self._dof == 7:
+                if self.arm_dof is None:
+                    self.arm_dof = 6
+                if self.gripper_joint is None:
+                    self.gripper_joint = 6
         if len(state) != self._dof or len(action) != self._dof:
             raise ValueError(f"state and action need {self._dof} values")
+
+        if self.unit_mode != "rad":
+            if not self.limits or len(self.limits) != len(state):
+                raise RuntimeError(
+                    f"unit_mode {self.unit_mode!r} requires joint limits matching state dim {len(state)}, "
+                    f"got limits={self.limits}"
+                )
+            if self.unit_mode == "so101_norm" and self.gripper_joint is None:
+                if not (self.schema is not None and self.arm_dof in (6, 7) and self.arm_dof == self._dof):
+                    raise RuntimeError(
+                        f"unit_mode {self.unit_mode!r} requires gripper_joint to be set"
+                    )
+            state = units.from_armd(
+                state,
+                self.unit_mode,
+                limits=self.limits,
+                gripper_joint=self.gripper_joint,
+                closed_rad=self.closed_rad,
+                open_rad=self.open_rad,
+            )
+            action = units.from_armd(
+                action,
+                self.unit_mode,
+                limits=self.limits,
+                gripper_joint=self.gripper_joint,
+                closed_rad=self.closed_rad,
+                open_rad=self.open_rad,
+            )
+
         ep.state.append([float(x) for x in state])
         ep.action.append([float(x) for x in action])
         for name, values in (("velocity", velocity), ("effort", effort)):
@@ -730,7 +837,15 @@ class LeRobotRecorder:
                 arr = pa.array(values)
             arrays.append(arr)
             fields.append(pa.field(key, arr.type))
-        hf = {"info": {"features": {k: _hf_feature(features[k]) for k in columns}}}
+        hf = {
+            "info": {
+                "features": {k: _hf_feature(features[k]) for k in columns},
+                "unit_mode": self.unit_mode,
+                "profile_id": self.profile_id,
+                "arm_dof": self.arm_dof,
+                "gripper_joint": self.gripper_joint,
+            }
+        }
         schema = pa.schema(fields, metadata={"huggingface": json.dumps(hf)})
         data_path = self.root / DATA_PATH.format(chunk_index=chunk, file_index=file)
         data_path.parent.mkdir(parents=True, exist_ok=True)
@@ -864,7 +979,14 @@ class LeRobotRecorder:
 
     def _features(self) -> dict[str, dict]:
         dof = getattr(self, "_dof", len(self.joint_names))
-        names = self.joint_names if len(self.joint_names) == dof else [f"joint_{i + 1}" for i in range(dof)]
+        if self._custom_joint_names and len(self.joint_names) == dof:
+            names = list(self.joint_names)
+        elif self.schema is not None and self.schema.joint_names and len(self.schema.joint_names) == dof:
+            names = list(self.schema.joint_names)
+        elif len(self.joint_names) == dof:
+            names = list(self.joint_names)
+        else:
+            names = [f"joint_{i + 1}" for i in range(dof)]
         feats: dict[str, dict] = {
             "observation.state": {"dtype": "float32", "shape": [dof], "names": list(names)},
             "action": {"dtype": "float32", "shape": [dof], "names": list(names)},
@@ -912,7 +1034,18 @@ class LeRobotRecorder:
             "video_path": VIDEO_PATH if self.has_video else None,
             "robot_type": self.robot_type,
             "splits": {"train": f"0:{len(self._episodes)}"},
+            "unit_mode": self.unit_mode,
+            "rebot_unit_mode": self.unit_mode,
+            "profile_id": self.profile_id,
+            "arm_dof": self.arm_dof,
+            "gripper_joint": self.gripper_joint,
         }
+        if self.limits:
+            info["normalization_bounds"] = {
+                "limits": [[float(l.min_position), float(l.max_position)] for l in self.limits],
+                "closed_rad": self.closed_rad,
+                "open_rad": self.open_rad,
+            }
         _write_json(meta / "info.json", info)
         _write_json(meta / "stats.json", _jsonable(aggregate_stats(self._stats)))
         pq.write_table(pa.Table.from_pylist(self._episodes), self.root / EPISODES_PATH)
@@ -1052,6 +1185,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--camera-key", default="observation.images.recamera")
     p.add_argument("--image-size", help="resize video to WxH (default: camera size)")
     p.add_argument("--vcodec", default="auto", help="auto (libsvtav1 if available, else h264), libsvtav1, h264")
+    p.add_argument(
+        "--unit-mode",
+        choices=["rad", "so101_norm", "deg"],
+        default="rad",
+        help="unit mode for state/action: rad (default, passthrough), so101_norm ([-100, 100], gripper [0, 100] normalized to armd limits), deg",
+    )
     p.add_argument("--no-prompt", action="store_true", help="start/save episodes without waiting for Enter")
     p.add_argument("--reset-s", type=float, default=0.0, help="pause between episodes with --no-prompt")
     args = p.parse_args(argv)
@@ -1071,6 +1210,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             extras=[e for e in args.extras.split(",") if e],
             image_size=size,
             video=VideoSettings(vcodec=args.vcodec),
+            unit_mode=args.unit_mode,
         )
         print(f"connecting to armd {args.armd}" + ("" if args.no_camera else f" and camera {args.camera}") + " ...")
         rec.open()
@@ -1104,6 +1244,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"{rec.num_episodes} episode(s) in {root}")
     return 0
 
+
+Recorder = LeRobotRecorder
 
 if __name__ == "__main__":
     sys.exit(main())

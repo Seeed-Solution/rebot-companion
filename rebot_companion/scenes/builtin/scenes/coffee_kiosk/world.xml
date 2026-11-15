@@ -1,0 +1,54 @@
+<mujoco model="coffee_kiosk_world">
+  <worldbody>
+    <!-- Customer pickup counter zone mat -->
+    <geom name="pickup_mat" type="box" pos="0.25 -0.16 0.001" size="0.065 0.065 0.001"
+          rgba="0.16 0.45 0.65 1" contype="0" conaffinity="0"/>
+
+    <!-- Espresso machine body anchored on the worktable (z = 0) -->
+    <body name="espresso_machine" pos="0.41 0.10 0">
+      <geom name="espresso_column" type="box" pos="0 0 0.12" size="0.04 0.065 0.12"
+            rgba="0.22 0.24 0.28 1"/>
+      <geom name="espresso_head" type="box" pos="-0.055 0 0.155" size="0.045 0.050 0.025"
+            rgba="0.28 0.30 0.35 1"/>
+      <geom name="espresso_spout" type="cylinder" pos="-0.080 0 0.122" size="0.010 0.012"
+            rgba="0.68 0.70 0.74 1" contype="0" conaffinity="0"/>
+      <geom name="drip_tray" type="box" pos="-0.10 0 0.004" size="0.055 0.060 0.004"
+            rgba="0.15 0.16 0.18 1"/>
+      <geom name="brew_led" type="sphere" pos="-0.042 -0.035 0.155" size="0.008"
+            rgba="0.85 0.20 0.20 1" contype="0" conaffinity="0"/>
+    </body>
+
+    <!-- Spring-loaded microswitch pedestal in front of espresso column -->
+    <body name="button_pedestal" pos="0.25 0.17 0">
+      <geom name="btn_post" type="box" pos="0 0 0.040" size="0.030 0.030 0.040"
+            rgba="0.24 0.26 0.30 1"/>
+      <geom name="btn_housing" type="box" pos="0 0 0.088" size="0.024 0.024 0.008"
+            rgba="0.14 0.15 0.18 1"/>
+      <body name="brew_button" pos="0 0 0.097">
+        <joint name="brew_btn_joint" type="slide" axis="0 0 1" range="-0.014 0.0"
+               stiffness="350" damping="18" springref="0.0"/>
+        <inertial pos="0 0 0" mass="0.05" diaginertia="1e-5 1e-5 1e-5"/>
+        <geom name="brew_btn_cap" type="cylinder" size="0.020 0.007" pos="0 0 0"
+              rgba="0.90 0.35 0.15 1"/>
+      </body>
+    </body>
+
+    <!-- Paper espresso cup (48 mm diameter, 70 mm tall) -->
+    <body name="cup" pos="0.27 -0.10 0.035">
+      <freejoint name="cup_joint"/>
+      <inertial pos="0 0 -0.005" mass="0.09" diaginertia="3e-5 3e-5 3e-5"/>
+      <geom name="cup" type="cylinder" size="0.024 0.035" rgba="0.95 0.94 0.90 1"
+            friction="1.4 0.01 0.001" condim="4"/>
+      <geom name="coffee_top" type="cylinder" size="0.020 0.0015" pos="0 0 0.0345"
+            rgba="0.22 0.12 0.07 1" contype="0" conaffinity="0"/>
+    </body>
+
+    <!-- Coffee capsule -->
+    <body name="pod" pos="0.23 -0.19 0.015">
+      <freejoint name="pod_joint"/>
+      <inertial pos="0 0 0" mass="0.025" diaginertia="5e-6 5e-6 5e-6"/>
+      <geom name="pod" type="cylinder" size="0.016 0.015" rgba="0.32 0.18 0.10 1"
+            friction="1.2 0.01 0.001" condim="4"/>
+    </body>
+  </worldbody>
+</mujoco>

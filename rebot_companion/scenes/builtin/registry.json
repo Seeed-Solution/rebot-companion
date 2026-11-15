@@ -1,0 +1,59 @@
+{
+  "version": 1,
+  "scenes": [
+    {
+      "id": "coffee_kiosk",
+      "name": "Mobile Coffee Kiosk",
+      "description": "4-stage coffee workflow: detect/grasp cup, place under spout avoiding espresso column, press spring brew button, serve at pickup counter.",
+      "robots": ["b601dm"],
+      "default_tool": "default",
+      "recommended_tools": ["default", "wide_cup_gripper"]
+    },
+    {
+      "id": "pcb_suction",
+      "name": "PCB Pick-and-Place & Test Cell",
+      "description": "3-stage PCB workflow with suction end-effector: vacuum-pick PCB from infeed tray over divider wall, place on test fixture, then transfer to outfeed bin.",
+      "robots": ["b601dm"],
+      "default_tool": "suction",
+      "recommended_tools": ["suction", "default"]
+    },
+    {
+      "id": "pcb_inspection",
+      "name": "PCB AOI & Sorting Cell",
+      "description": "4-stage AOI continuity test fixture and Pass/NG sorting cell with dual bins and divider keepouts.",
+      "robots": ["b601dm"],
+      "default_tool": "suction",
+      "recommended_tools": ["suction", "screwdriver", "default"]
+    }
+  ],
+  "tools": [
+    {
+      "id": "default",
+      "name": "Stock Parallel Jaw Gripper",
+      "kind": "gripper",
+      "description": "Factory parallel gripper shipped with B601-DM or SO-ARM101.",
+      "robots": ["b601dm", "so-arm101"]
+    },
+    {
+      "id": "wide_cup_gripper",
+      "name": "Wide Silicone Cup Gripper",
+      "kind": "gripper",
+      "description": "Tall high-friction silicone parallel jaws tuned for 48 mm paper coffee cups.",
+      "robots": ["b601dm"]
+    },
+    {
+      "id": "suction",
+      "name": "Vacuum Suction End-Effector",
+      "kind": "suction",
+      "description": "Flat vacuum cup with runtime mjEQ_WELD suction controlled via /sim/io {vacuum: true|false}.",
+      "robots": ["b601dm"]
+    },
+    {
+      "id": "screwdriver",
+      "name": "Spindle Electric Screwdriver",
+      "kind": "screwdriver",
+      "description": "Rotating electric screwdriver spindle controlled via /sim/io {spindle_rpm: ...}.",
+      "robots": ["b601dm"]
+    }
+  ]
+}

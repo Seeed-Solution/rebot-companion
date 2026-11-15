@@ -1,0 +1,23 @@
+{
+  "id": "wide_cup_gripper",
+  "name": "Wide Silicone Cup Gripper",
+  "kind": "gripper",
+  "version": "1.0.0",
+  "description": "Tall high-friction silicone parallel jaws tuned for 48 mm paper coffee cups.",
+  "tool_xml": "tool.xml",
+  "robots": ["b601dm"],
+  "attach_body": "end_link",
+  "replace_bodies": ["finger_left", "finger_right"],
+  "replace_geoms": ["palm", "motor_housing"],
+  "replace_equalities": ["jaw_coupling"],
+  "replace_actuators": ["m7"],
+  "driven_joint": "cup_jaw_left",
+  "coupled_joint": "cup_jaw_right",
+  "actuator": "m7_cup",
+  "motor_to_joint_scale": -0.007456140350877194,
+  "finger_geoms": ["cup_pad_left", "cup_pad_right"],
+  "tcp_site": "tcp",
+  "tcp_offset": [0.0, 0.0, 0.0],
+  "io": [],
+  "assets": []
+}

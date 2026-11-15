@@ -364,14 +364,29 @@ class Arm:
         rpy: Optional[Sequence[float]] = None,
         speed: Optional[float] = None,
         timeout: Optional[float] = None,
+        auto_yaw: Optional[bool] = None,
     ) -> ActionResult:
         """Straight-line move of the gripper to ``xyz`` (metres, arm base frame: x forward, y left, z up).
 
         ``rpy``: orientation in radians (roll, pitch, yaw); None keeps the current one.
         ``speed``: m/s (armd default 0.05).
+        ``auto_yaw``: when True on 5-DOF arms (orient_dof=2), armd solves yaw from position.
         """
+        if auto_yaw is not None and not isinstance(auto_yaw, bool):
+            raise ValueError(f"auto_yaw must be bool or None, got {type(auto_yaw).__name__}: {auto_yaw!r}")
+        caps = getattr(getattr(self, "schema", None), "capabilities", None) or {}
+        has_auto_yaw_cap = caps.get("auto_yaw") is True
+        if auto_yaw is True:
+            if not has_auto_yaw_cap:
+                raise UnsupportedError(
+                    "armd does not advertise auto_yaw capability",
+                    code="UNSUPPORTED",
+                )
+        elif auto_yaw is False:
+            if not has_auto_yaw_cap:
+                auto_yaw = None
         return self._motion(
-            lambda: self.session.move_pose(xyz, rpy=rpy, linear_speed=speed, timeout=timeout),
+            lambda: self.session.move_pose(xyz, rpy=rpy, linear_speed=speed, timeout=timeout, auto_yaw=auto_yaw),
             f"target {_fmt(xyz)}",
             timeout,
         )
@@ -428,6 +443,20 @@ class Arm:
         Closes the jaws until stall to measure the zero offset.
         Returns an ActionResult with stop_rad, offset_rad, and pass_ (or .passed).
         """
+        schema = getattr(self.session, "_schema", None)
+        if schema is None and hasattr(self.session, "schema"):
+            try:
+                schema = self.session.schema()
+            except Exception:
+                schema = None
+        if schema is not None:
+            caps = getattr(schema, "capabilities", None) or {}
+            policy = getattr(schema, "gripper_policy", None) or {}
+            if caps.get("gripper_zero") is False or policy.get("zero_check_supported") is False:
+                raise UnsupportedError(
+                    "gripper mechanical zero check is not supported on this arm",
+                    code="UNSUPPORTED",
+                )
         return self._motion(
             lambda: self.session.gripper_zero_check(
                 store_offset=store_offset,

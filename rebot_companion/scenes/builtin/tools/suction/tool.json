@@ -1,0 +1,36 @@
+{
+  "id": "suction",
+  "name": "Vacuum Suction End-Effector",
+  "kind": "suction",
+  "version": "1.0.0",
+  "description": "Flat vacuum cup with runtime mjEQ_WELD suction controlled via /sim/io {vacuum: true|false}.",
+  "tool_xml": "tool.xml",
+  "robots": ["b601dm"],
+  "attach_body": "end_link",
+  "replace_bodies": ["finger_left", "finger_right"],
+  "replace_geoms": ["palm", "motor_housing"],
+  "replace_equalities": ["jaw_coupling"],
+  "replace_actuators": ["m7"],
+  "driven_joint": "suction_valve",
+  "coupled_joint": null,
+  "actuator": "m7_suction",
+  "motor_to_joint_scale": -0.007456140350877194,
+  "finger_geoms": [],
+  "tcp_site": "tcp",
+  "tcp_offset": [0.0, 0.0, 0.0],
+  "io": [
+    {
+      "name": "vacuum",
+      "kind": "bool",
+      "direction": "output",
+      "default": false
+    },
+    {
+      "name": "vacuum_engaged",
+      "kind": "bool",
+      "direction": "input",
+      "default": false
+    }
+  ],
+  "assets": []
+}

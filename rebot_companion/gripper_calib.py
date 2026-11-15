@@ -161,8 +161,30 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"Connecting to armd at {url}...")
 
     # Step 1: Connect and show current calibration & observation.gripper_zero
+    client = ArmdClient(url)
     try:
-        client = ArmdClient(url)
+        schema = client.get_schema()
+    except Exception as exc:
+        print(f"\nCould not fetch schema from armd: {exc}")
+        return 1
+
+    if schema.capabilities.get("gripper") is False or schema.gripper_joint is None:
+        print(
+            f"\nError: arm reports no gripper (capabilities.gripper={schema.capabilities.get('gripper')}, "
+            f"gripper_joint={schema.gripper_joint}). Aborting."
+        )
+        return 1
+
+    gripper_joint = schema.gripper_joint
+    policy = schema.gripper_policy or {}
+    if policy.get("zero_check_supported") is False or schema.capabilities.get("gripper_zero") is False:
+        zero_check_supported = False
+    else:
+        zero_check_supported = bool(
+            policy.get("zero_check_supported", False) or schema.capabilities.get("gripper_zero") is True
+        )
+
+    try:
         calib = client.get_gripper_calibration()
         print("\nCurrent calibration (GET /api/v1/gripper/calibration):")
         print(json.dumps(calib, indent=2))
@@ -192,47 +214,54 @@ def main(argv: Sequence[str] | None = None) -> int:
     with Arm(host=args.host, enable=True) as arm:
         # Step 3: Zero check
         print("\n--- Step 1: Gripper zero check ---")
-        print("Running mechanical zero check (empty jaws)...")
-        res = arm.gripper_zero_check(store_offset=False, threshold_rad=0.10)
-        stop_rad = res.stop_rad
-        offset_rad = res.offset_rad
-        is_pass = res.passed
-        print(f"Zero check result: stop_rad={stop_rad:.4f} rad, offset_rad={offset_rad:.4f} rad, pass={is_pass}")
+        if zero_check_supported:
+            print("Running mechanical zero check (empty jaws)...")
+            res = arm.gripper_zero_check(store_offset=False, threshold_rad=0.10)
+            stop_rad = res.stop_rad
+            offset_rad = res.offset_rad
+            is_pass = res.passed
+            print(f"Zero check result: stop_rad={stop_rad:.4f} rad, offset_rad={offset_rad:.4f} rad, pass={is_pass}")
 
-        if not is_pass:
+            if not is_pass:
+                print(
+                    "WARNING: the offset exceeds 0.10 rad. Check the jaws for debris and the gripper mounting"
+                    " before storing it; armd refuses offsets beyond 0.5 rad."
+                )
+            ans = input("Store this offset? [y/N]: ").strip().lower()
+            if ans in ("y", "yes"):
+                chosen_offset = offset_rad
+                if args.dry_run:
+                    print("[dry-run] Skipping offset write.")
+                else:
+                    print(f"Storing offset {offset_rad:.4f} rad...")
+                    arm.set_gripper_calibration(offset_rad=chosen_offset)
+                    print("Offset stored.")
+        else:
             print(
-                "WARNING: the offset exceeds 0.10 rad. Check the jaws for debris and the gripper mounting"
-                " before storing it; armd refuses offsets beyond 0.5 rad."
+                "Mechanical zero check is not supported on this arm model (zero_check_supported=False). "
+                "Skipping to jaw opening calibration."
             )
-        ans = input("Store this offset? [y/N]: ").strip().lower()
-        if ans in ("y", "yes"):
-            chosen_offset = offset_rad
-            if args.dry_run:
-                print("[dry-run] Skipping offset write.")
-            else:
-                print(f"Storing offset {offset_rad:.4f} rad...")
-                arm.set_gripper_calibration(offset_rad=chosen_offset)
-                print("Offset stored.")
 
         # Step 4: Opening table
         print("\n--- Step 2: Jaw opening calibration ---")
         fractions = compute_fractions(args.points)
         raw_points: list[list[float]] = []
+        j_name = f"J{gripper_joint + 1}"
 
         for i, frac in enumerate(fractions):
             print(f"\nMoving gripper to fraction {frac:.2f} ({i + 1}/{len(fractions)})...")
             arm.gripper_move(frac)
             time.sleep(0.5)
             st = arm.state()
-            j7_rad = st.positions[6]
-            print(f"Position reached. Measured J7 = {j7_rad:.4f} rad")
+            gj_rad = st.positions[gripper_joint]
+            print(f"Position reached. Measured {j_name} = {gj_rad:.4f} rad")
             while True:
                 prompt = input("Caliper opening at the jaw tips in mm [number / s (skip) / q (abort)]: ").strip()
                 status, val_mm = parse_caliper_input(prompt)
                 if status == "ok":
                     assert val_mm is not None
                     opening_m = val_mm / 1000.0
-                    raw_points.append([j7_rad, opening_m])
+                    raw_points.append([gj_rad, opening_m])
                     break
                 elif status == "skip":
                     print(f"Skipped fraction {frac:.2f}.")
@@ -261,13 +290,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 1
 
         print("\n=== Calibration Summary Table ===")
-        print(f"{'#':<3} {'J7 (rad)':<12} {'Measured (mm)':<15} {'Fitted (mm)':<15} {'Residual (mm)':<15}")
+        print(f"{'#':<3} {f'{j_name} (rad)':<12} {'Measured (mm)':<15} {'Fitted (mm)':<15} {'Residual (mm)':<15}")
         print("-" * 65)
         for idx, (p, r_mm) in enumerate(zip(sorted_points, fit["residuals_mm"])):
-            j7_v, w_m = p[0], p[1]
+            gj_v, w_m = p[0], p[1]
             w_meas_mm = w_m * 1000.0
-            w_fit_mm = (fit["slope"] * j7_v + fit["intercept"]) * 1000.0
-            print(f"{idx + 1:<3} {j7_v:<12.4f} {w_meas_mm:<15.2f} {w_fit_mm:<15.2f} {r_mm:<15.2f}")
+            w_fit_mm = (fit["slope"] * gj_v + fit["intercept"]) * 1000.0
+            print(f"{idx + 1:<3} {gj_v:<12.4f} {w_meas_mm:<15.2f} {w_fit_mm:<15.2f} {r_mm:<15.2f}")
 
         print(f"\nMax residual: {fit['max_residual_mm']:.2f} mm")
         if fit["warn_residual"]:

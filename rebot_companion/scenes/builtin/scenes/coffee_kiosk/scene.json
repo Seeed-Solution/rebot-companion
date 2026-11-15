@@ -1,0 +1,136 @@
+{
+  "id": "coffee_kiosk",
+  "name": "Mobile Coffee Kiosk",
+  "version": "1.0.0",
+  "description": "Mobile beverage kiosk cell: grasp a coffee cup, place it on the espresso drip tray without hitting the machine column, press the spring brew switch, and deliver to the customer pickup mat.",
+  "world_xml": "world.xml",
+  "robots": ["b601dm"],
+  "default_tool": "default",
+  "recommended_tools": ["default", "wide_cup_gripper"],
+  "objects": [
+    {
+      "name": "cup",
+      "body": "cup",
+      "geom": "cup",
+      "class_name": "cup",
+      "default_pos": [0.27, -0.10, 0.035],
+      "jitter_xy": 0.025
+    },
+    {
+      "name": "pod",
+      "body": "pod",
+      "geom": "pod",
+      "class_name": "pod",
+      "default_pos": [0.23, -0.19, 0.015],
+      "jitter_xy": 0.02
+    }
+  ],
+  "zones": {
+    "drip_tray": {
+      "center": [0.31, 0.10, 0.043],
+      "half_extents": [0.055, 0.06, 0.04]
+    },
+    "pickup_counter": {
+      "center": [0.25, -0.16, 0.035],
+      "half_extents": [0.065, 0.065, 0.04]
+    }
+  },
+  "io": [
+    {
+      "name": "brew_button_pressed",
+      "kind": "bool",
+      "direction": "input",
+      "description": "Physical spring switch state attached to brew_btn_joint"
+    },
+    {
+      "name": "brew_led",
+      "kind": "bool",
+      "direction": "output",
+      "default": false,
+      "description": "Brew indicator LED color (red off -> green active)"
+    }
+  ],
+  "task_stages": [
+    {
+      "id": "cup_grasped",
+      "type": "object_grasped",
+      "object": "cup",
+      "min_z": 0.055,
+      "latch": true
+    },
+    {
+      "id": "cup_on_tray",
+      "type": "object_in_zone",
+      "object": "cup",
+      "zone": "drip_tray",
+      "requires": ["cup_grasped"],
+      "latch": true
+    },
+    {
+      "id": "brew_pressed",
+      "type": "joint_threshold",
+      "joint": "brew_btn_joint",
+      "op": "<=",
+      "threshold": -0.005,
+      "indicator_geom": "brew_led",
+      "indicator_rgba": [0.15, 0.9, 0.35, 1.0],
+      "requires": ["cup_on_tray"],
+      "latch": true
+    },
+    {
+      "id": "cup_served",
+      "type": "object_in_zone",
+      "object": "cup",
+      "zone": "pickup_counter",
+      "requires": ["brew_pressed"],
+      "latch": true
+    }
+  ],
+  "poses": {
+    "scan": {
+      "xyz": [0.24, -0.10, 0.22],
+      "rpy": [0.0, 1.5707963, 0.0],
+      "note": "Overhead camera scan pose looking at cup pickup table"
+    },
+    "drip_approach": {
+      "xyz": [0.31, 0.10, 0.115],
+      "rpy": [0.0, 1.5707963, 0.0],
+      "note": "Clear of espresso_head overhang before lowering onto tray"
+    },
+    "drip_tray": {
+      "xyz": [0.31, 0.10, 0.048],
+      "rpy": [0.0, 1.5707963, 0.0]
+    },
+    "brew_above": {
+      "xyz": [0.25, 0.17, 0.145],
+      "rpy": [0.0, 1.5707963, 0.0]
+    },
+    "brew_press": {
+      "xyz": [0.25, 0.17, 0.094],
+      "rpy": [0.0, 1.5707963, 0.0],
+      "note": "Compresses spring brew_btn_joint below -0.005 m"
+    },
+    "pickup_approach": {
+      "xyz": [0.25, -0.16, 0.115],
+      "rpy": [0.0, 1.5707963, 0.0]
+    },
+    "pickup_counter": {
+      "xyz": [0.25, -0.16, 0.040],
+      "rpy": [0.0, 1.5707963, 0.0]
+    }
+  },
+  "keepout_boxes": [
+    {
+      "name": "espresso_column",
+      "min": [0.365, 0.03, 0.0],
+      "max": [0.46, 0.175, 0.25]
+    }
+  ],
+  "training": {
+    "recommended_approach": "hybrid_rules_and_vision_or_il",
+    "rules_stages": ["cup_on_tray", "brew_pressed", "cup_served"],
+    "vision_stages": ["cup_grasped"],
+    "il_notes": "Record diverse cup seeds with rebot-record or examples/scenes/coffee_kiosk/train_and_eval_demo.py to train ACT/Diffusion via rebot-policy."
+  },
+  "assets": []
+}

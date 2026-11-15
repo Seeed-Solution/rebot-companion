@@ -1,0 +1,30 @@
+{
+  "id": "screwdriver",
+  "name": "Spindle Electric Screwdriver",
+  "kind": "screwdriver",
+  "version": "1.0.0",
+  "description": "Rotating electric screwdriver spindle controlled via /sim/io {spindle_rpm: ...}.",
+  "tool_xml": "tool.xml",
+  "robots": ["b601dm"],
+  "attach_body": "end_link",
+  "replace_bodies": ["finger_left", "finger_right"],
+  "replace_geoms": ["palm", "motor_housing"],
+  "replace_equalities": ["jaw_coupling"],
+  "replace_actuators": ["m7"],
+  "driven_joint": "spindle_joint",
+  "coupled_joint": null,
+  "actuator": "m7_spindle",
+  "motor_to_joint_scale": 1.0,
+  "finger_geoms": [],
+  "tcp_site": "tcp",
+  "tcp_offset": [0.0, 0.0, 0.0],
+  "io": [
+    {
+      "name": "spindle_rpm",
+      "kind": "float",
+      "direction": "output",
+      "default": 0.0
+    }
+  ],
+  "assets": []
+}
