@@ -939,6 +939,7 @@ class PolicyRunner:
         sender_join_s: float = 2 * SEND_TIMEOUT_S,
         action_units: str = "auto",
         state_units: str = "auto",
+        override_unit_mode: bool = False,
         lerobot_calib: str | Path | None = None,
         io_sender: Any = None,
     ) -> None:
@@ -974,6 +975,7 @@ class PolicyRunner:
         self.connect_timeout = connect_timeout
         self.action_units_requested = action_units
         self.state_units_requested = state_units
+        self.override_unit_mode = bool(override_unit_mode)
         self.lerobot_calib = lerobot_calib
         if self.lerobot_calib is not None:
             if "deg" in (action_units, state_units):
@@ -1253,12 +1255,20 @@ class PolicyRunner:
                 meta_unit_str = str(meta_unit).strip()
                 if meta_unit_str:
                     if self.action_units_requested != "auto" and self.action_units_requested != meta_unit_str:
+                        if not self.override_unit_mode:
+                            raise RunnerError(
+                                f"explicit action_units {self.action_units_requested!r} conflicts with policy metadata unit_mode {meta_unit_str!r}; pass --override-unit-mode to force"
+                            )
                         log.warning(
                             "explicit action_units %r differs from policy metadata unit_mode %r",
                             self.action_units_requested,
                             meta_unit_str,
                         )
                     if self.state_units_requested != "auto" and self.state_units_requested != meta_unit_str:
+                        if not self.override_unit_mode:
+                            raise RunnerError(
+                                f"explicit state_units {self.state_units_requested!r} conflicts with policy metadata unit_mode {meta_unit_str!r}; pass --override-unit-mode to force"
+                            )
                         log.warning(
                             "explicit state_units %r differs from policy metadata unit_mode %r",
                             self.state_units_requested,
@@ -2040,6 +2050,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--lerobot-calib",
         help="path to LeRobot SO-100/SO-101 calibration JSON to align motor tick bounds for so101_norm",
     )
+    p.add_argument(
+        "--override-unit-mode",
+        action="store_true",
+        default=False,
+        help="allow explicit action_units / state_units to override policy metadata unit_mode",
+    )
     p.add_argument("--stall-s", type=float, default=1.0, help="stop when the policy gives no target for this long")
     p.add_argument("--max-frame-age", type=float, default=0.5, help="stop when the newest camera frame is older (s)")
     p.add_argument(
@@ -2102,6 +2118,7 @@ def _main(args: argparse.Namespace, handle: Any) -> int:
             log_path=args.log,
             action_units=args.action_units,
             state_units=args.state_units,
+            override_unit_mode=args.override_unit_mode,
             lerobot_calib=args.lerobot_calib,
         )
         print(

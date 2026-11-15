@@ -741,6 +741,7 @@ def _clamp_lead_and_step(
     Intersects [prev_val - max_step, prev_val + max_step], [ref_val - max_lead, ref_val + max_lead],
     and [j_min, j_max] if provided. Raises LeaderTeleopError if lead and step intervals are disjoint.
     """
+    converted: dict[str, float] = {}
     for name, v in (
         ("val", val),
         ("prev_val", prev_val),
@@ -748,14 +749,25 @@ def _clamp_lead_and_step(
         ("max_step", max_step),
         ("max_lead", max_lead),
     ):
+        if isinstance(v, bool):
+            raise LeaderTeleopError(f"{name} must be numeric, got {v!r}")
         try:
             vf = float(v)
         except (ValueError, TypeError) as exc:
             raise LeaderTeleopError(f"{name} must be numeric, got {v!r}") from exc
         if not math.isfinite(vf):
             raise LeaderTeleopError(f"{name} must be finite, got {v!r}")
+        converted[name] = vf
+
+    val = converted["val"]
+    prev_val = converted["prev_val"]
+    ref_val = converted["ref_val"]
+    max_step = converted["max_step"]
+    max_lead = converted["max_lead"]
 
     if j_min is not None:
+        if isinstance(j_min, bool):
+            raise LeaderTeleopError(f"j_min must be numeric, got {j_min!r}")
         try:
             jf_min = float(j_min)
         except (ValueError, TypeError) as exc:
@@ -765,6 +777,8 @@ def _clamp_lead_and_step(
         j_min = jf_min
 
     if j_max is not None:
+        if isinstance(j_max, bool):
+            raise LeaderTeleopError(f"j_max must be numeric, got {j_max!r}")
         try:
             jf_max = float(j_max)
         except (ValueError, TypeError) as exc:
@@ -795,11 +809,11 @@ def _clamp_lead_and_step(
 def _measured_ref(obs: Any) -> list[float]:
     """Extract reference positions preferring measured positions over commanded positions."""
     positions = getattr(obs, "positions", None)
-    if positions:
-        return list(positions)
+    if positions is not None and len(positions) > 0:
+        return [float(x) for x in positions]
     commanded = getattr(obs, "commanded_positions", None)
-    if commanded:
-        return list(commanded)
+    if commanded is not None and len(commanded) > 0:
+        return [float(x) for x in commanded]
     return []
 
 
@@ -952,6 +966,7 @@ class LeaderTeleopBridge:
         self._last_obs_timestamp: float | None = None
         self._last_obs_frames: int | None = None
         self._last_obs_time: float = time.monotonic()
+        self._transient_disjoint_counts = [0] * 6
 
     def _check_follower_healthy(self, obs: Any, *, require_torqued: bool = True) -> None:
         if obs is None:
@@ -1125,10 +1140,79 @@ class LeaderTeleopBridge:
         clamped = min(max(float(target_val), eff_lo), eff_hi)
         return float(clamped)
 
+    def _clamp_with_transient_droop_recovery(
+        self,
+        val: float,
+        prev_val: float,
+        ref_val: float,
+        max_step: float,
+        max_lead: float,
+        j_min: float | None = None,
+        j_max: float | None = None,
+        joint_index: int = 0,
+    ) -> float:
+        """Clamp joint target using _clamp_lead_and_step with bounded transient droop recovery."""
+        try:
+            clamped = _clamp_lead_and_step(
+                val,
+                prev_val,
+                ref_val,
+                max_step,
+                max_lead,
+                j_min=j_min,
+                j_max=j_max,
+                joint_index=joint_index,
+            )
+            if 0 <= joint_index < len(self._transient_disjoint_counts):
+                self._transient_disjoint_counts[joint_index] = 0
+            return clamped
+        except LeaderTeleopError:
+            lead_lo = float(ref_val) - float(max_lead)
+            lead_hi = float(ref_val) + float(max_lead)
+            if j_min is not None:
+                lead_lo = max(lead_lo, float(j_min))
+            if j_max is not None:
+                lead_hi = min(lead_hi, float(j_max))
+            if lead_lo > lead_hi + 1e-9:
+                raise
+
+            lead_nearest = min(max(float(prev_val), lead_lo), lead_hi)
+            gap_step = abs(lead_nearest - float(prev_val))
+            safe_jump_cap = min(0.25, max(3.0 * float(max_step), 0.06))
+
+            cur_count = (
+                self._transient_disjoint_counts[joint_index]
+                if 0 <= joint_index < len(self._transient_disjoint_counts)
+                else 0
+            )
+            if gap_step <= safe_jump_cap and cur_count < 5:
+                if 0 <= joint_index < len(self._transient_disjoint_counts):
+                    self._transient_disjoint_counts[joint_index] += 1
+                cur_count_display = (
+                    self._transient_disjoint_counts[joint_index]
+                    if 0 <= joint_index < len(self._transient_disjoint_counts)
+                    else 1
+                )
+                log.warning(
+                    "leader teleop: joint %d transient disjoint interval (gap=%.4f <= %.4f, count=%d/5); clamping to lead window",
+                    joint_index + 1,
+                    gap_step,
+                    safe_jump_cap,
+                    cur_count_display,
+                )
+                eff_lo = max(lead_lo, float(prev_val) - safe_jump_cap)
+                eff_hi = min(lead_hi, float(prev_val) + safe_jump_cap)
+                if eff_lo > eff_hi:
+                    return 0.5 * (eff_lo + eff_hi)
+                return min(max(float(val), eff_lo), eff_hi)
+
+            raise
+
     def align_and_ramp(self) -> None:
         """Verify alignment against the follower arm and perform a smooth quintic ramp-in."""
         if self._stop:
             return
+        self._transient_disjoint_counts = [0] * 6
 
         if self.schema.dof != 6 or self.schema.arm_dof not in (5, None) or self.schema.gripper_joint != 5:
             raise LeaderError(
@@ -1237,7 +1321,7 @@ class LeaderTeleopBridge:
                 if j != self.gripper_joint and j < 5:
                     max_step = v_cap * dt
                     j_min, j_max = self.limits[j] if j < len(self.limits) else (None, None)
-                    interp[j] = _clamp_lead_and_step(
+                    interp[j] = self._clamp_with_transient_droop_recovery(
                         interp[j],
                         prev_cmd[j],
                         ref[j],
@@ -1248,7 +1332,7 @@ class LeaderTeleopBridge:
                         joint_index=j,
                     )
             gj = self.gripper_joint if self.gripper_joint is not None else 5
-            if gj is not None and gj < len(interp) and gj < len(prev_cmd):
+            if gj < len(interp) and gj < len(prev_cmd):
                 interp[gj] = self._clamp_gripper_step_and_range(interp[gj], prev_cmd[gj])
             prev_cmd = list(interp)
             self.session.servo(interp)
@@ -1309,7 +1393,7 @@ class LeaderTeleopBridge:
                         if j != self.gripper_joint and j < 5:
                             max_step = v_cap * dt
                             j_min, j_max = self.limits[j] if j < len(self.limits) else (None, None)
-                            settle_cmd[j] = _clamp_lead_and_step(
+                            settle_cmd[j] = self._clamp_with_transient_droop_recovery(
                                 settle_cmd[j],
                                 prev_cmd[j],
                                 ref[j],
@@ -1320,7 +1404,7 @@ class LeaderTeleopBridge:
                                 joint_index=j,
                             )
                     gj = self.gripper_joint if self.gripper_joint is not None else 5
-                    if gj is not None and gj < len(settle_cmd) and gj < len(prev_cmd):
+                    if gj < len(settle_cmd) and gj < len(prev_cmd):
                         settle_cmd[gj] = self._clamp_gripper_step_and_range(settle_cmd[gj], prev_cmd[gj])
                     prev_cmd = list(settle_cmd)
                     self.session.servo(settle_cmd)
@@ -1339,6 +1423,7 @@ class LeaderTeleopBridge:
         """Stream servo frames continuously at fps."""
         self._error = None
         self._parked = False
+        self._transient_disjoint_counts = [0] * 6
         self.bus.disable_torque(self.calib.servo_ids)
         try:
             try:
@@ -1388,7 +1473,7 @@ class LeaderTeleopBridge:
                             v_cap_j = v_caps[j] if j < len(v_caps) else 0.6
                             v_run_j = 0.8 * v_cap_j
                             max_frame_step_j = min(0.30, v_run_j * dt)
-                            clamped_val = _clamp_lead_and_step(
+                            clamped_val = self._clamp_with_transient_droop_recovery(
                                 orig_val,
                                 prev[j],
                                 ref[j],
@@ -1403,7 +1488,7 @@ class LeaderTeleopBridge:
                             clamped_target[j] = clamped_val
 
                     gj = self.gripper_joint if self.gripper_joint is not None else 5
-                    if gj is not None and gj < len(clamped_target) and gj < len(prev):
+                    if gj < len(clamped_target) and gj < len(prev):
                         clamped_target[gj] = self._clamp_gripper_step_and_range(clamped_target[gj], prev[gj])
 
                     if saturated:

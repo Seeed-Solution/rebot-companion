@@ -3408,7 +3408,15 @@ def test_policy_runner_post_conversion_nan_guard():
     policy._inference_thread = None
     policy.async_infer = False
 
-    runner = PolicyRunner(mock_client, policy, action_units="so101_norm", state_units="so101_norm", fps=10, max_seconds=1.0)
+    runner = PolicyRunner(
+        mock_client,
+        policy,
+        action_units="so101_norm",
+        state_units="so101_norm",
+        override_unit_mode=True,
+        fps=10,
+        max_seconds=1.0,
+    )
     runner.dof = 6
     runner.action_units = "so101_norm"
     runner.limits = [(-2.0, 2.0)] * 6
@@ -4182,9 +4190,17 @@ def test_policy_runner_warns_on_unit_mode_metadata_mismatch(caplog):
     mock_policy.name = "mock_policy"
     mock_policy.info = {"unit_mode": "rad"}
 
-    with caplog.at_level(logging.WARNING):
+    # Default override_unit_mode=False raises RunnerError on conflict
+    with pytest.raises(RunnerError, match="conflicts with policy metadata unit_mode 'rad'"):
         runner = PolicyRunner(mock_client, mock_policy, action_units="deg", state_units="so101_norm")
         runner._read_arm()
+
+    # override_unit_mode=True logs warning cleanly and proceeds
+    with caplog.at_level(logging.WARNING):
+        runner_override = PolicyRunner(
+            mock_client, mock_policy, action_units="deg", state_units="so101_norm", override_unit_mode=True
+        )
+        runner_override._read_arm()
     assert "differs from policy metadata unit_mode" in caplog.text
 
 
@@ -4291,15 +4307,29 @@ def test_leader_teleop_gripper_clamp_across_phases():
 
 
 def test_client_finite_float_validation_and_null_handling():
-    from rebot.client import _vec, _put_speed, _safe_int, _safe_float, TcpPose, GripperStatus, ArmSession, UnsupportedError
+    from rebot.client import _vec, _put_speed, _req_int, _req_float, TcpPose, GripperStatus, ArmSession, UnsupportedError
 
-    # 1. _safe_int and _safe_float reject bool and non-finite floats
-    assert _safe_int(True, 42) == 42
-    assert _safe_int(False, 42) == 42
-    assert _safe_int(float("nan"), 42) == 42
-    assert _safe_int(float("inf"), 42) == 42
-    assert _safe_float(True, 3.14) == 3.14
-    assert _safe_float(float("nan"), 3.14) == 3.14
+    # 1. _req_int rejects bool, non-integer floats like 5.7, and non-finite floats
+    assert _req_int(5) == 5
+    assert _req_int(5.0) == 5
+    assert _req_int("5") == 5
+    with pytest.raises(ValueError, match="must be an integer"):
+        _req_int(5.7)
+    with pytest.raises(ValueError, match="must be an integer"):
+        _req_int("5.7")
+    with pytest.raises(ValueError, match="must be an integer"):
+        _req_int(True)
+    with pytest.raises(ValueError, match="must be an integer"):
+        _req_int(False)
+    with pytest.raises(ValueError, match="must be an integer"):
+        _req_int(float("nan"))
+    with pytest.raises(ValueError, match="must be an integer"):
+        _req_int(float("inf"))
+    assert _req_float(3.14) == 3.14
+    with pytest.raises(ValueError, match="must be a float"):
+        _req_float(True)
+    with pytest.raises(ValueError, match="must be finite"):
+        _req_float(float("nan"))
 
     # 2. _vec rejects NaN, Inf, and wrong length
     with pytest.raises(ValueError, match="must be finite"):
@@ -4549,3 +4579,284 @@ def test_arm_session_move_pose_auto_yaw_none_no_schema_fetch():
     s._last_schema_attempt = None
     s.move_pose([0.2, 0.0, 0.1], auto_yaw=None)
     mock_client.get_schema.assert_not_called()
+
+
+def test_clamp_lead_and_step_rejects_bool_and_accepts_converts():
+    from rebot_companion.leader_teleop import _clamp_lead_and_step, LeaderTeleopError
+
+    # Reject bool for all parameters
+    with pytest.raises(LeaderTeleopError, match="val must be numeric"):
+        _clamp_lead_and_step(True, 0.0, 0.0, 0.1, 0.1)
+    with pytest.raises(LeaderTeleopError, match="prev_val must be numeric"):
+        _clamp_lead_and_step(0.0, False, 0.0, 0.1, 0.1)
+    with pytest.raises(LeaderTeleopError, match="ref_val must be numeric"):
+        _clamp_lead_and_step(0.0, 0.0, True, 0.1, 0.1)
+    with pytest.raises(LeaderTeleopError, match="max_step must be numeric"):
+        _clamp_lead_and_step(0.0, 0.0, 0.0, True, 0.1)
+    with pytest.raises(LeaderTeleopError, match="max_lead must be numeric"):
+        _clamp_lead_and_step(0.0, 0.0, 0.0, 0.1, False)
+    with pytest.raises(LeaderTeleopError, match="j_min must be numeric"):
+        _clamp_lead_and_step(0.0, 0.0, 0.0, 0.1, 0.1, j_min=True)
+    with pytest.raises(LeaderTeleopError, match="j_max must be numeric"):
+        _clamp_lead_and_step(0.0, 0.0, 0.0, 0.1, 0.1, j_max=False)
+
+    # Valid string and int conversions return float
+    res = _clamp_lead_and_step("0.05", "0.0", 0, "0.1", "0.1", j_min="-0.5", j_max="0.5")
+    assert isinstance(res, float)
+    assert res == pytest.approx(0.05)
+
+
+def test_measured_ref_numpy_arrays_and_commanded():
+    import numpy as np
+    from rebot_companion.leader_teleop import _measured_ref
+
+    obs = MagicMock()
+    # 1. NumPy array in positions does not trigger ambiguous boolean evaluation
+    obs.positions = np.zeros(6)
+    obs.commanded_positions = np.ones(6)
+    assert _measured_ref(obs) == [0.0] * 6
+
+    # 2. When positions is None, prefers commanded_positions
+    obs.positions = None
+    assert _measured_ref(obs) == [1.0] * 6
+
+    # 3. When both are None or empty
+    obs.positions = None
+    obs.commanded_positions = []
+    assert _measured_ref(obs) == []
+
+
+def test_leader_teleop_transient_droop_recovery_and_fail_closed(caplog):
+    import logging
+    from rebot_companion.leader_teleop import LeaderTeleopBridge, LeaderTeleopError, LeaderCalibration
+
+    mock_bus = MagicMock()
+    mock_session = MagicMock()
+    mock_session.client = MagicMock()
+    mock_schema = ObservationSchema.from_dict({
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "limits": [
+            {"name": f"j{i}", "min_position": -2.0, "max_position": 2.0, "max_velocity": 1.0, "max_acceleration": 1.0}
+            for i in range(6)
+        ],
+        "gripper_policy": {"closed_rad": 0.0, "open_rad": 1.5},
+        "servo_max_lead_rad": 0.15,
+    })
+    calib = LeaderCalibration()
+    bridge = LeaderTeleopBridge(mock_bus, mock_session, mock_schema, calib=calib, follower="mock")
+
+    # Transient droop condition:
+    # prev_val=0.0, ref_val=0.22, max_step=0.05, max_lead=0.15
+    # step window [-0.05, 0.05], lead window [0.07, 0.37] -> disjoint!
+    # lead_nearest = 0.07, gap_step = 0.07. safe_jump_cap = min(0.25, max(0.15, 0.06)) = 0.15.
+    # gap_step (0.07) <= safe_jump_cap (0.15), so recovery is feasible.
+
+    # 1. Up to 5 consecutive transient droop frames recover with warning
+    with caplog.at_level(logging.WARNING):
+        for count in range(1, 6):
+            clamped = bridge._clamp_with_transient_droop_recovery(
+                0.0, prev_val=0.0, ref_val=0.22, max_step=0.05, max_lead=0.15, joint_index=0
+            )
+            assert 0.07 <= clamped <= 0.15
+            assert bridge._transient_disjoint_counts[0] == count
+
+    assert "transient disjoint interval" in caplog.text
+
+    # 2. On 6th consecutive frame (> 5), fails closed with LeaderTeleopError
+    with pytest.raises(LeaderTeleopError, match="disjoint lead and step intervals"):
+        bridge._clamp_with_transient_droop_recovery(
+            0.0, prev_val=0.0, ref_val=0.22, max_step=0.05, max_lead=0.15, joint_index=0
+        )
+
+    # 3. Successful frame resets counter to 0
+    clamped_ok = bridge._clamp_with_transient_droop_recovery(
+        0.02, prev_val=0.0, ref_val=0.05, max_step=0.05, max_lead=0.15, joint_index=0
+    )
+    assert clamped_ok == pytest.approx(0.02)
+    assert bridge._transient_disjoint_counts[0] == 0
+
+    # 4. Large discontinuity gap exceeding safe_jump_cap immediately fails closed
+    # ref_val=1.0 -> lead window [0.85, 1.15], gap_step = 0.85 > safe_jump_cap
+    with pytest.raises(LeaderTeleopError, match="disjoint lead and step intervals"):
+        bridge._clamp_with_transient_droop_recovery(
+            0.0, prev_val=0.0, ref_val=1.0, max_step=0.05, max_lead=0.15, joint_index=0
+        )
+
+
+def test_arm_session_servo_non_finite_ref_telemetry_jump_protection():
+    import threading
+    from rebot.errors import ServoJumpError
+
+    mock_client = MagicMock()
+    s = ArmSession(mock_client)
+    s._state = threading.Condition()
+    s._servo_error = None
+    s._last_servo = None
+    s._schema = ObservationSchema.from_dict({
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "limits": [
+            {"name": f"j{i}", "min_position": -2.0, "max_position": 2.0, "max_velocity": 1.0, "max_acceleration": 1.0}
+            for i in range(6)
+        ],
+    })
+    s._gripper_joint = 5
+    s._check_lease = MagicMock(return_value=1)
+    s._send = MagicMock()
+    s._epoch = 1
+    s.client_id = "test"
+
+    # 1. Target length does not match schema DOF
+    with pytest.raises(ValueError, match="does not match schema DOF"):
+        s.servo([0.0] * 5)
+
+    # 2. Non-finite telemetry reference does NOT bypass ServoJumpError
+    mock_obs = MagicMock()
+    mock_obs.positions = [0.0, float("nan"), 0.0, 0.0, 0.0, 0.0]
+    s.latest_observation = MagicMock(return_value=mock_obs)
+
+    with pytest.raises(ServoJumpError, match="is not finite"):
+        s.servo([0.0] * 6)
+
+
+def test_arm_move_to_schema_fallback_and_move_pose_schema_fetch_cooldown():
+    from rebot.arm import Arm
+    from rebot.client import ActionResult, ArmSession, UnsupportedError
+
+    # 1. Arm.move_to capability check fallback via session._schema
+    mock_session = MagicMock()
+    mock_session.is_open = True
+    mock_session._schema = ObservationSchema.from_dict({
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "capabilities": {"auto_yaw": True},
+        "limits": [
+            {"name": f"j{i}", "min_position": -2.0, "max_position": 2.0, "max_velocity": 1.0, "max_acceleration": 1.0}
+            for i in range(6)
+        ],
+    })
+    mock_session.move_pose.return_value = MagicMock(ok=True)
+    mock_arm = Arm.__new__(Arm)
+    mock_arm.session = mock_session
+    mock_arm.schema = None  # schema on Arm is None, should fall back to session._schema
+    mock_arm._motion = lambda fn, label, to=None: fn()
+    res = mock_arm.move_to([0.2, 0.0, 0.1], auto_yaw=True)
+    assert res.ok
+    mock_session.move_pose.assert_called_once()
+    assert mock_session.move_pose.call_args[1].get("auto_yaw") is True
+
+    # When fallback session._schema lacks auto_yaw, auto_yaw=True raises UnsupportedError
+    mock_session._schema = ObservationSchema.from_dict({
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "capabilities": {"auto_yaw": False},
+        "limits": [
+            {"name": f"j{i}", "min_position": -2.0, "max_position": 2.0, "max_velocity": 1.0, "max_acceleration": 1.0}
+            for i in range(6)
+        ],
+    })
+    with pytest.raises(UnsupportedError, match="does not advertise auto_yaw capability"):
+        mock_arm.move_to([0.2, 0.0, 0.1], auto_yaw=True)
+
+    # 2. ArmSession.move_pose with _schema=None triggers schema() obeying cooldown
+    session = ArmSession.__new__(ArmSession)
+    session._action = MagicMock()
+    session._schema = None
+    session._last_schema_attempt = None
+
+    def fake_schema(timeout=1.0):
+        session._schema = ObservationSchema.from_dict({
+            "dof": 6,
+            "arm_dof": 5,
+            "gripper_joint": 5,
+            "capabilities": {"auto_yaw": True},
+            "limits": [
+                {"name": f"j{i}", "min_position": -2.0, "max_position": 2.0, "max_velocity": 1.0, "max_acceleration": 1.0}
+                for i in range(6)
+            ],
+        })
+        session._last_schema_attempt = time.monotonic()
+        return session._schema
+
+    session.schema = MagicMock(side_effect=fake_schema)
+
+    session.move_pose([0.2, 0.0, 0.1], auto_yaw=True)
+    assert session.schema.call_count == 1
+    assert session._schema is not None
+
+    # Calling again immediately obeys cooldown
+    session._schema = None
+    session.move_pose([0.2, 0.0, 0.1], auto_yaw=False)
+    assert session.schema.call_count == 1
+
+
+def test_arm_status_from_dict_malformed_debug_log(caplog, monkeypatch):
+    import logging
+
+    monkeypatch.setenv("REBOT_DEBUG", "1")
+    with caplog.at_level(logging.DEBUG, logger="rebot"):
+        status_bad_tcp = ArmStatus.from_dict({"tcp": {"position": "invalid"}})
+        assert status_bad_tcp.tcp is None
+        assert "ignoring malformed tcp payload" in caplog.text
+
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG, logger="rebot"):
+        status_bad_grip = ArmStatus.from_dict({"gripper": {"joint": "not_an_int"}})
+        assert status_bad_grip.gripper is None
+        assert "ignoring malformed gripper payload" in caplog.text
+
+
+def test_units_homing_applied_in_hw_warning_and_gripper_center_branches(tmp_path: Path, caplog):
+    import json
+    import logging
+    from rebot_companion import units
+
+    joint_names = ("shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll")
+    calib_data = {
+        name: {"range_min": 1024, "range_max": 3072, "homing_offset": 0}
+        for name in joint_names
+    }
+    calib_data["gripper"] = {"range_min": 1500, "range_max": 2500, "homing_offset": 0}
+    calib_file = tmp_path / "calib_homing.json"
+    calib_file.write_text(json.dumps(calib_data), encoding="utf-8")
+
+    mock_schema = ObservationSchema.from_dict({
+        "dof": 6,
+        "arm_dof": 5,
+        "gripper_joint": 5,
+        "limits": [
+            {"name": f"j{i}", "min_position": -2.0, "max_position": 2.0, "max_velocity": 1.0, "max_acceleration": 1.0}
+            for i in range(6)
+        ],
+        "feetech_joints": [
+            {"zero_step": 2048, "homing_applied_in_hw": True, "homing_offset_steps": 100}
+            for _ in range(6)
+        ],
+    })
+
+    with caplog.at_level(logging.WARNING):
+        limits, closed, open_ = units.load_lerobot_norm_bounds(calib_file, schema=mock_schema)
+    assert "homing_applied_in_hw=True means EEPROM homing_offset cannot be cross-verified" in caplog.text
+
+    # Test gripper center and zero_step branches
+    calib_zero_step = {
+        name: {"range_min": 1024, "range_max": 3072, "center": 2048}
+        for name in joint_names
+    }
+    calib_zero_step["gripper"] = {"range_min": 1500, "range_max": 2500, "zero_step": 2048}
+    calib_file_zs = tmp_path / "calib_zs.json"
+    calib_file_zs.write_text(json.dumps(calib_zero_step), encoding="utf-8")
+    limits_zs, _, _ = units.load_lerobot_norm_bounds(calib_file_zs, schema=mock_schema)
+    assert len(limits_zs) == 6
+
+    calib_center = dict(calib_zero_step)
+    calib_center["gripper"] = {"range_min": 1500, "range_max": 2500, "center": 2048}
+    calib_file_c = tmp_path / "calib_c.json"
+    calib_file_c.write_text(json.dumps(calib_center), encoding="utf-8")
+    limits_c, _, _ = units.load_lerobot_norm_bounds(calib_file_c, schema=mock_schema)
+    assert len(limits_c) == 6

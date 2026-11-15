@@ -53,6 +53,8 @@ from typing import Any, Callable, Iterable, Optional, Sequence
 
 from . import _http, _ws
 from ._log import _log
+
+log = _log
 from .errors import (
     ActionFailed,
     ArmCommandRejected,
@@ -133,35 +135,14 @@ def _opt_float(v: Any) -> float | None:
         return None
 
 
-def _safe_float(v: Any, default: float = 0.0) -> float:
-    if v is None or isinstance(v, bool):
-        return default
-    try:
-        vf = float(v)
-        return vf if math.isfinite(vf) else default
-    except (ValueError, TypeError, OverflowError):
-        return default
-
-
-def _safe_int(v: Any, default: int = 0) -> int:
-    if v is None or isinstance(v, bool):
-        return default
-    try:
-        if isinstance(v, float):
-            if not math.isfinite(v):
-                return default
-        return int(v)
-    except (ValueError, TypeError, OverflowError):
-        return default
-
-
 def _req_int(v: Any, name: str = "value") -> int:
     if v is None or isinstance(v, bool):
         raise ValueError(f"{name} must be an integer, got {v!r}")
     try:
         if isinstance(v, float):
-            if not math.isfinite(v):
-                raise ValueError(f"{name} must be finite, got {v!r}")
+            if not (math.isfinite(v) and v.is_integer()):
+                raise ValueError(f"{name} must be an integer, got {v!r}")
+            return int(v)
         return int(v)
     except (ValueError, TypeError, OverflowError) as exc:
         raise ValueError(f"{name} must be an integer, got {v!r}") from exc
@@ -172,11 +153,11 @@ def _req_float(v: Any, name: str = "value") -> float:
         raise ValueError(f"{name} must be a float, got {v!r}")
     try:
         vf = float(v)
-        if not math.isfinite(vf):
-            raise ValueError(f"{name} must be finite, got {v!r}")
-        return vf
     except (ValueError, TypeError, OverflowError) as exc:
         raise ValueError(f"{name} must be a float, got {v!r}") from exc
+    if not math.isfinite(vf):
+        raise ValueError(f"{name} must be finite, got {v!r}")
+    return vf
 
 
 @dataclass
@@ -422,14 +403,16 @@ class ArmStatus:
         if isinstance(d.get("tcp"), dict):
             try:
                 tcp = TcpPose.from_dict(d["tcp"])
-            except (TypeError, ValueError):
+            except (TypeError, ValueError) as exc:
+                log.debug("ignoring malformed tcp payload: %s", exc)
                 tcp = None
 
         gripper = None
         if isinstance(d.get("gripper"), dict):
             try:
                 gripper = GripperStatus.from_dict(d["gripper"])
-            except (TypeError, ValueError):
+            except (TypeError, ValueError) as exc:
+                log.debug("ignoring malformed gripper payload: %s", exc)
                 gripper = None
 
         return cls(
@@ -1950,6 +1933,10 @@ class ArmSession:
             for i, (t, r) in enumerate(zip(target, ref)):
                 if gj is not None and i == gj:
                     continue
+                if not math.isfinite(r):
+                    raise ServoJumpError(
+                        f"servo reference position joint {i + 1} is not finite ({r!r}); cannot verify jump safety"
+                    )
                 if abs(t - r) > SERVO_MAX_STEP:
                     raise ServoJumpError(
                         f"servo frame joint {i + 1} steps {abs(t - r):.3f} rad (> {SERVO_MAX_STEP} rad) from the "

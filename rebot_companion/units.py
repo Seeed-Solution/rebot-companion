@@ -463,6 +463,11 @@ def load_lerobot_norm_bounds(
                         f"{name}: homing_offset mismatch between calibration JSON ({calib_ho}) and "
                         f"armd schema feetech_joints ({homing_offset_steps}) when homing_applied_in_hw=False"
                     )
+            elif homing_applied:
+                log.warning(
+                    "%s: homing_applied_in_hw=True means EEPROM homing_offset cannot be cross-verified against homing_offset_steps",
+                    name,
+                )
 
         if "zero_step" in entry or "center" in entry:
             raw_c = entry["zero_step"] if "zero_step" in entry else entry["center"]
@@ -548,6 +553,10 @@ def load_lerobot_norm_bounds(
                     f"gripper: homing_offset mismatch between calibration JSON ({g_calib_ho}) and "
                     f"armd schema feetech_joints ({g_homing_offset_steps}) when homing_applied_in_hw=False"
                 )
+        elif g_homing_applied:
+            log.warning(
+                "gripper: homing_applied_in_hw=True means EEPROM homing_offset cannot be cross-verified against homing_offset_steps"
+            )
 
     if "zero_step" in grip_entry or "center" in grip_entry:
         raw_gc = grip_entry.get("zero_step", grip_entry.get("center"))
