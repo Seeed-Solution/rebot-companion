@@ -158,6 +158,8 @@ class OnnxPolicyManifest:
     outputs: dict[str, dict[str, Any]] = field(default_factory=dict)
     normalization: dict[str, list[float]] = field(default_factory=dict)
     description: str = ""
+    action_space: str = "joint_positions"
+    image_y_up: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         """Convert manifest to a plain JSON-serializable dictionary."""
@@ -241,6 +243,8 @@ class OnnxPolicyManifest:
         validate_normalization_stats(normalization, state_dim=state_dim, action_dim=action_dim)
 
         description = str(data.get("description", ""))
+        action_space = str(data.get("action_space", "joint_positions"))
+        image_y_up = bool(data.get("image_y_up", False))
 
         return cls(
             format=fmt,
@@ -254,6 +258,8 @@ class OnnxPolicyManifest:
             outputs=outputs,
             normalization=normalization,
             description=description,
+            action_space=action_space,
+            image_y_up=image_y_up,
         )
 
     def save(self, path: str | Path) -> Path:
@@ -867,6 +873,218 @@ def scaffold_closed_loop_demo_policy(
         state_gain=state_gain,
         image_layout=layout_upper,
         image_hw=(h, w),
+    )
+    (dest / "model.onnx").write_bytes(onnx_bytes)
+    return dest
+
+
+def build_pcb_visual_servo_onnx_bytes(
+    image_input_name: str = "observation.images.policy_cam",
+    state_input_name: str = "observation.state",
+    output_name: str = "action",
+    action_dim: int = 7,
+    cam_pos: tuple[float, float, float] = (0.23, -0.14, 0.34),
+    fovy_deg: float = 45.0,
+    plane_z: float = 0.011,
+    image_hw: tuple[int, int] = (64, 64),
+    image_y_up: bool = False,
+    ir_version: int = 8,
+    opset_version: int = 13,
+) -> bytes:
+    """Build an opset-13 ONNX ModelProto computing spatial visual-servo target from policy_cam.
+
+    Computes:
+      1) Green-excess per-pixel mask via 1x1 Conv (W=[[-0.6, 1.0, -0.6]], B=[-0.06]) -> Relu -> Flatten -> [1, 4096].
+      2) Metric spatial coordinates from camera extrinsics:
+         d = cam_z - plane_z = 0.34 - 0.011 = 0.329 m.
+         S = d * tan(fovy / 2) = 0.13627638 m.
+         dx = (col - 31.5) / 32.0 * S.
+         dy = (31.5 - row) / 32.0 * S (when image_y_up is False).
+         Centroid = (sum(M * dx) / (sum(M) + eps), sum(M * dy) / (sum(M) + eps)).
+      3) Cartesian target [cam_x + dx, cam_y + dy, plane_z, 0, 0, 0, 1.0].
+      4) Adds state @ 0 to link observation.state without altering action.
+    """
+    h, w = int(image_hw[0]), int(image_hw[1])
+    n_pixels = h * w
+    cam_x, cam_y, cam_z = float(cam_pos[0]), float(cam_pos[1]), float(cam_pos[2])
+    d = cam_z - float(plane_z)
+    fovy_rad = math.radians(float(fovy_deg))
+    s_half = d * math.tan(fovy_rad / 2.0)
+
+    cols = np.tile(np.arange(w, dtype=np.float32), h)
+    rows = np.repeat(np.arange(h, dtype=np.float32), w)
+
+    half_w = float(w) / 2.0
+    half_h = float(h) / 2.0
+    dx_grid = ((cols - (half_w - 0.5)) / half_w * s_half).astype(np.float32)
+    if image_y_up:
+        dy_grid = ((rows - (half_h - 0.5)) / half_h * s_half).astype(np.float32)
+    else:
+        dy_grid = (((half_h - 0.5) - rows) / half_h * s_half).astype(np.float32)
+
+    w_uv = np.column_stack([dx_grid, dy_grid]).astype(np.float32)
+    w_ones = np.ones((n_pixels, 1), dtype=np.float32)
+
+    # Conv 1x1: W=[1, 3, 1, 1], B=[1]
+    w_conv = np.array([[[[-0.6]], [[1.0]], [[-0.6]]]], dtype=np.float32)
+    b_conv = np.array([-0.06], dtype=np.float32)
+
+    eps_val = np.array([[1e-6]], dtype=np.float32)
+
+    w_act = np.zeros((2, action_dim), dtype=np.float32)
+    w_act[0, 0] = 1.0
+    w_act[1, 1] = 1.0
+
+    b_act = np.zeros((action_dim,), dtype=np.float32)
+    b_act[0] = cam_x
+    b_act[1] = cam_y
+    if action_dim > 2:
+        b_act[2] = float(plane_z)
+    if action_dim > 6:
+        b_act[6] = 1.0  # vacuum tool activate
+
+    w_state = np.zeros((action_dim, action_dim), dtype=np.float32)
+
+    t_w_conv = _make_tensor("W_conv", w_conv)
+    t_b_conv = _make_tensor("B_conv", b_conv)
+    t_w_uv = _make_tensor("W_uv", w_uv)
+    t_w_ones = _make_tensor("W_ones", w_ones)
+    t_eps = _make_tensor("Eps", eps_val)
+    t_w_act = _make_tensor("W_act", w_act)
+    t_b_act = _make_tensor("B_act", b_act)
+    t_w_state = _make_tensor("W_state", w_state)
+
+    n_conv = _make_node("Conv", [image_input_name, "W_conv", "B_conv"], ["conv_out"], "n_conv")
+    n_relu = _make_node("Relu", ["conv_out"], ["relu_out"], "n_relu")
+    n_flat = _make_node("Flatten", ["relu_out"], ["M_flat"], "n_flat")
+
+    n_num = _make_node("MatMul", ["M_flat", "W_uv"], ["dxy_num"], "n_num")
+    n_den = _make_node("MatMul", ["M_flat", "W_ones"], ["den_raw"], "n_den")
+    n_den_eps = _make_node("Add", ["den_raw", "Eps"], ["den_safe"], "n_den_eps")
+    n_dxy = _make_node("Div", ["dxy_num", "den_safe"], ["dxy"], "n_dxy")
+
+    n_act_mm = _make_node("MatMul", ["dxy", "W_act"], ["act_xy_dim"], "n_act_mm")
+    n_act_base = _make_node("Add", ["act_xy_dim", "B_act"], ["act_base"], "n_act_base")
+
+    n_state_mm = _make_node("MatMul", [state_input_name, "W_state"], ["state_dummy"], "n_state_mm")
+    n_action = _make_node("Add", ["act_base", "state_dummy"], [output_name], "n_action")
+
+    vi_img = _make_value_info(image_input_name, 1, [1, 3, h, w])
+    vi_state = _make_value_info(state_input_name, 1, [1, action_dim])
+    vi_action = _make_value_info(output_name, 1, [1, action_dim])
+
+    graph_parts = [
+        _encode_message(1, n_conv),
+        _encode_message(1, n_relu),
+        _encode_message(1, n_flat),
+        _encode_message(1, n_num),
+        _encode_message(1, n_den),
+        _encode_message(1, n_den_eps),
+        _encode_message(1, n_dxy),
+        _encode_message(1, n_act_mm),
+        _encode_message(1, n_act_base),
+        _encode_message(1, n_state_mm),
+        _encode_message(1, n_action),
+        _encode_string(2, "pcb_visual_servo_graph"),
+        _encode_message(5, t_w_conv),
+        _encode_message(5, t_b_conv),
+        _encode_message(5, t_w_uv),
+        _encode_message(5, t_w_ones),
+        _encode_message(5, t_eps),
+        _encode_message(5, t_w_act),
+        _encode_message(5, t_b_act),
+        _encode_message(5, t_w_state),
+        _encode_message(11, vi_img),
+        _encode_message(11, vi_state),
+        _encode_message(12, vi_action),
+    ]
+    graph = b"".join(graph_parts)
+    opset = _encode_string(1, "") + _encode_int(2, opset_version)
+
+    return (
+        _encode_int(1, ir_version)
+        + _encode_string(2, "rebot-companion")
+        + _encode_message(7, graph)
+        + _encode_message(8, opset)
+    )
+
+
+def scaffold_pcb_visual_servo_policy(
+    target_dir: str | Path,
+    policy_id: str = "pcb_visual_servo",
+    action_dim: int = 7,
+    robot: str = "b601dm",
+    cam_pos: tuple[float, float, float] = (0.23, -0.14, 0.34),
+    fovy_deg: float = 45.0,
+    plane_z: float = 0.011,
+    image_hw: tuple[int, int] = (64, 64),
+    image_y_up: bool = False,
+    overwrite: bool = False,
+) -> Path:
+    """Scaffold a visual-servo policy estimating PCB world centroid from overhead camera."""
+    dest = Path(target_dir).resolve()
+    if dest.exists() and not overwrite:
+        raise FileExistsError(f"Target directory {dest} already exists and overwrite is False")
+
+    dest.mkdir(parents=True, exist_ok=True)
+
+    image_input_name = "observation.images.policy_cam"
+    state_input_name = "observation.state"
+    action_output_name = "action"
+
+    h, w = int(image_hw[0]), int(image_hw[1])
+    inputs: dict[str, dict[str, Any]] = {
+        "state": {
+            "name": state_input_name,
+            "shape": [1, action_dim],
+            "dtype": "float32",
+        },
+        "image": {
+            "name": image_input_name,
+            "shape": [1, 3, h, w],
+            "dtype": "float32",
+            "layout": "NCHW",
+            "scale": 1.0 / 255.0,
+            "mean": [0.0, 0.0, 0.0],
+            "std": [1.0, 1.0, 1.0],
+        },
+    }
+
+    outputs: dict[str, dict[str, Any]] = {
+        "action": {
+            "name": action_output_name,
+            "shape": [1, action_dim],
+            "dtype": "float32",
+        }
+    }
+
+    manifest = OnnxPolicyManifest(
+        format=ONNX_POLICY_FORMAT,
+        name=policy_id,
+        robot=robot,
+        fps=30,
+        action_dim=action_dim,
+        unit_mode="rad",
+        model_file="model.onnx",
+        inputs=inputs,
+        outputs=outputs,
+        normalization={},
+        description=f"Overhead visual servo policy {policy_id} for PCB centroid alignment",
+        action_space="cartesian_xy_target",
+        image_y_up=image_y_up,
+    )
+    manifest.save(dest / "policy.json")
+
+    onnx_bytes = build_pcb_visual_servo_onnx_bytes(
+        image_input_name=image_input_name,
+        state_input_name=state_input_name,
+        output_name=action_output_name,
+        action_dim=action_dim,
+        cam_pos=cam_pos,
+        fovy_deg=fovy_deg,
+        plane_z=plane_z,
+        image_hw=(h, w),
+        image_y_up=image_y_up,
     )
     (dest / "model.onnx").write_bytes(onnx_bytes)
     return dest
