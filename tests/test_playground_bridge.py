@@ -19,7 +19,6 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-import onnxruntime as ort
 import pytest
 import websockets.asyncio.client
 from websockets.asyncio.server import serve as ws_serve
@@ -127,6 +126,7 @@ def test_builtin_scene_pcb_inspection():
 # ---------------------------------------------------------------------------
 
 def test_closed_loop_onnx_policy_contraction_and_camera_control(tmp_path: Path):
+    ort = pytest.importorskip("onnxruntime")
     policy_dir = tmp_path / "closed_loop_policy"
     target_q = [0.08, -0.35, 0.55, 0.0, 1.15, 0.0, 0.0]
 
@@ -175,6 +175,7 @@ def test_closed_loop_onnx_policy_contraction_and_camera_control(tmp_path: Path):
 
 
 def test_closed_loop_onnx_policy_nhwc(tmp_path: Path):
+    ort = pytest.importorskip("onnxruntime")
     policy_dir = tmp_path / "nhwc_policy"
     scaffold_closed_loop_demo_policy(
         policy_dir,

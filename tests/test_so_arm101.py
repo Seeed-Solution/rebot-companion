@@ -32,9 +32,14 @@ from rebot_companion.calibration import HandEyeResult, check_b601_compatibility,
 from rebot_companion.camera_client import MarkerDetection, ReCameraClient
 from rebot_companion.gripper_calib import main as gripper_calib_main
 from rebot_companion.ik import B601IkAdapter
-from rebot_companion.mcp_server import Controller, ToolFail
 from rebot_companion.pipeline import DeterministicPickPlacePipeline, PipelineConfig
 from rebot_companion.transforms import Transform
+
+try:
+    from rebot_companion.mcp_server import Controller, ToolFail
+except ImportError:  # the agent extra (anyio, mcp) is not installed
+    Controller = ToolFail = None
+needs_mcp = pytest.mark.skipif(Controller is None, reason="needs the agent extra")
 
 # ==============================================================================
 # 1. Schema Parsing & Fallback Tests
@@ -404,6 +409,7 @@ def test_gripper_calib_skips_zero_check_for_so_arm101(capsys):
 # ==============================================================================
 
 
+@needs_mcp
 def test_mcp_server_reads_obs_tcp_and_gripper_on_5_plus_1():
     client = MagicMock(spec=ArmdClient)
     schema = ObservationSchema.from_dict(
@@ -447,6 +453,7 @@ def test_mcp_server_reads_obs_tcp_and_gripper_on_5_plus_1():
     assert state["gripper"]["stalled"] is False
 
 
+@needs_mcp
 def test_mcp_server_6_plus_0_has_no_gripper():
     client = MagicMock(spec=ArmdClient)
     schema = ObservationSchema.from_dict(
@@ -482,6 +489,7 @@ def test_mcp_server_6_plus_0_has_no_gripper():
     assert exc_info.value.code == "UNSUPPORTED"
 
 
+@needs_mcp
 def test_mcp_server_move_to_2_dof_orientation():
     client = MagicMock(spec=ArmdClient)
     schema = ObservationSchema.from_dict(
@@ -826,6 +834,7 @@ def test_armsession_open_heartbeat_starts_immediately_after_acquire_lease():
         session._stop.set()
 
 
+@needs_mcp
 def test_mcp_server_auto_yaw_unsupported_when_explicitly_false():
     mock_client = MagicMock()
     mock_schema = ObservationSchema.from_dict({

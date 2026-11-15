@@ -351,6 +351,7 @@ def test_builtin_pcb_suction_manifest_and_fsm_stdlib():
 
 
 def test_onnx_policy_scaffold_validate_and_runner(tmp_path: Path):
+    pytest.importorskip("onnxruntime")
     import numpy as np
 
     from rebot_companion.onnx_policy import (

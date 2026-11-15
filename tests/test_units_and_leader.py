@@ -33,8 +33,13 @@ from rebot_companion.leader_teleop import (
     encode_packet,
 )
 from rebot_companion.lerobot_recorder import LeRobotRecorder
-from rebot_companion.mcp_server import Controller
 from rebot_companion.policy_runner import PolicyRunner, RunnerError, parse_policy, pretrained_info
+
+try:
+    from rebot_companion.mcp_server import Controller
+except ImportError:  # the agent extra (anyio, mcp) is not installed
+    Controller = None
+needs_mcp = pytest.mark.skipif(Controller is None, reason="needs the agent extra")
 
 # --------------------------------------------------------------------------- units.py tests
 
@@ -857,6 +862,7 @@ def test_pretrained_info_resolves_so101_norm_for_lerobot_policy(tmp_path):
 # --------------------------------------------------------------------------- mcp_server.py tests
 
 
+@needs_mcp
 def test_mcp_server_auto_yaw_on_orient_dof_2():
     mock_client = MagicMock()
     # Arm schema with orient_dof == 2 (5-DOF arm)
@@ -903,6 +909,7 @@ def test_mcp_server_auto_yaw_on_orient_dof_2():
     assert abs(kwargs.get("rpy")[2] - math.radians(30.0)) < 1e-4
 
 
+@needs_mcp
 def test_mcp_server_schema_fallback_7dof():
     mock_client = MagicMock()
     # Schema endpoint raises Exception -> trigger fallback
@@ -1508,6 +1515,7 @@ def test_leader_teleop_exit_codes_and_fault_code_reporting():
     assert bridge._error is None
 
 
+@needs_mcp
 def test_schema_cooldown_initial_sentinel_allows_early_monotonic(monkeypatch):
     """When time.monotonic() is small (e.g. 1.0 in a fresh container), first schema call must succeed."""
     monkeypatch.setattr(time, "monotonic", lambda: 1.0)
@@ -1756,6 +1764,7 @@ def test_leader_teleop_main_restores_signal_handlers(monkeypatch):
         signal.signal(signal.SIGTERM, orig_term)
 
 
+@needs_mcp
 def test_mcp_server_gripper_fraction_schema_bounds():
     from rebot_companion.mcp_server import gripper_fraction
 
@@ -2111,6 +2120,7 @@ def test_sine_policy_joint6_rejected_and_unit_enforcement():
         runner_bad._read_arm()
 
 
+@needs_mcp
 def test_mcp_format_tcp_and_move_to_quat_and_partial_orientation():
     from rebot_companion.mcp_server import Controller, ToolFail
     client = MagicMock()
@@ -2434,6 +2444,7 @@ def test_policy_runner_lerobot_calib_and_warning(tmp_path: Path, caplog):
         assert any("so101_norm is active without --lerobot-calib" in record.message for record in caplog.records)
 
 
+@needs_mcp
 def test_mcp_fallback_schema_and_orientation_dof_guard():
     from rebot_companion.mcp_server import Controller, ToolFail
 

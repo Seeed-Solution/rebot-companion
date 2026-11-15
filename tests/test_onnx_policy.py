@@ -90,6 +90,7 @@ def test_validate_normalization_stats_finite_and_positive():
 
 
 def test_onnx_policy_normalization_applied_and_shape_mismatch(tmp_path: Path):
+    pytest.importorskip("onnxruntime")
     pol_dir = scaffold_onnx_policy(tmp_path / "norm_pol", policy_id="norm_pol", action_dim=7)
 
     # Update policy.json to include normalization
@@ -322,6 +323,7 @@ def test_policy_runner_io_delivery_failure_stops_cleanly():
 
 
 def test_onnx_policy_nhwc_image_preprocessing(tmp_path: Path):
+    pytest.importorskip("onnxruntime")
     pol_dir = scaffold_onnx_policy(
         tmp_path / "nhwc_pol",
         policy_id="nhwc_pol",
