@@ -59,8 +59,7 @@ class LeaderError(RuntimeError):
     """The leader teleop bridge encountered an error."""
 
 
-class LeaderTeleopError(LeaderError):
-    pass
+LeaderTeleopError = LeaderError
 
 
 class _DisjointLeadError(LeaderTeleopError):
