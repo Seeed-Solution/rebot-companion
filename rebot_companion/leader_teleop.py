@@ -59,7 +59,12 @@ class LeaderError(RuntimeError):
     """The leader teleop bridge encountered an error."""
 
 
-LeaderTeleopError = LeaderError
+class LeaderTeleopError(LeaderError):
+    pass
+
+
+class _DisjointLeadError(LeaderTeleopError):
+    pass
 
 
 # --------------------------------------------------------------------------- packet codec
@@ -787,6 +792,11 @@ def _clamp_lead_and_step(
             raise LeaderTeleopError(f"j_max must be finite, got {j_max!r}")
         j_max = jf_max
 
+    if max_step < 0 or max_lead < 0:
+        raise LeaderTeleopError(
+            f"max_step and max_lead must be non-negative, got max_step={max_step}, max_lead={max_lead}"
+        )
+
     lo = max(prev_val - max_step, ref_val - max_lead)
     hi = min(prev_val + max_step, ref_val + max_lead)
     if j_min is not None:
@@ -796,7 +806,7 @@ def _clamp_lead_and_step(
 
     if lo > hi + 1e-9:
         j_str = f"joint {joint_index + 1}: " if joint_index is not None else ""
-        raise LeaderTeleopError(
+        raise _DisjointLeadError(
             f"{j_str}disjoint lead and step intervals (prev_val={prev_val:.4f}, "
             f"ref_val={ref_val:.4f}, max_step={max_step:.4f}, max_lead={max_lead:.4f}, "
             f"lo={lo:.4f}, hi={hi:.4f}); follower moved away from command (pushed/blocked or tracking lag)"
@@ -1166,7 +1176,7 @@ class LeaderTeleopBridge:
             if 0 <= joint_index < len(self._transient_disjoint_counts):
                 self._transient_disjoint_counts[joint_index] = 0
             return clamped
-        except LeaderTeleopError:
+        except _DisjointLeadError:
             lead_lo = float(ref_val) - float(max_lead)
             lead_hi = float(ref_val) + float(max_lead)
             if j_min is not None:

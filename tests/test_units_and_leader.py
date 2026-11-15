@@ -4684,6 +4684,10 @@ def test_leader_teleop_transient_droop_recovery_and_fail_closed(caplog):
             0.0, prev_val=0.0, ref_val=1.0, max_step=0.05, max_lead=0.15, joint_index=0
         )
 
+    # 5. Non-finite input fails closed immediately without entering droop recovery
+    with pytest.raises(LeaderTeleopError, match="val must be finite"):
+        bridge._clamp_with_transient_droop_recovery(float("nan"), 0.0, 0.0, 0.05, 0.3)
+
 
 def test_arm_session_servo_non_finite_ref_telemetry_jump_protection():
     import threading
