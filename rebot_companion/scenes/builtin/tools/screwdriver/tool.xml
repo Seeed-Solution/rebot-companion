@@ -1,0 +1,15 @@
+<mujoco model="builtin_screwdriver_tool">
+  <worldbody>
+    <geom name="driver_housing" type="cylinder" pos="-0.085 0 0" euler="0 90 0" size="0.022 0.040"
+          rgba="0.20 0.24 0.28 1"/>
+    <body name="driver_spindle" pos="-0.022 0 0">
+      <joint name="spindle_joint" type="hinge" axis="1 0 0" damping="0.1"/>
+      <inertial pos="0 0 0" mass="0.03" diaginertia="1e-5 1e-5 1e-5"/>
+      <geom name="driver_bit" type="cylinder" pos="0 0 0" euler="0 90 0" size="0.005 0.022"
+            rgba="0.72 0.74 0.78 1" friction="1.0 0.01 0.001"/>
+    </body>
+  </worldbody>
+  <actuator>
+    <position name="m7_spindle" joint="spindle_joint" kp="10" dampratio="1" forcerange="-5 5"/>
+  </actuator>
+</mujoco>

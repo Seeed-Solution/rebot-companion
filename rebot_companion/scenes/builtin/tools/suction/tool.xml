@@ -1,0 +1,19 @@
+<mujoco model="builtin_suction_tool">
+  <worldbody>
+    <geom name="suction_manifold" type="box" pos="-0.080 0 0" size="0.018 0.032 0.032"
+          rgba="0.22 0.25 0.30 1"/>
+    <geom name="suction_stem" type="cylinder" pos="-0.040 0 0" euler="0 90 0" size="0.012 0.025"
+          rgba="0.58 0.62 0.68 1"/>
+    <geom name="suction_cup_bellows" type="cylinder" pos="-0.008 0 0" euler="0 90 0" size="0.016 0.008"
+          rgba="0.14 0.45 0.72 1" friction="1.4 0.01 0.001"/>
+    <body name="suction_valve_body" pos="-0.080 0 0">
+      <joint name="suction_valve" type="slide" axis="0 1 0" range="-0.06 0.06" damping="2"/>
+      <inertial pos="0 0 0" mass="0.01" diaginertia="1e-6 1e-6 1e-6"/>
+      <geom name="suction_valve_dummy" type="sphere" size="0.004" rgba="0.2 0.8 0.9 1"
+            contype="0" conaffinity="0"/>
+    </body>
+  </worldbody>
+  <actuator>
+    <position name="m7_suction" joint="suction_valve" kp="20" dampratio="1" forcerange="-5 5"/>
+  </actuator>
+</mujoco>

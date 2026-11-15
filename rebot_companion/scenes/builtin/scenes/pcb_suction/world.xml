@@ -1,0 +1,48 @@
+<mujoco model="pcb_suction_world">
+  <worldbody>
+    <!-- Infeed station base tray -->
+    <geom name="infeed_tray" type="box" pos="0.23 -0.14 0.004" size="0.055 0.055 0.004"
+          rgba="0.28 0.30 0.34 1"/>
+
+    <!-- Free-joint PCB workpiece resting on infeed tray -->
+    <body name="pcb" pos="0.23 -0.14 0.011">
+      <freejoint name="pcb_joint"/>
+      <inertial pos="0 0 0" mass="0.06" diaginertia="2e-5 2e-5 4e-5"/>
+      <geom name="pcb" type="box" size="0.030 0.022 0.003" rgba="0.08 0.45 0.18 1"
+            friction="1.4 0.01 0.001" condim="4"/>
+      <!-- Decorative gold edge connector strip -->
+      <geom name="pcb_connector" type="box" pos="0.027 0 0.001" size="0.003 0.018 0.0022"
+            rgba="0.85 0.72 0.20 1" contype="0" conaffinity="0"/>
+    </body>
+
+    <!-- Physical divider wall separating infeed area from test fixture -->
+    <geom name="divider_wall" type="box" pos="0.25 -0.065 0.025" size="0.075 0.005 0.025"
+          rgba="0.40 0.42 0.46 1"/>
+
+    <!-- Test fixture station with alignment pad and status indicator LED -->
+    <body name="test_fixture" pos="0.27 0.01 0">
+      <geom name="fixture_base" type="box" pos="0 0 0.008" size="0.055 0.045 0.008"
+            rgba="0.22 0.24 0.27 1"/>
+      <geom name="fixture_pad" type="box" pos="0 0 0.0165" size="0.035 0.026 0.0005"
+            rgba="0.25 0.50 0.80 0.8" contype="0" conaffinity="0"/>
+      <geom name="test_pass_led" type="sphere" pos="0.042 -0.030 0.022" size="0.007"
+            rgba="0.85 0.20 0.20 1" contype="0" conaffinity="0"/>
+    </body>
+
+    <!-- Outfeed bin station with low border walls and catch mat -->
+    <body name="outfeed_bin" pos="0.23 0.15 0">
+      <geom name="outfeed_bottom" type="box" pos="0 0 0.003" size="0.055 0.055 0.003"
+            rgba="0.20 0.22 0.25 1"/>
+      <geom name="outfeed_wall_n" type="box" pos="0 0.052 0.016" size="0.055 0.003 0.013"
+            rgba="0.32 0.34 0.38 1"/>
+      <geom name="outfeed_wall_s" type="box" pos="0 -0.052 0.016" size="0.055 0.003 0.013"
+            rgba="0.32 0.34 0.38 1"/>
+      <geom name="outfeed_wall_e" type="box" pos="0.052 0 0.016" size="0.003 0.049 0.013"
+            rgba="0.32 0.34 0.38 1"/>
+      <geom name="outfeed_wall_w" type="box" pos="-0.052 0 0.016" size="0.003 0.049 0.013"
+            rgba="0.32 0.34 0.38 1"/>
+      <geom name="outfeed_mat" type="box" pos="0 0 0.0065" size="0.048 0.048 0.0005"
+            rgba="0.16 0.48 0.26 1" contype="0" conaffinity="0"/>
+    </body>
+  </worldbody>
+</mujoco>

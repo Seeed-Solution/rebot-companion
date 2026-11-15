@@ -1,0 +1,127 @@
+{
+  "id": "pcb_suction",
+  "name": "PCB Pick-and-Place & Test Cell",
+  "version": "1.0.0",
+  "description": "3-stage PCB workflow with suction end-effector: vacuum-pick PCB from infeed tray over divider wall, place on test fixture, then transfer to outfeed bin.",
+  "world_xml": "world.xml",
+  "robots": ["b601dm"],
+  "default_tool": "suction",
+  "recommended_tools": ["suction", "default"],
+  "objects": [
+    {
+      "name": "pcb",
+      "body": "pcb",
+      "geom": "pcb",
+      "class_name": "pcb",
+      "default_pos": [0.23, -0.14, 0.011],
+      "jitter_xy": 0.015
+    }
+  ],
+  "zones": {
+    "infeed_tray": {
+      "center": [0.23, -0.14, 0.018],
+      "half_extents": [0.05, 0.05, 0.025]
+    },
+    "test_fixture": {
+      "center": [0.27, 0.01, 0.024],
+      "half_extents": [0.05, 0.045, 0.03]
+    },
+    "outfeed_bin": {
+      "center": [0.23, 0.15, 0.022],
+      "half_extents": [0.055, 0.055, 0.03]
+    }
+  },
+  "io": [
+    {
+      "name": "fixture_test_pass",
+      "kind": "bool",
+      "direction": "input",
+      "default": false,
+      "description": "Electrical test fixture result signal indicating PCB board passed continuity check"
+    },
+    {
+      "name": "fixture_led",
+      "kind": "bool",
+      "direction": "output",
+      "default": false,
+      "description": "Fixture pass/fail indicator LED"
+    }
+  ],
+  "task_stages": [
+    {
+      "id": "pcb_picked",
+      "type": "object_grasped",
+      "object": "pcb",
+      "min_z": 0.055,
+      "latch": true
+    },
+    {
+      "id": "pcb_in_fixture",
+      "type": "object_in_zone",
+      "object": "pcb",
+      "zone": "test_fixture",
+      "requires": ["pcb_picked"],
+      "indicator_geom": "test_pass_led",
+      "indicator_rgba": [0.15, 0.9, 0.35, 1.0],
+      "latch": true
+    },
+    {
+      "id": "pcb_in_outfeed",
+      "type": "object_in_zone",
+      "object": "pcb",
+      "zone": "outfeed_bin",
+      "requires": ["pcb_in_fixture"],
+      "latch": true
+    }
+  ],
+  "poses": {
+    "scan": {
+      "xyz": [0.23, -0.14, 0.20],
+      "rpy": [0.0, 1.5707963, 0.0],
+      "note": "Overhead inspection scan pose looking at infeed tray"
+    },
+    "infeed_approach": {
+      "xyz": [0.23, -0.14, 0.08],
+      "rpy": [0.0, 1.5707963, 0.0]
+    },
+    "infeed_pick": {
+      "xyz": [0.23, -0.14, 0.015],
+      "rpy": [0.0, 1.5707963, 0.0]
+    },
+    "divider_clear": {
+      "xyz": [0.25, -0.065, 0.10],
+      "rpy": [0.0, 1.5707963, 0.0],
+      "note": "Clearance height above divider wall"
+    },
+    "fixture_approach": {
+      "xyz": [0.27, 0.01, 0.08],
+      "rpy": [0.0, 1.5707963, 0.0]
+    },
+    "fixture_place": {
+      "xyz": [0.27, 0.01, 0.022],
+      "rpy": [0.0, 1.5707963, 0.0]
+    },
+    "outfeed_approach": {
+      "xyz": [0.23, 0.15, 0.08],
+      "rpy": [0.0, 1.5707963, 0.0]
+    },
+    "outfeed_place": {
+      "xyz": [0.23, 0.15, 0.022],
+      "rpy": [0.0, 1.5707963, 0.0]
+    }
+  },
+  "keepout_boxes": [
+    {
+      "name": "divider_wall",
+      "min": [0.175, -0.070, 0.0],
+      "max": [0.325, -0.060, 0.055]
+    }
+  ],
+  "training": {
+    "recommended_approach": "hybrid_rules_and_vision_or_il",
+    "rules_stages": ["pcb_in_fixture", "pcb_in_outfeed"],
+    "vision_stages": ["pcb_picked"],
+    "il_notes": "Train pick-and-place with suction tool using SimEnv or rebot-record."
+  },
+  "assets": []
+}
