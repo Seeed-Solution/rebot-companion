@@ -1,0 +1,45 @@
+<mujoco model="screw_fastening_world">
+  <worldbody>
+    <!-- Fixed aluminum assembly carrier fixture (z = 0 is worktable) -->
+    <body name="assembly_carrier" pos="0.25 0.0 0">
+      <geom name="carrier_base" type="box" pos="0 0 0.008" size="0.065 0.055 0.008"
+            rgba="0.75 0.78 0.82 1" friction="0.8 0.01 0.001"/>
+      <geom name="carrier_recess" type="box" pos="0 0 0.016" size="0.050 0.040 0.001"
+            rgba="0.60 0.64 0.70 1" contype="0" conaffinity="0"/>
+
+      <!-- Screw target 1 receptacle & status LED -->
+      <geom name="receptacle1" type="cylinder" pos="-0.020 -0.025 0.016" size="0.006 0.001"
+            rgba="0.30 0.32 0.36 1" contype="0" conaffinity="0"/>
+      <geom name="screw1_led" type="sphere" pos="-0.035 -0.025 0.018" size="0.004"
+            rgba="0.85 0.20 0.20 1" contype="0" conaffinity="0"/>
+
+      <!-- Screw target 2 receptacle & status LED -->
+      <geom name="receptacle2" type="cylinder" pos="0.020 0.025 0.016" size="0.006 0.001"
+            rgba="0.30 0.32 0.36 1" contype="0" conaffinity="0"/>
+      <geom name="screw2_led" type="sphere" pos="0.035 0.025 0.018" size="0.004"
+            rgba="0.85 0.20 0.20 1" contype="0" conaffinity="0"/>
+    </body>
+
+    <!-- Spring-loaded M3 screw head 1 (depressed during fastening) -->
+    <body name="screw1" pos="0.23 -0.025 0.019">
+      <joint name="screw1_joint" type="slide" axis="0 0 1" range="-0.006 0.0"
+             stiffness="600" damping="30" springref="0.0"/>
+      <inertial pos="0 0 0" mass="0.01" diaginertia="1e-6 1e-6 1e-6"/>
+      <geom name="screw1_head" type="cylinder" size="0.0035 0.003"
+            rgba="0.88 0.88 0.90 1" friction="1.2 0.01 0.001"/>
+    </body>
+
+    <!-- Spring-loaded M3 screw head 2 (depressed during fastening) -->
+    <body name="screw2" pos="0.27 0.025 0.019">
+      <joint name="screw2_joint" type="slide" axis="0 0 1" range="-0.006 0.0"
+             stiffness="600" damping="30" springref="0.0"/>
+      <inertial pos="0 0 0" mass="0.01" diaginertia="1e-6 1e-6 1e-6"/>
+      <geom name="screw2_head" type="cylinder" size="0.0035 0.003"
+            rgba="0.88 0.88 0.90 1" friction="1.2 0.01 0.001"/>
+    </body>
+
+    <!-- Safety keepout guard shield along rear edge of assembly carrier -->
+    <geom name="screw_guard" type="box" pos="0.33 0 0.035" size="0.005 0.065 0.035"
+          rgba="0.85 0.35 0.15 0.7"/>
+  </worldbody>
+</mujoco>

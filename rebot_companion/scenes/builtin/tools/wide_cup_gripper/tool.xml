@@ -12,7 +12,7 @@
       <geom name="cup_carriage_left" type="box" pos="-0.065 0.016 0" size="0.015 0.010 0.022"
             rgba="0.30 0.32 0.36 1"/>
       <geom name="cup_pad_left" type="box" pos="-0.016 0.0075 0" size="0.016 0.0075 0.024"
-            rgba="0.16 0.45 0.58 1" friction="1.8 0.02 0.002" condim="4"/>
+            rgba="0.16 0.45 0.58 1" priority="2" friction="2.4 0.04 0.004" condim="4"/>
     </body>
 
     <body name="cup_jaw_right" pos="0 0 0">
@@ -21,7 +21,7 @@
       <geom name="cup_carriage_right" type="box" pos="-0.065 -0.016 0" size="0.015 0.010 0.022"
             rgba="0.30 0.32 0.36 1"/>
       <geom name="cup_pad_right" type="box" pos="-0.016 -0.0075 0" size="0.016 0.0075 0.024"
-            rgba="0.16 0.45 0.58 1" friction="1.8 0.02 0.002" condim="4"/>
+            rgba="0.16 0.45 0.58 1" priority="2" friction="2.4 0.04 0.004" condim="4"/>
     </body>
   </worldbody>
 

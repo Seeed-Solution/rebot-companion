@@ -24,6 +24,22 @@
       "robots": ["b601dm"],
       "default_tool": "suction",
       "recommended_tools": ["suction", "screwdriver", "default"]
+    },
+    {
+      "id": "screw_fastening",
+      "name": "Aluminum Assembly & Screw Fastening Cell",
+      "description": "2-point automated M3 screw fastening workflow with electric screwdriver: align bit with M3 screw targets on aluminum assembly carrier and fasten with torque feedback.",
+      "robots": ["b601dm"],
+      "default_tool": "screwdriver",
+      "recommended_tools": ["screwdriver", "default"]
+    },
+    {
+      "id": "lab_desktop",
+      "name": "Laboratory Desktop Pick & Place",
+      "description": "SO-ARM101 table sorting cell: pick cube from feeder tray and place into sorting bin with obstacle avoidance.",
+      "robots": ["so-arm101"],
+      "default_tool": "default",
+      "recommended_tools": ["default"]
     }
   ],
   "tools": [

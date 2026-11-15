@@ -1,5 +1,8 @@
 <mujoco model="pcb_suction_world">
   <worldbody>
+    <!-- Fixed overhead visual-servo camera looking straight down at infeed tray (0.23, -0.14, 0) -->
+    <camera name="policy_cam" pos="0.23 -0.14 0.34" xyaxes="1 0 0 0 1 0" fovy="45"/>
+
     <!-- Infeed station base tray -->
     <geom name="infeed_tray" type="box" pos="0.23 -0.14 0.004" size="0.055 0.055 0.004"
           rgba="0.28 0.30 0.34 1"/>

@@ -91,6 +91,7 @@ class SceneManifest:
     poses: dict[str, Any] = field(default_factory=dict)
     keepout_boxes: list[dict[str, Any]] = field(default_factory=list)
     training: dict[str, Any] = field(default_factory=dict)
+    camera_extrinsics: dict[str, Any] = field(default_factory=dict)
     assets: list[AssetRef] = field(default_factory=list)
     source_dir: Path | None = None
 
@@ -117,12 +118,13 @@ class SceneManifest:
             poses=dict(raw.get("poses", {})),
             keepout_boxes=[dict(b) for b in raw.get("keepout_boxes", [])],
             training=dict(raw.get("training", {})),
+            camera_extrinsics=dict(raw.get("camera_extrinsics", {})),
             assets=assets,
             source_dir=source_dir,
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        data: dict[str, Any] = {
             "id": self.id,
             "name": self.name,
             "version": self.version,
@@ -140,6 +142,9 @@ class SceneManifest:
             "training": dict(self.training),
             "assets": [a.to_dict() for a in self.assets],
         }
+        if self.camera_extrinsics:
+            data["camera_extrinsics"] = dict(self.camera_extrinsics)
+        return data
 
 
 @dataclass

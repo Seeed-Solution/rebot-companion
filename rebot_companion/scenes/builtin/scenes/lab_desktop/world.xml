@@ -1,0 +1,31 @@
+<mujoco model="lab_desktop_world">
+  <worldbody>
+    <!-- Feeder tray holding pick cube -->
+    <geom name="feeder_tray" type="box" pos="0.22 -0.05 0.002" size="0.045 0.045 0.002"
+          rgba="0.28 0.32 0.38 1"/>
+
+    <!-- Free-joint pick cube for SO-ARM101 (30 mm cube) -->
+    <body name="cube" pos="0.22 -0.05 0.015">
+      <freejoint name="cube_joint"/>
+      <inertial pos="0 0 0" mass="0.035" diaginertia="5e-6 5e-6 5e-6"/>
+      <geom name="cube" type="box" size="0.015 0.015 0.015"
+            rgba="0.85 0.25 0.15 1" friction="1.2 0.01 0.001" condim="4"/>
+    </body>
+
+    <!-- Target sorting bin on table -->
+    <body name="target_bin" pos="0.22 0.08 0.005">
+      <geom name="bin_floor" type="box" pos="0 0 0.002" size="0.045 0.045 0.002"
+            rgba="0.20 0.22 0.26 1"/>
+      <geom name="bin_wall_n" type="box" pos="0 0.043 0.014" size="0.045 0.002 0.012"
+            rgba="0.32 0.35 0.40 1"/>
+      <geom name="bin_wall_s" type="box" pos="0 -0.043 0.014" size="0.045 0.002 0.012"
+            rgba="0.32 0.35 0.40 1"/>
+      <geom name="bin_wall_e" type="box" pos="0.043 0 0.014" size="0.002 0.041 0.012"
+            rgba="0.32 0.35 0.40 1"/>
+      <geom name="bin_wall_w" type="box" pos="-0.043 0 0.014" size="0.002 0.041 0.012"
+            rgba="0.32 0.35 0.40 1"/>
+      <geom name="bin_mat" type="box" pos="0 0 0.0045" size="0.040 0.040 0.0005"
+            rgba="0.16 0.48 0.26 1" contype="0" conaffinity="0"/>
+    </body>
+  </worldbody>
+</mujoco>

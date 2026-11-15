@@ -7,6 +7,12 @@
   "robots": ["b601dm"],
   "default_tool": "suction",
   "recommended_tools": ["suction", "default"],
+  "camera_extrinsics": {
+    "name": "policy_cam",
+    "pos": [0.23, -0.14, 0.34],
+    "fovy": 45,
+    "plane_z": 0.011
+  },
   "objects": [
     {
       "name": "pcb",
