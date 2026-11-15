@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from rebot.client import ArmdClient, ArmSession
+from rebot_companion.scenes.spec import VALID_ID_RE
 
 DEPLOY_PROFILE_FORMAT = "rebot-deploy-profile/v1"
 SUPPORTED_ROBOTS = ("b601dm", "so-arm101")
@@ -87,10 +88,14 @@ def validate_deploy_profile(raw: dict[str, Any], source_path: Path | None = None
     scene_id = str(raw.get("scene_id") or "").strip()
     if not scene_id:
         raise ValueError("Deploy profile must specify a non-empty 'scene_id'")
+    if not VALID_ID_RE.match(scene_id):
+        raise ValueError(f"Invalid scene_id {scene_id!r}; expected match for {VALID_ID_RE.pattern}")
 
     tool_id = str(raw.get("tool_id") or "").strip()
     if not tool_id:
         raise ValueError("Deploy profile must specify a non-empty 'tool_id'")
+    if not VALID_ID_RE.match(tool_id):
+        raise ValueError(f"Invalid tool_id {tool_id!r}; expected match for {VALID_ID_RE.pattern}")
 
     # Poses validation
     raw_poses = raw.get("poses")
@@ -357,17 +362,19 @@ def apply_deploy_profile(
     except Exception as exc:
         warnings.append(f"Could not inspect safety description: {exc}")
 
+    read_errors: list[str] = []
     existing_poses: list[dict[str, Any]] = []
     try:
         existing_poses = client.get_poses()
     except Exception as exc:
-        warnings.append(f"Could not read device poses: {exc}")
+        read_errors.append(f"Could not read device poses: {exc}")
 
     existing_keepout: dict[str, Any] = {}
     try:
         existing_keepout = client.get_keepout()
     except Exception as exc:
-        warnings.append(f"Could not read device keepout boxes: {exc}")
+        read_errors.append(f"Could not read device keepout boxes: {exc}")
+    warnings.extend(read_errors)
 
     device_boxes = existing_keepout.get("boxes", [])
     diff: dict[str, Any] = {
@@ -385,6 +392,10 @@ def apply_deploy_profile(
             "warnings": warnings,
             "out_script": script_written,
         }
+
+    # set_keepout replaces every box: without a readable prior state there is no backup to restore
+    if read_errors:
+        raise RuntimeError("Not applying: " + "; ".join(read_errors))
 
     # Backup prior state before mutation
     if backup_path is None:
