@@ -286,6 +286,8 @@ def _cmd_apply_profile(args: argparse.Namespace) -> int:
         apply_changes=args.yes,
         backup_path=args.backup,
         out_script=args.out_script,
+        clear_keepout=args.clear_keepout,
+        apply_collision_guard=args.apply_collision_guard,
     )
     print(json.dumps(result, indent=2, ensure_ascii=False))
     return 0
@@ -306,7 +308,7 @@ def _cmd_playground_serve(args: argparse.Namespace) -> int:
 
     async def run() -> None:
         await server.start()
-        print(f"reBot Playground serving at {server.url} (armd: {args.armd_url})")
+        print(f"reBot Cyclops serving at {server.url} (armd: {args.armd_url})")
         stop = asyncio.Event()
         try:
             await stop.wait()
@@ -397,7 +399,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_hash.add_argument("--json", action="store_true", help="Output JSON")
     p_hash.set_defaults(func=_cmd_asset_hash)
 
-    p_exp = sub.add_parser("export-bundle", help="Export static self-contained playground bundle")
+    p_exp = sub.add_parser("export-bundle", help="Export static self-contained reBot Cyclops bundle")
     p_exp.add_argument("--out", required=True, help="Destination directory for bundle.json and model.onnx")
     p_exp.add_argument("--scene", default=None, help="Scene ID or path (default None)")
     p_exp.add_argument("--tool", default=None, help="Tool ID or path (default scene's tool or default)")
@@ -414,9 +416,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_prof.add_argument("--yes", action="store_true", help="Mutate device state (otherwise dry-run)")
     p_prof.add_argument("--backup", default=None, help="Path to backup existing device configuration")
     p_prof.add_argument("--out-script", default=None, help="Path to output generated Python 3.8 main.py")
+    p_prof.add_argument(
+        "--clear-keepout",
+        action="store_true",
+        help="Clear existing device keepout boxes when profile specifies none",
+    )
+    p_prof.add_argument(
+        "--apply-collision-guard",
+        action="store_true",
+        help="Apply collision guard configuration from profile to armd",
+    )
     p_prof.set_defaults(func=_cmd_apply_profile)
 
-    p_serve = sub.add_parser("playground-serve", help="Run static asset and same-origin armd reverse proxy")
+    p_serve = sub.add_parser("playground-serve", help="Run static asset and same-origin armd reverse proxy for reBot Cyclops")
     p_serve.add_argument("--static-dir", required=True, help="Static build directory")
     p_serve.add_argument("--armd-url", default="http://127.0.0.1:8765", help="Upstream armd URL")
     p_serve.add_argument("--host", default="127.0.0.1", help="Proxy listening host")
